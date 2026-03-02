@@ -394,4 +394,42 @@ app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
         res.status(500).json({ status: 'error', error: err.message });
     }
 });
+// ==========================================
+// GESTIÓN DE PROPIEDADES (ADMINISTRACIÓN)
+// ==========================================
+app.get('/propiedades-admin', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
+    try {
+        const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
+        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
+        
+        const result = await pool.query('SELECT id, identificador, alicuota FROM propiedades WHERE condominio_id = $1 ORDER BY identificador ASC', [condoRes.rows[0].id]);
+        res.json({ status: 'success', propiedades: result.rows });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
+});
+
+app.post('/propiedades-admin', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
+    const { identificador, alicuota } = req.body;
+    
+    try {
+        const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
+        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
+        
+        // Traductor por si escriben la alícuota con coma (Ej: 0,5)
+        const parsedAlicuota = parseFloat(alicuota.toString().replace(',', '.')) || 0;
+
+        await pool.query(
+            'INSERT INTO propiedades (condominio_id, identificador, alicuota) VALUES ($1, $2, $3)',
+            [condoRes.rows[0].id, identificador, parsedAlicuota]
+        );
+        res.json({ status: 'success', message: 'Inmueble registrado con éxito' });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
+});
 app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
