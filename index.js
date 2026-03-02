@@ -238,31 +238,41 @@ app.get('/proveedores', verifyToken, async (req, res) => {
 });
 
 app.post('/gastos', verifyToken, async (req, res) => {
+    const parseLatamNum = (val) => parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
+
     if (!req.user.cedula.startsWith('J-')) {
         return res.status(403).json({ status: 'error', message: 'Solo las Juntas de Condominio pueden registrar gastos.' });
     }
 
     const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, periodo_cobro } = req.body;
+    const m_bs = parseLatamNum(monto_bs);
+    const t_c = parseLatamNum(tasa_cambio);
 
     try {
-        const condominioResult = await pool.query(
-            'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+        const condoRes = await pool.query(
+            'SELECT id, ciclo_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1',
             [req.user.id]
         );
 
-        if (condominioResult.rows.length === 0) {
+        if (condoRes.rows.length === 0) {
             return res.status(404).json({ status: 'error', message: 'No se encontró un condominio asociado a esta Junta.' });
         }
 
-        const condominio_id = condominioResult.rows[0].id;
-        const monto_usd = (monto_bs / tasa_cambio).toFixed(2);
+        const condominio_id = condoRes.rows[0].id;
+        const ciclo_actual = condoRes.rows[0].ciclo_actual || 1;
+        const monto_usd_num = m_bs / t_c;
+        const monto_usd = monto_usd_num.toFixed(2);
         const monto_cuota_usd = (monto_usd / total_cuotas).toFixed(2);
+
+        if (isNaN(monto_usd) || monto_usd === Infinity) {
+            return res.status(400).json({ status: 'error', message: 'Error en montos matemáticos' });
+        }
 
         const gastoResult = await pool.query(
             `INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id`,
-            [condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas]
+            [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas]
         );
 
         const gasto_id = gastoResult.rows[0].id;
