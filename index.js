@@ -478,4 +478,32 @@ app.post('/propiedades-admin', verifyToken, async (req, res) => {
         res.status(500).json({ status: 'error', error: err.message });
     }
 });
+// ==========================================
+// CUENTAS POR COBRAR (Avisos de Cobro)
+// ==========================================
+app.get('/cuentas-por-cobrar', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
+    try {
+        // 1. Buscamos la Junta
+        const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
+        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
+        
+        const condominio_id = condoRes.rows[0].id;
+
+        // 2. Buscamos todos los recibos de las propiedades de este condominio
+        const result = await pool.query(`
+            SELECT r.id, p.identificador as inmueble, r.mes_cobro as ciclo, r.monto_usd, r.estado, 
+                   TO_CHAR(r.fecha_emision, 'DD/MM/YYYY') as fecha
+            FROM recibos r
+            JOIN propiedades p ON r.propiedad_id = p.id
+            WHERE p.condominio_id = $1
+            ORDER BY r.id DESC
+        `, [condominio_id]);
+
+        res.json({ status: 'success', recibos: result.rows });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
+});
 app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
