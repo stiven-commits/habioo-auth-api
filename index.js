@@ -335,5 +335,63 @@ app.get('/gastos', verifyToken, async (req, res) => {
         res.status(500).json({ status: 'error', error: err.message });
     }
 });
+// ==========================================
+// VER EL PRELIMINAR (Lo que hay en la caja actual)
+// ==========================================
+app.get('/preliminar', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
+    try {
+        const condoRes = await pool.query('SELECT id, ciclo_actual, metodo_division FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
+        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
+        
+        const { id: condominio_id, ciclo_actual, metodo_division } = condoRes.rows[0];
 
+        // Buscamos todas las cuotas asignadas a este ciclo que estén pendientes
+        const gastosRes = await pool.query(`
+            SELECT g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, p.nombre as proveedor
+            FROM gastos_cuotas gc
+            JOIN gastos g ON gc.gasto_id = g.id
+            JOIN proveedores p ON g.proveedor_id = p.id
+            WHERE g.condominio_id = $1 AND gc.ciclo_asignado = $2 AND gc.estado = 'Pendiente'
+        `, [condominio_id, ciclo_actual]);
+
+        const total_usd = gastosRes.rows.reduce((sum, item) => sum + parseFloat(item.monto_cuota_usd), 0);
+
+        res.json({ status: 'success', ciclo_actual, metodo_division, gastos: gastosRes.rows, total_usd: total_usd.toFixed(2) });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
+});
+
+// ==========================================
+// APROBAR PRELIMINAR Y AVANZAR CICLO
+// ==========================================
+app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
+    try {
+        const condoRes = await pool.query('SELECT id, ciclo_actual FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
+        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
+        
+        const { id: condominio_id, ciclo_actual } = condoRes.rows[0];
+
+        // 1. Congelamos los gastos de este ciclo pasándolos a "En Preliminar"
+        await pool.query(`
+            UPDATE gastos_cuotas 
+            SET estado = 'En Preliminar' 
+            FROM gastos 
+            WHERE gastos_cuotas.gasto_id = gastos.id 
+            AND gastos.condominio_id = $1 
+            AND gastos_cuotas.ciclo_asignado = $2
+        `, [condominio_id, ciclo_actual]);
+
+        // 2. Avanzamos el reloj del condominio al siguiente ciclo
+        await pool.query('UPDATE condominios SET ciclo_actual = ciclo_actual + 1 WHERE id = $1', [condominio_id]);
+
+        res.json({ status: 'success', message: `¡Ciclo ${ciclo_actual} cerrado con éxito! Hemos avanzado al Ciclo ${ciclo_actual + 1}.` });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
+});
 app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
