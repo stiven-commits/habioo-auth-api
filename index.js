@@ -248,8 +248,11 @@ app.post('/gastos', verifyToken, async (req, res) => {
     // Ya NO pedimos periodo_cobro, el sistema lo hará automático
     const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas } = req.body;
 
-    // Traductor Matemático Latino
-    const parseLatamNum = (val) => parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
+    // Traductor Matemático Latino (¡VERSIÓN BLINDADA AQUÍ!)
+    const parseLatamNum = (val) => {
+        if (!val) return 0;
+        return parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
+    };
 
     try {
         const m_bs = parseLatamNum(monto_bs);
@@ -321,6 +324,11 @@ app.get('/gastos', verifyToken, async (req, res) => {
             WHERE c.admin_user_id = $1
             ORDER BY g.fecha_gasto DESC
         `, [req.user.id]);
+        // Traductor Matemático Latino (Blindado contra campos vacíos)
+        const parseLatamNum = (val) => {
+            if (!val) return 0;
+            return parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
+        };
         
         res.json({ status: 'success', gastos: result.rows });
     } catch (err) {
