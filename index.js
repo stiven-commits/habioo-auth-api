@@ -237,56 +237,92 @@ app.get('/proveedores', verifyToken, async (req, res) => {
     }
 });
 
+// ==========================================
+// REGISTRAR UN GASTO FÍSICO
+// ==========================================
 app.post('/gastos', verifyToken, async (req, res) => {
-    const parseLatamNum = (val) => parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
-
     if (!req.user.cedula.startsWith('J-')) {
         return res.status(403).json({ status: 'error', message: 'Solo las Juntas de Condominio pueden registrar gastos.' });
     }
 
-    const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, periodo_cobro } = req.body;
-    const m_bs = parseLatamNum(monto_bs);
-    const t_c = parseLatamNum(tasa_cambio);
+    // Ya NO pedimos periodo_cobro, el sistema lo hará automático
+    const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas } = req.body;
+
+    // Traductor Matemático Latino
+    const parseLatamNum = (val) => parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
 
     try {
+        const m_bs = parseLatamNum(monto_bs);
+        const t_c = parseLatamNum(tasa_cambio);
+
+        // Escudo Antiexplosiones
+        if (!proveedor_id) {
+            return res.status(400).json({ status: 'error', message: 'Debes seleccionar un proveedor haciendo clic en la lista.' });
+        }
+        if (isNaN(m_bs) || isNaN(t_c) || t_c <= 0 || m_bs <= 0) {
+            return res.status(400).json({ status: 'error', message: 'Error matemático: Revisa que el monto y la tasa sean correctos.' });
+        }
+
+        // 1. Buscar el condominio y su caja actual (ciclo)
         const condoRes = await pool.query(
             'SELECT id, ciclo_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1',
             [req.user.id]
         );
 
         if (condoRes.rows.length === 0) {
-            return res.status(404).json({ status: 'error', message: 'No se encontró un condominio asociado a esta Junta.' });
+            return res.status(404).json({ status: 'error', message: 'No eres administrador de ningún condominio.' });
         }
 
         const condominio_id = condoRes.rows[0].id;
-        const ciclo_actual = condoRes.rows[0].ciclo_actual || 1;
-        const monto_usd_num = m_bs / t_c;
-        const monto_usd = monto_usd_num.toFixed(2);
-        const monto_cuota_usd = (monto_usd / total_cuotas).toFixed(2);
+        const ciclo_actual = condoRes.rows[0].ciclo_actual || 1; // Si no tiene, asume 1
 
-        if (isNaN(monto_usd) || monto_usd === Infinity) {
-            return res.status(400).json({ status: 'error', message: 'Error en montos matemáticos' });
-        }
+        // 2. Cálculos inmutables
+        const monto_usd = (m_bs / t_c).toFixed(2);
+        const monto_cuota_usd = (monto_usd / parseInt(total_cuotas)).toFixed(2);
 
-        const gastoResult = await pool.query(
-            `INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             RETURNING id`,
-            [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas]
-        );
+        // 3. Insertar el Gasto Principal
+        const gastoRes = await pool.query(`
+            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas)
+            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+        `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas]);
+        
+        const gasto_id = gastoRes.rows[0].id;
 
-        const gasto_id = gastoResult.rows[0].id;
-
+        // 4. Generar las Cuotas en el tiempo (Motor de Ciclos)
         for (let i = 1; i <= total_cuotas; i++) {
-            const periodoCuota = total_cuotas > 1 ? `${periodo_cobro} - P${i}` : periodo_cobro;
-            await pool.query(
-                `INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, periodo_cobro)
-                 VALUES ($1, $2, $3, $4)`,
-                [gasto_id, i, monto_cuota_usd, periodoCuota]
-            );
+            // Magia: La cuota 1 va a la caja 1, la cuota 2 a la caja 2...
+            const ciclo_asignado = ciclo_actual + (i - 1);
+            
+            await pool.query(`
+                INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, ciclo_asignado)
+                VALUES ($1, $2, $3, $4)
+            `, [gasto_id, i, monto_cuota_usd, ciclo_asignado]);
         }
 
-        res.json({ status: 'success', message: 'Gasto y cuotas registrados' });
+        res.json({ status: 'success', message: 'Gasto contable registrado con éxito' });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
+});
+
+// ==========================================
+// OBTENER HISTORIAL DE GASTOS
+// ==========================================
+app.get('/gastos', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
+    try {
+        const result = await pool.query(`
+            SELECT g.concepto, g.monto_usd, p.nombre as proveedor, gc.numero_cuota, gc.monto_cuota_usd, gc.ciclo_asignado, gc.estado
+            FROM gastos g
+            JOIN gastos_cuotas gc ON g.id = gc.gasto_id
+            JOIN proveedores p ON g.proveedor_id = p.id
+            JOIN condominios c ON g.condominio_id = c.id
+            WHERE c.admin_user_id = $1
+            ORDER BY g.fecha_gasto DESC
+        `, [req.user.id]);
+        
+        res.json({ status: 'success', gastos: result.rows });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
