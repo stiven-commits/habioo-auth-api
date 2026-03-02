@@ -365,31 +365,77 @@ app.get('/preliminar', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// APROBAR PRELIMINAR Y AVANZAR CICLO
+// APROBAR PRELIMINAR, REPARTIR DEUDAS Y AVANZAR CICLO
 // ==========================================
 app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
-        const condoRes = await pool.query('SELECT id, ciclo_actual FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
+        // 1. Buscar los datos del Condominio
+        const condoRes = await pool.query('SELECT id, ciclo_actual, metodo_division FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
         if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
         
-        const { id: condominio_id, ciclo_actual } = condoRes.rows[0];
+        const { id: condominio_id, ciclo_actual, metodo_division } = condoRes.rows[0];
 
-        // 1. Congelamos los gastos de este ciclo pasándolos a "En Preliminar"
+        // 2. Sumar todo el dinero de la caja de este ciclo
+        const gastosRes = await pool.query(`
+            SELECT COALESCE(SUM(gc.monto_cuota_usd), 0) as total_usd
+            FROM gastos_cuotas gc
+            JOIN gastos g ON gc.gasto_id = g.id
+            WHERE g.condominio_id = $1 AND gc.ciclo_asignado = $2 AND (gc.estado = 'Pendiente' OR gc.estado IS NULL)
+        `, [condominio_id, ciclo_actual]);
+
+        const total_gastos = parseFloat(gastosRes.rows[0].total_usd);
+
+        if (total_gastos <= 0) {
+            return res.status(400).json({ status: 'error', message: 'No hay gastos pendientes para cobrar en este ciclo.' });
+        }
+
+        // 3. Buscar los apartamentos a los que se les va a cobrar
+        const propRes = await pool.query('SELECT id, identificador, alicuota FROM propiedades WHERE condominio_id = $1', [condominio_id]);
+        const propiedades = propRes.rows;
+
+        if (propiedades.length === 0) {
+            return res.status(400).json({ status: 'error', message: '¡Alto! No puedes cobrar si no hay inmuebles registrados.' });
+        }
+
+        // 4. El Motor Matemático (Repartir la deuda)
+        const mes_cobro = `Ciclo ${ciclo_actual}`; 
+
+        for (let prop of propiedades) {
+            let monto_deuda = 0;
+
+            if (metodo_division === 'Partes Iguales') {
+                monto_deuda = (total_gastos / propiedades.length).toFixed(2);
+            } else {
+                // Matemática por Alícuota (Porcentaje)
+                monto_deuda = (total_gastos * (parseFloat(prop.alicuota) / 100)).toFixed(2);
+            }
+
+            // Inyectamos la deuda al vecino
+            await pool.query(`
+                INSERT INTO recibos (propiedad_id, mes_cobro, monto_usd, estado)
+                VALUES ($1, $2, $3, 'Aviso de Cobro')
+            `, [prop.id, mes_cobro, monto_deuda]);
+        }
+
+        // 5. Congelar los gastos para que no se cobren dos veces
         await pool.query(`
             UPDATE gastos_cuotas 
-            SET estado = 'En Preliminar' 
+            SET estado = 'Procesado' 
             FROM gastos 
             WHERE gastos_cuotas.gasto_id = gastos.id 
             AND gastos.condominio_id = $1 
             AND gastos_cuotas.ciclo_asignado = $2
         `, [condominio_id, ciclo_actual]);
 
-        // 2. Avanzamos el reloj del condominio al siguiente ciclo
+        // 6. Avanzar el reloj de la Junta al siguiente Ciclo
         await pool.query('UPDATE condominios SET ciclo_actual = ciclo_actual + 1 WHERE id = $1', [condominio_id]);
 
-        res.json({ status: 'success', message: `¡Ciclo ${ciclo_actual} cerrado con éxito! Hemos avanzado al Ciclo ${ciclo_actual + 1}.` });
+        res.json({ 
+            status: 'success', 
+            message: `¡Cierre exitoso! Se procesaron $${total_gastos} y se generaron deudas para ${propiedades.length} inmuebles. Avanzamos al Ciclo ${ciclo_actual + 1}.` 
+        });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
