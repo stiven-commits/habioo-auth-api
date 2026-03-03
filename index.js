@@ -213,7 +213,7 @@ app.get('/mis-finanzas', verifyToken, async (req, res) => {
 // ==========================================
 app.post('/proveedores', verifyToken, async (req, res) => {
     // Validamos que el usuario sea una Junta (J-)
-    if (!req.user.cedula.startsWith('J-')) {
+    if (!req.user.cedula.startsWith('J')) {
         return res.status(403).json({ status: 'error', message: 'Solo las Juntas de Condominio pueden registrar proveedores.' });
     }
 
@@ -255,7 +255,7 @@ app.get('/proveedores', verifyToken, async (req, res) => {
 // REGISTRAR UN GASTO FÍSICO (Actualizado con Nota)
 // ==========================================
 app.post('/gastos', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Solo las Juntas pueden registrar gastos.' });
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Solo las Juntas pueden registrar gastos.' });
 
     const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota } = req.body;
 
@@ -306,7 +306,7 @@ app.post('/gastos', verifyToken, async (req, res) => {
 // OBTENER HISTORIAL DE GASTOS (Agrupado y con Fecha)
 // ==========================================
 app.get('/gastos', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
         const result = await pool.query(`
@@ -332,7 +332,7 @@ app.get('/gastos', verifyToken, async (req, res) => {
 // ELIMINAR UN GASTO (Regla de Auditoría)
 // ==========================================
 app.delete('/gastos/:id', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
         const gastoId = req.params.id;
@@ -361,7 +361,7 @@ app.delete('/gastos/:id', verifyToken, async (req, res) => {
 // VER EL PRELIMINAR (Actualizado con Nota y Detalles)
 // ==========================================
 app.get('/preliminar', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
         const condoRes = await pool.query('SELECT id, ciclo_actual, metodo_division FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
@@ -390,7 +390,7 @@ app.get('/preliminar', verifyToken, async (req, res) => {
 // APROBAR PRELIMINAR, REPARTIR DEUDAS Y AVANZAR CICLO
 // ==========================================
 app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
         // 1. Buscar los datos del Condominio
@@ -468,7 +468,7 @@ app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
 
 // 1. OBTENER (Con datos de Dueño e Inquilino)
 app.get('/propiedades-admin', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
@@ -496,7 +496,7 @@ app.get('/propiedades-admin', verifyToken, async (req, res) => {
 
 // 2. CREAR (Genera usuarios automáticos)
 app.post('/propiedades-admin', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     const { 
         identificador, alicuota, 
@@ -564,7 +564,7 @@ app.post('/propiedades-admin', verifyToken, async (req, res) => {
 
 // 3. EDITAR (Permite cambiar contraseñas y corregir datos)
 app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     const propId = req.params.id;
     const { 
@@ -631,7 +631,7 @@ app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
 // CUENTAS POR COBRAR (Avisos de Cobro)
 // ==========================================
 app.get('/cuentas-por-cobrar', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
         // 1. Buscamos la Junta
