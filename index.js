@@ -131,13 +131,19 @@ app.post('/register', async (req, res) => {
 });
 
 app.post('/login', async (req, res) => {
-    const { cedula, password } = req.body;
+    let { cedula, password } = req.body;
+    
     try {
-        const result = await pool.query('SELECT * FROM users WHERE cedula = $1', [cedula]);
+        // 1. LIMPIEZA AUTOMÁTICA: Quitamos guiones, espacios y ponemos mayúsculas
+        // Si llega "V-12345678", lo convertimos en "V12345678" antes de buscar
+        const cedulaLimpia = cedula.toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+        const result = await pool.query('SELECT * FROM users WHERE cedula = $1', [cedulaLimpia]);
         const user = result.rows[0];
 
         if (!user) return res.status(401).json({ status: 'error', message: 'Credenciales inválidas' });
 
+        // 2. Comparamos la contraseña
         const validPassword = await bcrypt.compare(password, user.password);
         if (!validPassword) return res.status(401).json({ status: 'error', message: 'Credenciales inválidas' });
 
