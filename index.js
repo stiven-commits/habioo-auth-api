@@ -682,10 +682,21 @@ app.post('/bancos', verifyToken, async (req, res) => {
         res.json({ status: 'success', message: 'Cuenta registrada.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// ELIMINAR BANCO
+app.delete('/bancos/:id', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
 
-// ==========================================
-// GESTIÓN DE ZONAS (Multizona)
-// ==========================================
+    try {
+        // Opcional: Podrías validar aquí si la cuenta ya tiene pagos asociados para no romper la contabilidad
+        // const check = await pool.query('SELECT id FROM pagos WHERE cuenta_bancaria_id = $1 LIMIT 1', [req.params.id]);
+        // if (check.rows.length > 0) return res.status(400).json({ status: 'error', message: 'No se puede eliminar: Tiene pagos registrados.' });
+
+        await pool.query('DELETE FROM cuentas_bancarias WHERE id = $1', [req.params.id]);
+        res.json({ status: 'success', message: 'Cuenta eliminada.' });
+    } catch (err) { 
+        res.status(500).json({ error: err.message }); 
+    }
+});
 // ==========================================
 // GESTIÓN DE ZONAS (Multizona con Auditoría)
 // ==========================================
