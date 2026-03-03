@@ -670,7 +670,7 @@ app.get('/bancos', verifyToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-a// CREAR BANCO (Con Tipo)
+// CREAR BANCO (Con Tipo)
 app.post('/bancos', verifyToken, async (req, res) => {
     const { numero_cuenta, nombre_banco, apodo, tipo } = req.body;
     try {
