@@ -663,16 +663,27 @@ app.delete('/bancos/:id', verifyToken, async (req, res) => {
 // ==========================================
 // GESTIÓN DE ZONAS (Multizona)
 // ==========================================
+// ==========================================
+// GESTIÓN DE ZONAS (Multizona con Auditoría)
+// ==========================================
 app.get('/zonas', verifyToken, async (req, res) => {
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
         const condo_id = condoRes.rows[0].id;
 
-        // Buscamos las zonas
-        const zonasRes = await pool.query('SELECT * FROM zonas WHERE condominio_id = $1 ORDER BY nombre ASC', [condo_id]);
+        // Buscamos zonas y calculamos si tienen gastos asociados (Auditoría)
+        const zonasRes = await pool.query(`
+            SELECT z.id, z.nombre, z.activa,
+                   (SELECT COUNT(*) FROM gastos g WHERE g.zona_id = z.id) > 0 as tiene_gastos
+            FROM zonas z 
+            WHERE z.condominio_id = $1 
+            ORDER BY z.activa DESC, z.nombre ASC
+        `, [condo_id]);
+        
         const zonas = zonasRes.rows;
 
-        // Para cada zona, buscamos qué propiedades tiene asignadas
+        // Adjuntamos las propiedades de cada zona
         for (let zona of zonas) {
             const propsRes = await pool.query(`
                 SELECT p.id, p.identificador 
@@ -681,9 +692,9 @@ app.get('/zonas', verifyToken, async (req, res) => {
                 WHERE pz.zona_id = $1
             `, [zona.id]);
             zona.propiedades = propsRes.rows;
+            zona.propiedades_ids = propsRes.rows.map(p => p.id); // Para facilitar la edición en frontend
         }
 
-        // También necesitamos la lista completa de propiedades para el selector
         const allProps = await pool.query('SELECT id, identificador FROM propiedades WHERE condominio_id = $1 ORDER BY identificador ASC', [condo_id]);
 
         res.json({ status: 'success', zonas, todas_propiedades: allProps.rows });
@@ -691,32 +702,60 @@ app.get('/zonas', verifyToken, async (req, res) => {
 });
 
 app.post('/zonas', verifyToken, async (req, res) => {
-    const { nombre, propiedades_ids } = req.body; // propiedades_ids es un array [1, 5, 8]
+    const { nombre, propiedades_ids } = req.body;
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         
-        // 1. Crear Zona
         const zonaRes = await pool.query(
-            'INSERT INTO zonas (condominio_id, nombre) VALUES ($1, $2) RETURNING id',
+            'INSERT INTO zonas (condominio_id, nombre, activa) VALUES ($1, $2, true) RETURNING id',
             [condoRes.rows[0].id, nombre]
         );
         const zona_id = zonaRes.rows[0].id;
 
-        // 2. Asignar Propiedades (Loop)
         if (propiedades_ids && propiedades_ids.length > 0) {
             for (let prop_id of propiedades_ids) {
-                await pool.query(
-                    'INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                    [zona_id, prop_id]
-                );
+                await pool.query('INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [zona_id, prop_id]);
             }
         }
-        res.json({ status: 'success', message: 'Zona creada y propiedades asignadas.' });
+        res.json({ status: 'success', message: 'Zona creada exitosamente.' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// NUEVO: Editar Zona (Nombre, Propiedades y Estado)
+app.put('/zonas/:id', verifyToken, async (req, res) => {
+    const { id } = req.params;
+    const { nombre, propiedades_ids, activa } = req.body;
+    
+    try {
+        // 1. Verificar si tiene gastos (Seguridad extra aunque el frontend lo bloquee)
+        const checkGastos = await pool.query('SELECT COUNT(*) FROM gastos WHERE zona_id = $1', [id]);
+        const tieneGastos = parseInt(checkGastos.rows[0].count) > 0;
+
+        // Actualizamos datos básicos
+        await pool.query('UPDATE zonas SET nombre = $1, activa = $2 WHERE id = $3', [nombre, activa, id]);
+
+        // Si NO tiene gastos, permitimos cambiar la estructura de apartamentos
+        // Si TIENE gastos, protegemos la estructura para no romper recibos viejos, pero permitimos cambiar nombre/estado
+        if (!tieneGastos && propiedades_ids) {
+            // Borramos relaciones viejas y ponemos las nuevas
+            await pool.query('DELETE FROM propiedades_zonas WHERE zona_id = $1', [id]);
+            for (let prop_id of propiedades_ids) {
+                await pool.query('INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [id, prop_id]);
+            }
+        }
+
+        res.json({ status: 'success', message: 'Zona actualizada.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete('/zonas/:id', verifyToken, async (req, res) => {
     try {
+        // Validación de seguridad: No borrar si hay gastos
+        const check = await pool.query('SELECT id FROM gastos WHERE zona_id = $1 LIMIT 1', [req.params.id]);
+        if (check.rows.length > 0) {
+            return res.status(400).json({ status: 'error', message: 'No se puede eliminar: Esta zona tiene historial contable. Desactívala en su lugar.' });
+        }
+
         await pool.query('DELETE FROM zonas WHERE id = $1', [req.params.id]);
         res.json({ status: 'success', message: 'Zona eliminada.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
