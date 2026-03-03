@@ -344,7 +344,7 @@ app.delete('/gastos/:id', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// VER EL PRELIMINAR (Solo Comunes + Saldos)
+// VER EL PRELIMINAR (Con Lista de Alícuotas)
 // ==========================================
 app.get('/preliminar', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
@@ -355,17 +355,11 @@ app.get('/preliminar', verifyToken, async (req, res) => {
         
         const { id: condominio_id, ciclo_actual, metodo_division } = condoRes.rows[0];
 
-        // 1. Buscamos SOLO gastos COMUNES y calculamos el saldo restante
-        // Fórmula Saldo Restante: Monto Total USD - (Monto Cuota * Número de Cuota Actual)
+        // 1. Gastos Comunes
         const gastosRes = await pool.query(`
             SELECT 
-                g.concepto, 
-                gc.monto_cuota_usd, 
-                gc.numero_cuota, 
-                g.total_cuotas, 
-                p.nombre as proveedor, 
-                g.nota, 
-                g.monto_usd as monto_total_usd,
+                g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, 
+                p.nombre as proveedor, g.nota, g.monto_usd as monto_total_usd,
                 (g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_restante
             FROM gastos_cuotas gc
             JOIN gastos g ON gc.gasto_id = g.id
@@ -376,15 +370,26 @@ app.get('/preliminar', verifyToken, async (req, res) => {
               AND g.tipo = 'Comun' 
         `, [condominio_id, ciclo_actual]);
 
-        // Calculamos el total de la caja chica de este mes
         const total_usd = gastosRes.rows.reduce((sum, item) => sum + parseFloat(item.monto_cuota_usd), 0);
+
+        // 2. NUEVO: Obtener las alícuotas únicas que existen en las propiedades
+        const alicuotasRes = await pool.query(`
+            SELECT DISTINCT alicuota 
+            FROM propiedades 
+            WHERE condominio_id = $1 
+            ORDER BY alicuota ASC
+        `, [condominio_id]);
+
+        // Extraemos solo los valores numéricos
+        const alicuotas = alicuotasRes.rows.map(r => parseFloat(r.alicuota));
 
         res.json({ 
             status: 'success', 
             ciclo_actual, 
             metodo_division, 
             gastos: gastosRes.rows, 
-            total_usd: total_usd.toFixed(2) 
+            total_usd: total_usd.toFixed(2),
+            alicuotas_disponibles: alicuotas // Enviamos la lista al frontend
         });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
