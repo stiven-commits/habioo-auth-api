@@ -246,17 +246,13 @@ app.get('/proveedores', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// REGISTRAR UN GASTO FÍSICO
+// REGISTRAR UN GASTO FÍSICO (Actualizado con Nota)
 // ==========================================
 app.post('/gastos', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) {
-        return res.status(403).json({ status: 'error', message: 'Solo las Juntas de Condominio pueden registrar gastos.' });
-    }
+    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Solo las Juntas pueden registrar gastos.' });
 
-    // Ya NO pedimos periodo_cobro, el sistema lo hará automático
-    const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas } = req.body;
+    const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota } = req.body;
 
-    // Traductor Matemático Latino (¡VERSIÓN BLINDADA AQUÍ!)
     const parseLatamNum = (val) => {
         if (!val) return 0;
         return parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
@@ -266,47 +262,31 @@ app.post('/gastos', verifyToken, async (req, res) => {
         const m_bs = parseLatamNum(monto_bs);
         const t_c = parseLatamNum(tasa_cambio);
 
-        // Escudo Antiexplosiones
-        if (!proveedor_id) {
-            return res.status(400).json({ status: 'error', message: 'Debes seleccionar un proveedor haciendo clic en la lista.' });
-        }
-        if (isNaN(m_bs) || isNaN(t_c) || t_c <= 0 || m_bs <= 0) {
-            return res.status(400).json({ status: 'error', message: 'Error matemático: Revisa que el monto y la tasa sean correctos.' });
-        }
+        if (!proveedor_id) return res.status(400).json({ status: 'error', message: 'Debes seleccionar un proveedor.' });
+        if (isNaN(m_bs) || isNaN(t_c) || t_c <= 0 || m_bs <= 0) return res.status(400).json({ status: 'error', message: 'Error matemático en monto o tasa.' });
 
-        // 1. Buscar el condominio y su caja actual (ciclo)
-        const condoRes = await pool.query(
-            'SELECT id, ciclo_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1',
-            [req.user.id]
-        );
-
-        if (condoRes.rows.length === 0) {
-            return res.status(404).json({ status: 'error', message: 'No eres administrador de ningún condominio.' });
-        }
+        const condoRes = await pool.query('SELECT id, ciclo_actual FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
+        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
 
         const condominio_id = condoRes.rows[0].id;
-        const ciclo_actual = condoRes.rows[0].ciclo_actual || 1; // Si no tiene, asume 1
+        const ciclo_actual = condoRes.rows[0].ciclo_actual || 1;
 
-        // 2. Cálculos inmutables
         const monto_usd = (m_bs / t_c).toFixed(2);
         const monto_cuota_usd = (monto_usd / parseInt(total_cuotas)).toFixed(2);
 
-        // 3. Insertar el Gasto Principal
+        // Guardamos el gasto INCLUYENDO la nota
         const gastoRes = await pool.query(`
-            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas)
-            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
-        `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas]);
+            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id
+        `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota || '']);
         
         const gasto_id = gastoRes.rows[0].id;
 
-        // 4. Generar las Cuotas en el tiempo (Motor de Ciclos)
         for (let i = 1; i <= total_cuotas; i++) {
-            // Magia: La cuota 1 va a la caja 1, la cuota 2 a la caja 2...
             const ciclo_asignado = ciclo_actual + (i - 1);
-            
             await pool.query(`
-                INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, ciclo_asignado)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, ciclo_asignado, estado)
+                VALUES ($1, $2, $3, $4, 'Pendiente')
             `, [gasto_id, i, monto_cuota_usd, ciclo_asignado]);
         }
 
@@ -317,34 +297,30 @@ app.post('/gastos', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// OBTENER HISTORIAL DE GASTOS
+// OBTENER HISTORIAL DE GASTOS (Actualizado con todos los detalles)
 // ==========================================
 app.get('/gastos', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
         const result = await pool.query(`
-            SELECT g.concepto, g.monto_usd, p.nombre as proveedor, gc.numero_cuota, gc.monto_cuota_usd, gc.ciclo_asignado, gc.estado
+            SELECT gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio, g.monto_usd as monto_total_usd, g.nota, p.nombre as proveedor, gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.ciclo_asignado, gc.estado
             FROM gastos g
             JOIN gastos_cuotas gc ON g.id = gc.gasto_id
             JOIN proveedores p ON g.proveedor_id = p.id
             JOIN condominios c ON g.condominio_id = c.id
             WHERE c.admin_user_id = $1
-            ORDER BY g.fecha_gasto DESC
+            ORDER BY gc.id DESC
         `, [req.user.id]);
-        // Traductor Matemático Latino (Blindado contra campos vacíos)
-        const parseLatamNum = (val) => {
-            if (!val) return 0;
-            return parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
-        };
         
         res.json({ status: 'success', gastos: result.rows });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
 });
+
 // ==========================================
-// VER EL PRELIMINAR (Lo que hay en la caja actual)
+// VER EL PRELIMINAR (Actualizado con Nota y Detalles)
 // ==========================================
 app.get('/preliminar', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
@@ -355,13 +331,13 @@ app.get('/preliminar', verifyToken, async (req, res) => {
         
         const { id: condominio_id, ciclo_actual, metodo_division } = condoRes.rows[0];
 
-        // Buscamos todas las cuotas asignadas a este ciclo que estén pendientes
+        // Extraemos todos los detalles para la modal
         const gastosRes = await pool.query(`
-            SELECT g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, p.nombre as proveedor
+            SELECT g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, p.nombre as proveedor, g.nota, g.monto_bs, g.tasa_cambio, g.monto_usd as monto_total_usd
             FROM gastos_cuotas gc
             JOIN gastos g ON gc.gasto_id = g.id
             JOIN proveedores p ON g.proveedor_id = p.id
-            WHERE g.condominio_id = $1 AND gc.ciclo_asignado = $2 AND gc.estado = 'Pendiente'
+            WHERE g.condominio_id = $1 AND gc.ciclo_asignado = $2 AND (gc.estado = 'Pendiente' OR gc.estado IS NULL)
         `, [condominio_id, ciclo_actual]);
 
         const total_usd = gastosRes.rows.reduce((sum, item) => sum + parseFloat(item.monto_cuota_usd), 0);
