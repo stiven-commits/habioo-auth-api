@@ -670,22 +670,16 @@ app.get('/bancos', verifyToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+a// CREAR BANCO (Con Tipo)
 app.post('/bancos', verifyToken, async (req, res) => {
-    const { numero_cuenta, nombre_banco, apodo } = req.body;
+    const { numero_cuenta, nombre_banco, apodo, tipo } = req.body;
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         await pool.query(
-            'INSERT INTO cuentas_bancarias (condominio_id, numero_cuenta, nombre_banco, apodo) VALUES ($1, $2, $3, $4)',
-            [condoRes.rows[0].id, numero_cuenta, nombre_banco, apodo]
+            'INSERT INTO cuentas_bancarias (condominio_id, numero_cuenta, nombre_banco, apodo, tipo) VALUES ($1, $2, $3, $4, $5)',
+            [condoRes.rows[0].id, numero_cuenta, nombre_banco, apodo, tipo]
         );
-        res.json({ status: 'success', message: 'Cuenta bancaria registrada.' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.delete('/bancos/:id', verifyToken, async (req, res) => {
-    try {
-        await pool.query('DELETE FROM cuentas_bancarias WHERE id = $1', [req.params.id]);
-        res.json({ status: 'success', message: 'Cuenta eliminada.' });
+        res.json({ status: 'success', message: 'Cuenta registrada.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -815,6 +809,59 @@ app.get('/recibos-historial', verifyToken, async (req, res) => {
         `, [req.user.id]);
 
         res.json({ status: 'success', recibos: result.rows });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
+});
+// ==========================================
+// TESORERÍA: REGISTRAR PAGO (ADMIN)
+// ==========================================
+app.post('/pagos-admin', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+
+    const { recibo_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota } = req.body;
+
+    // Helper para limpiar números (1.000,50 -> 1000.50)
+    const parseMonto = (val) => parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
+
+    try {
+        const monto = parseMonto(monto_origen);
+        const tasa = parseMonto(tasa_cambio) || 1; // Si es Zelle/Efectivo tasa es 1
+        
+        // 1. Calcular el valor real en Dólares
+        const monto_usd_final = (monto / tasa).toFixed(2);
+
+        // 2. Obtener datos de la cuenta para saber el método
+        const cuentaRes = await pool.query('SELECT tipo FROM cuentas_bancarias WHERE id = $1', [cuenta_id]);
+        const metodo = cuentaRes.rows[0]?.tipo || 'Desconocido';
+
+        // 3. Registrar el Pago (Ya nace VALIDADO porque lo hace el Admin)
+        await pool.query(`
+            INSERT INTO pagos (recibo_id, cuenta_bancaria_id, monto_origen, tasa_cambio, monto_usd, referencia, fecha_pago, metodo, estado, nota)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Validado', $9)
+        `, [recibo_id, cuenta_id, monto, tasa, monto_usd_final, referencia, fecha_pago, metodo, nota]);
+
+        // 4. Actualizar el estado del Recibo (Conciliación)
+        // Sumamos todos los pagos validados de este recibo
+        const pagosRes = await pool.query("SELECT SUM(monto_usd) as total_pagado FROM pagos WHERE recibo_id = $1 AND estado = 'Validado'", [recibo_id]);
+        const totalPagado = parseFloat(pagosRes.rows[0].total_pagado || 0);
+
+        // Buscamos el monto original del recibo
+        const reciboRes = await pool.query('SELECT monto_usd FROM recibos WHERE id = $1', [recibo_id]);
+        const deudaTotal = parseFloat(reciboRes.rows[0].monto_usd);
+
+        // Decidimos el nuevo estado
+        let nuevoEstado = 'Aviso de Cobro';
+        if (totalPagado >= deudaTotal - 0.05) { // Tolerancia de 5 centavos por redondeo
+            nuevoEstado = 'Solvente';
+        } else if (totalPagado > 0) {
+            nuevoEstado = 'Abonado Parcial';
+        }
+
+        await pool.query('UPDATE recibos SET estado = $1 WHERE id = $2', [nuevoEstado, recibo_id]);
+
+        res.json({ status: 'success', message: 'Pago registrado y conciliado exitosamente.', nuevo_estado: nuevoEstado });
+
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
