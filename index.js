@@ -284,7 +284,7 @@ app.post('/gastos', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// OBTENER HISTORIAL DE GASTOS (Agrupado y con Fecha)
+// OBTENER HISTORIAL (Corregido: Trae Tipo y Zona)
 // ==========================================
 app.get('/gastos', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
@@ -294,11 +294,13 @@ app.get('/gastos', verifyToken, async (req, res) => {
             SELECT g.id as gasto_id, gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio, 
                    g.monto_usd as monto_total_usd, g.nota, p.nombre as proveedor, 
                    gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.ciclo_asignado, gc.estado,
-                   TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha
+                   TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha,
+                   g.tipo, z.nombre as zona_nombre
             FROM gastos g
             JOIN gastos_cuotas gc ON g.id = gc.gasto_id
             JOIN proveedores p ON g.proveedor_id = p.id
             JOIN condominios c ON g.condominio_id = c.id
+            LEFT JOIN zonas z ON g.zona_id = z.id
             WHERE c.admin_user_id = $1
             ORDER BY g.id DESC, gc.numero_cuota ASC
         `, [req.user.id]);
