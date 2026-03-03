@@ -457,10 +457,7 @@ app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
     }
 });
 // ==========================================
-// GESTIÓN DE PROPIEDADES (ADMINISTRACIÓN)
-// ==========================================
-// ==========================================
-// GESTIÓN DE PROPIEDADES E INQUILINOS (Inteligente)
+// OBTENER PROPIEDADES (CON DUEÑO E INQUILINO)
 // ==========================================
 app.get('/propiedades-admin', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
@@ -469,91 +466,22 @@ app.get('/propiedades-admin', verifyToken, async (req, res) => {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
         
-        // Buscamos propiedad y los datos del propietario actual
+        // Magia SQL: Traemos al Propietario (u1) y al Inquilino (u2) en la misma fila
         const result = await pool.query(`
-            SELECT p.id, p.identificador, p.alicuota, 
-                   u.nombre as propietario, u.cedula, u.telefono, u.email
+            SELECT 
+                p.id, p.identificador, p.alicuota,
+                u1.id as prop_id, u1.nombre as prop_nombre, u1.cedula as prop_cedula, u1.email as prop_email, u1.telefono as prop_telefono,
+                u2.id as inq_id, u2.nombre as inq_nombre, u2.cedula as inq_cedula, u2.email as inq_email, u2.telefono as inq_telefono
             FROM propiedades p
-            LEFT JOIN usuarios_propiedades up ON p.id = up.propiedad_id AND up.rol = 'Propietario'
-            LEFT JOIN users u ON up.user_id = u.id
+            LEFT JOIN usuarios_propiedades up1 ON p.id = up1.propiedad_id AND up1.rol = 'Propietario'
+            LEFT JOIN users u1 ON up1.user_id = u1.id
+            LEFT JOIN usuarios_propiedades up2 ON p.id = up2.propiedad_id AND up2.rol = 'Inquilino'
+            LEFT JOIN users u2 ON up2.user_id = u2.id
             WHERE p.condominio_id = $1
             ORDER BY p.identificador ASC
         `, [condoRes.rows[0].id]);
 
         res.json({ status: 'success', propiedades: result.rows });
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
-});
-
-app.post('/propiedades-admin', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
-    
-    const { 
-        identificador, alicuota, 
-        prop_nombre, prop_cedula, prop_email, prop_telefono,
-        tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono 
-    } = req.body;
-    
-    // Función auxiliar para buscar o crear usuario (Upsert)
-    const findOrCreateUser = async (nombre, cedula, email, telefono) => {
-        if (!cedula) return null;
-        // 1. Buscamos si ya existe
-        let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedula]);
-        
-        if (userRes.rows.length > 0) {
-            // Si existe, actualizamos sus datos de contacto si nos los dieron
-            if (email || telefono) {
-                await pool.query('UPDATE users SET email = COALESCE($1, email), telefono = COALESCE($2, telefono) WHERE id = $3', [email, telefono, userRes.rows[0].id]);
-            }
-            return userRes.rows[0].id;
-        } else {
-            // 2. Si no existe, lo creamos con Password = Cédula
-            const salt = await bcrypt.genSalt(10);
-            const hashedPassword = await bcrypt.hash(cedula, salt); // La clave es la cédula
-            const newUser = await pool.query(
-                'INSERT INTO users (nombre, cedula, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-                [nombre, cedula, email, telefono, hashedPassword]
-            );
-            return newUser.rows[0].id;
-        }
-    };
-
-    try {
-        const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
-        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
-        const condominio_id = condoRes.rows[0].id;
-        
-        const parsedAlicuota = parseFloat(alicuota.toString().replace(',', '.')) || 0;
-
-        // 1. Crear la Propiedad
-        const propRes = await pool.query(
-            'INSERT INTO propiedades (condominio_id, identificador, alicuota) VALUES ($1, $2, $3) RETURNING id',
-            [condominio_id, identificador, parsedAlicuota]
-        );
-        const propiedad_id = propRes.rows[0].id;
-
-        // 2. Procesar al Propietario (Obligatorio)
-        const propUserId = await findOrCreateUser(prop_nombre, prop_cedula, prop_email, prop_telefono);
-        if (propUserId) {
-            await pool.query(
-                'INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)',
-                [propUserId, propiedad_id, 'Propietario']
-            );
-        }
-
-        // 3. Procesar al Inquilino (Opcional)
-        if (tiene_inquilino && inq_cedula) {
-            const inqUserId = await findOrCreateUser(inq_nombre, inq_cedula, inq_email, inq_telefono);
-            if (inqUserId) {
-                await pool.query(
-                    'INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)',
-                    [inqUserId, propiedad_id, 'Inquilino']
-                );
-            }
-        }
-
-        res.json({ status: 'success', message: 'Inmueble y residentes registrados. Ya pueden iniciar sesión con su cédula.' });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
