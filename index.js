@@ -487,6 +487,87 @@ app.get('/propiedades-admin', verifyToken, async (req, res) => {
     }
 });
 // ==========================================
+// EDITAR PROPIEDAD Y USUARIOS
+// ==========================================
+app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
+    const propId = req.params.id;
+    const { 
+        identificador, alicuota, 
+        prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password,
+        tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password
+    } = req.body;
+
+    // Helper para actualizar o crear usuario
+    const upsertUser = async (rol, nombre, cedula, email, telefono, password) => {
+        if (!cedula) return;
+
+        // 1. Buscar si ya existe este usuario
+        let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedula]);
+        let userId;
+
+        if (userRes.rows.length > 0) {
+            userId = userRes.rows[0].id;
+            // Actualizamos datos básicos
+            let query = 'UPDATE users SET nombre = $1, email = $2, telefono = $3';
+            let params = [nombre, email, telefono];
+            
+            // Si mandaron contraseña nueva, la encriptamos y actualizamos
+            if (password && password.trim() !== "") {
+                const salt = await bcrypt.genSalt(10);
+                const hash = await bcrypt.hash(password, salt);
+                query += `, password = $4 WHERE id = $5`;
+                params.push(hash, userId);
+            } else {
+                query += ` WHERE id = $4`;
+                params.push(userId);
+            }
+            await pool.query(query, params);
+        } else {
+            // Si no existe (ej: cambiaron la cédula por una nueva), lo creamos
+            const salt = await bcrypt.genSalt(10);
+            const hash = await bcrypt.hash(password || cedula, salt); // Si no hay clave, usa la cédula
+            const newUser = await pool.query(
+                'INSERT INTO users (nombre, cedula, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+                [nombre, cedula, email, telefono, hash]
+            );
+            userId = newUser.rows[0].id;
+        }
+
+        // 2. Asegurar el vínculo con la propiedad
+        // Primero borramos vínculo viejo de ese rol en esta propiedad para evitar duplicados si cambió de persona
+        await pool.query("DELETE FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2", [propId, rol]);
+        // Creamos el vínculo nuevo
+        await pool.query(
+            'INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+            [userId, propId, rol]
+        );
+    };
+
+    try {
+        const parsedAlicuota = parseFloat(alicuota.toString().replace(',', '.')) || 0;
+
+        // 1. Actualizar Propiedad
+        await pool.query('UPDATE propiedades SET identificador = $1, alicuota = $2 WHERE id = $3', [identificador, parsedAlicuota, propId]);
+
+        // 2. Actualizar Propietario
+        await upsertUser('Propietario', prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password);
+
+        // 3. Actualizar Inquilino (o borrar si se desactivó)
+        if (tiene_inquilino && inq_cedula) {
+            await upsertUser('Inquilino', inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password);
+        } else {
+            // Si desmarcaron la casilla, quitamos al inquilino de esta propiedad
+            await pool.query("DELETE FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = 'Inquilino'", [propId]);
+        }
+
+        res.json({ status: 'success', message: 'Datos actualizados correctamente.' });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
+});
+// ==========================================
 // CUENTAS POR COBRAR (Avisos de Cobro)
 // ==========================================
 app.get('/cuentas-por-cobrar', verifyToken, async (req, res) => {
