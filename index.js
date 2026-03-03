@@ -297,23 +297,55 @@ app.post('/gastos', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// OBTENER HISTORIAL DE GASTOS (Actualizado con todos los detalles)
+// OBTENER HISTORIAL DE GASTOS (Agrupado y con Fecha)
 // ==========================================
 app.get('/gastos', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
         const result = await pool.query(`
-            SELECT gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio, g.monto_usd as monto_total_usd, g.nota, p.nombre as proveedor, gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.ciclo_asignado, gc.estado
+            SELECT g.id as gasto_id, gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio, 
+                   g.monto_usd as monto_total_usd, g.nota, p.nombre as proveedor, 
+                   gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.ciclo_asignado, gc.estado,
+                   TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha
             FROM gastos g
             JOIN gastos_cuotas gc ON g.id = gc.gasto_id
             JOIN proveedores p ON g.proveedor_id = p.id
             JOIN condominios c ON g.condominio_id = c.id
             WHERE c.admin_user_id = $1
-            ORDER BY gc.id DESC
+            ORDER BY g.id DESC, gc.numero_cuota ASC
         `, [req.user.id]);
         
         res.json({ status: 'success', gastos: result.rows });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
+});
+
+// ==========================================
+// ELIMINAR UN GASTO (Regla de Auditoría)
+// ==========================================
+app.delete('/gastos/:id', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J-')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
+    try {
+        const gastoId = req.params.id;
+
+        // 1. Buscamos la Junta
+        const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
+        
+        // 2. Auditoría: ¿Hay alguna cuota que ya se cobró o se procesó?
+        const cuotasCheck = await pool.query("SELECT id FROM gastos_cuotas WHERE gasto_id = $1 AND estado != 'Pendiente'", [gastoId]);
+        if (cuotasCheck.rows.length > 0) {
+            return res.status(400).json({ status: 'error', message: '¡Alto! No puedes eliminar este gasto porque ya tiene cuotas procesadas o pagadas. Por auditoría, debe mantenerse.' });
+        }
+
+        // 3. Si todo está limpio, ejecutamos la eliminación en cascada
+        await pool.query('DELETE FROM gastos_cuotas WHERE gasto_id = $1', [gastoId]);
+        await pool.query('DELETE FROM gastos WHERE id = $1 AND condominio_id = $2', [gastoId, condoRes.rows[0].id]);
+
+        res.json({ status: 'success', message: 'Gasto y sus cuotas eliminados exitosamente.' });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
