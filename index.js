@@ -228,9 +228,17 @@ app.post('/proveedores', verifyToken, async (req, res) => {
     }
 });
 
+// ==========================================
+// OBTENER DIRECTORIO DE PROVEEDORES
+// ==========================================
 app.get('/proveedores', verifyToken, async (req, res) => {
     try {
-        const result = await pool.query('SELECT id, identificador, nombre FROM proveedores ORDER BY nombre ASC');
+        // Ahora sí pedimos todos los datos: telefonos, direccion y estado
+        const result = await pool.query(`
+            SELECT id, identificador, nombre, telefono1, telefono2, direccion, estado_venezuela 
+            FROM proveedores 
+            ORDER BY nombre ASC
+        `);
         res.json({ status: 'success', proveedores: result.rows });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
