@@ -284,18 +284,21 @@ app.post('/gastos', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// OBTENER HISTORIAL (Corregido: Trae Tipo y Zona)
+// OBTENER HISTORIAL (Con Saldo Pendiente)
 // ==========================================
 app.get('/gastos', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
+        // Agregamos la columna 'saldo_pendiente'
+        // Lógica: Si es la cuota 1 de 3 ($33), el saldo es Total - $33.
         const result = await pool.query(`
             SELECT g.id as gasto_id, gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio, 
                    g.monto_usd as monto_total_usd, g.nota, p.nombre as proveedor, 
                    gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.ciclo_asignado, gc.estado,
                    TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha,
-                   g.tipo, z.nombre as zona_nombre
+                   g.tipo, z.nombre as zona_nombre,
+                   GREATEST(0, g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_pendiente
             FROM gastos g
             JOIN gastos_cuotas gc ON g.id = gc.gasto_id
             JOIN proveedores p ON g.proveedor_id = p.id
@@ -341,29 +344,48 @@ app.delete('/gastos/:id', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// VER EL PRELIMINAR (Actualizado con Nota y Detalles)
+// VER EL PRELIMINAR (Solo Comunes + Saldos)
 // ==========================================
 app.get('/preliminar', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
-        const condoRes = await pool.query('SELECT id, ciclo_actual, metodo_division FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
+        const condoRes = await pool.query('SELECT id, ciclo_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
         
         const { id: condominio_id, ciclo_actual, metodo_division } = condoRes.rows[0];
 
-        // Extraemos todos los detalles para la modal
+        // 1. Buscamos SOLO gastos COMUNES y calculamos el saldo restante
+        // Fórmula Saldo Restante: Monto Total USD - (Monto Cuota * Número de Cuota Actual)
         const gastosRes = await pool.query(`
-            SELECT g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, p.nombre as proveedor, g.nota, g.monto_bs, g.tasa_cambio, g.monto_usd as monto_total_usd
+            SELECT 
+                g.concepto, 
+                gc.monto_cuota_usd, 
+                gc.numero_cuota, 
+                g.total_cuotas, 
+                p.nombre as proveedor, 
+                g.nota, 
+                g.monto_usd as monto_total_usd,
+                (g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_restante
             FROM gastos_cuotas gc
             JOIN gastos g ON gc.gasto_id = g.id
             JOIN proveedores p ON g.proveedor_id = p.id
-            WHERE g.condominio_id = $1 AND gc.ciclo_asignado = $2 AND (gc.estado = 'Pendiente' OR gc.estado IS NULL)
+            WHERE g.condominio_id = $1 
+              AND gc.ciclo_asignado = $2 
+              AND (gc.estado = 'Pendiente' OR gc.estado IS NULL)
+              AND g.tipo = 'Comun' 
         `, [condominio_id, ciclo_actual]);
 
+        // Calculamos el total de la caja chica de este mes
         const total_usd = gastosRes.rows.reduce((sum, item) => sum + parseFloat(item.monto_cuota_usd), 0);
 
-        res.json({ status: 'success', ciclo_actual, metodo_division, gastos: gastosRes.rows, total_usd: total_usd.toFixed(2) });
+        res.json({ 
+            status: 'success', 
+            ciclo_actual, 
+            metodo_division, 
+            gastos: gastosRes.rows, 
+            total_usd: total_usd.toFixed(2) 
+        });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
