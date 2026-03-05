@@ -252,7 +252,29 @@ app.get('/proveedores', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// RUTA: REGISTRAR GASTO (Actualizada para Zonas)
+// HELPERS DE CALENDARIO (NUEVO)
+// ==========================================
+// Suma meses a una fecha YYYY-MM y avanza el año si es necesario
+const addMonths = (yyyy_mm, monthsToAdd) => {
+    let [year, month] = yyyy_mm.split('-').map(Number);
+    month += monthsToAdd;
+    while (month > 12) {
+        month -= 12;
+        year += 1;
+    }
+    return `${year}-${month.toString().padStart(2, '0')}`;
+};
+
+// Convierte "2026-03" en "Marzo 2026"
+const formatMonthText = (yyyy_mm) => {
+    if (!yyyy_mm) return '';
+    const [year, month] = yyyy_mm.split('-');
+    const meses = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+    return `${meses[parseInt(month) - 1]} ${year}`;
+};
+
+// ==========================================
+// RUTA: REGISTRAR GASTO (Meses Calendario)
 // ==========================================
 app.post('/gastos', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
@@ -263,10 +285,13 @@ app.post('/gastos', verifyToken, async (req, res) => {
     try {
         const m_bs = parseNum(monto_bs);
         const t_c = parseNum(tasa_cambio);
-        const condoRes = await pool.query('SELECT id, ciclo_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        
+        // CORRECCIÓN AQUÍ: Pedimos 'mes_actual' en lugar de 'ciclo_actual'
+        const condoRes = await pool.query('SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         
         const condominio_id = condoRes.rows[0].id;
-        const ciclo_actual = condoRes.rows[0].ciclo_actual;
+        const mes_actual = condoRes.rows[0].mes_actual;
+        
         const monto_usd = (m_bs / t_c).toFixed(2);
         const monto_cuota_usd = (monto_usd / parseInt(total_cuotas)).toFixed(2);
 
@@ -275,27 +300,32 @@ app.post('/gastos', verifyToken, async (req, res) => {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id
         `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, tipo || 'Comun', zona_id || null]);
 
+        // Inyectar cuotas proyectando los meses al futuro
         for (let i = 1; i <= total_cuotas; i++) {
-            await pool.query(`INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, ciclo_asignado) VALUES ($1, $2, $3, $4)`, 
-            [result.rows[0].id, i, monto_cuota_usd, ciclo_actual + (i - 1)]);
+            // Usamos la función addMonths para calcular "Marzo + 1 = Abril"
+            const mes_cuota = addMonths(mes_actual, i - 1);
+            
+            // CORRECCIÓN AQUÍ: Insertamos en 'mes_asignado' en lugar de 'ciclo_asignado'
+            await pool.query(`INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado) VALUES ($1, $2, $3, $4)`, 
+            [result.rows[0].id, i, monto_cuota_usd, mes_cuota]);
         }
         res.json({ status: 'success', message: 'Gasto registrado correctamente.' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
 // ==========================================
-// OBTENER HISTORIAL (Con Saldo Pendiente)
+// OBTENER HISTORIAL DE GASTOS
 // ==========================================
 app.get('/gastos', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
-        // Agregamos la columna 'saldo_pendiente'
-        // Lógica: Si es la cuota 1 de 3 ($33), el saldo es Total - $33.
         const result = await pool.query(`
             SELECT g.id as gasto_id, gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio, 
                    g.monto_usd as monto_total_usd, g.nota, p.nombre as proveedor, 
-                   gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.ciclo_asignado, gc.estado,
+                   gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.mes_asignado, gc.estado,
                    TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha,
                    g.tipo, z.nombre as zona_nombre,
                    GREATEST(0, g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_pendiente
@@ -309,53 +339,39 @@ app.get('/gastos', verifyToken, async (req, res) => {
         `, [req.user.id]);
         
         res.json({ status: 'success', gastos: result.rows });
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
+    } catch (err) { res.status(500).json({ status: 'error', error: err.message }); }
 });
 
 // ==========================================
-// ELIMINAR UN GASTO (Regla de Auditoría)
+// ELIMINAR UN GASTO (Se mantiene igual)
 // ==========================================
 app.delete('/gastos/:id', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
-    
     try {
         const gastoId = req.params.id;
-
-        // 1. Buscamos la Junta
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
-        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
         
-        // 2. Auditoría: ¿Hay alguna cuota que ya se cobró o se procesó?
         const cuotasCheck = await pool.query("SELECT id FROM gastos_cuotas WHERE gasto_id = $1 AND estado != 'Pendiente'", [gastoId]);
-        if (cuotasCheck.rows.length > 0) {
-            return res.status(400).json({ status: 'error', message: '¡Alto! No puedes eliminar este gasto porque ya tiene cuotas procesadas o pagadas. Por auditoría, debe mantenerse.' });
-        }
+        if (cuotasCheck.rows.length > 0) return res.status(400).json({ status: 'error', message: 'Por auditoría, no puedes eliminar un gasto con cuotas procesadas.' });
 
-        // 3. Si todo está limpio, ejecutamos la eliminación en cascada
         await pool.query('DELETE FROM gastos_cuotas WHERE gasto_id = $1', [gastoId]);
         await pool.query('DELETE FROM gastos WHERE id = $1 AND condominio_id = $2', [gastoId, condoRes.rows[0].id]);
-
-        res.json({ status: 'success', message: 'Gasto y sus cuotas eliminados exitosamente.' });
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
+        res.json({ status: 'success', message: 'Gasto eliminado.' });
+    } catch (err) { res.status(500).json({ status: 'error', error: err.message }); }
 });
 
 // ==========================================
-// VER EL PRELIMINAR (Con Lista de Alícuotas)
+// VER EL PRELIMINAR (Mes Calendario)
 // ==========================================
 app.get('/preliminar', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
-        const condoRes = await pool.query('SELECT id, ciclo_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        const condoRes = await pool.query('SELECT id, mes_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
         
-        const { id: condominio_id, ciclo_actual, metodo_division } = condoRes.rows[0];
+        const { id: condominio_id, mes_actual, metodo_division } = condoRes.rows[0];
 
-        // 1. Gastos Comunes
         const gastosRes = await pool.query(`
             SELECT 
                 g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, 
@@ -365,102 +381,90 @@ app.get('/preliminar', verifyToken, async (req, res) => {
             JOIN gastos g ON gc.gasto_id = g.id
             JOIN proveedores p ON g.proveedor_id = p.id
             WHERE g.condominio_id = $1 
-              AND gc.ciclo_asignado = $2 
+              AND gc.mes_asignado = $2 
               AND (gc.estado = 'Pendiente' OR gc.estado IS NULL)
               AND g.tipo = 'Comun' 
-        `, [condominio_id, ciclo_actual]);
+        `, [condominio_id, mes_actual]);
 
         const total_usd = gastosRes.rows.reduce((sum, item) => sum + parseFloat(item.monto_cuota_usd), 0);
 
-        // 2. NUEVO: Obtener las alícuotas únicas que existen en las propiedades
-        const alicuotasRes = await pool.query(`
-            SELECT DISTINCT alicuota 
-            FROM propiedades 
-            WHERE condominio_id = $1 
-            ORDER BY alicuota ASC
-        `, [condominio_id]);
-
-        // Extraemos solo los valores numéricos
+        const alicuotasRes = await pool.query('SELECT DISTINCT alicuota FROM propiedades WHERE condominio_id = $1 ORDER BY alicuota ASC', [condominio_id]);
         const alicuotas = alicuotasRes.rows.map(r => parseFloat(r.alicuota));
 
         res.json({ 
             status: 'success', 
-            ciclo_actual, 
+            mes_actual, 
+            mes_texto: formatMonthText(mes_actual), // Enviamos el texto "Marzo 2026" listo
             metodo_division, 
             gastos: gastosRes.rows, 
             total_usd: total_usd.toFixed(2),
-            alicuotas_disponibles: alicuotas // Enviamos la lista al frontend
+            alicuotas_disponibles: alicuotas
         });
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
+    } catch (err) { res.status(500).json({ status: 'error', error: err.message }); }
 });
 
 // ==========================================
-// MOTOR DE CIERRE: REPARTO POR ZONAS
+// MOTOR DE CIERRE: REPARTO POR MES Y ZONAS
 // ==========================================
 app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
-        const condoRes = await pool.query('SELECT id, ciclo_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
-        const { id: condo_id, ciclo_actual, metodo_division } = condoRes.rows[0];
+        const condoRes = await pool.query('SELECT id, mes_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        const { id: condo_id, mes_actual, metodo_division } = condoRes.rows[0];
+        const mes_cobro_texto = formatMonthText(mes_actual);
 
-        // 1. Obtener todas las propiedades
         const propRes = await pool.query('SELECT id, alicuota, zona_id FROM propiedades WHERE condominio_id = $1', [condo_id]);
         const propiedades = propRes.rows;
 
-        // 2. Obtener cuotas del ciclo agrupadas por tipo/zona
         const cuotasRes = await pool.query(`
             SELECT gc.monto_cuota_usd, g.tipo, g.zona_id 
             FROM gastos_cuotas gc JOIN gastos g ON gc.gasto_id = g.id
-            WHERE g.condominio_id = $1 AND gc.ciclo_asignado = $2 AND gc.estado = 'Pendiente'
-        `, [condo_id, ciclo_actual]);
+            WHERE g.condominio_id = $1 AND gc.mes_asignado = $2 AND gc.estado = 'Pendiente'
+        `, [condo_id, mes_actual]);
         
         const cuotas = cuotasRes.rows;
 
-        // 3. REPARTO MATEMÁTICO (Actualizado para M:N)
         for (let p of propiedades) {
             let total_deuda_apto = 0;
-
-            // Buscamos a qué zonas pertenece este apartamento específico
             const zonasDelApto = await pool.query('SELECT zona_id FROM propiedades_zonas WHERE propiedad_id = $1', [p.id]);
-            const zonaIds = zonasDelApto.rows.map(z => z.zona_id); // Ej: [1, 5]
+            const zonaIds = zonasDelApto.rows.map(z => z.zona_id); 
 
             for (let c of cuotas) {
-                // Si es Gasto COMÚN (Para todos)
                 if (c.tipo === 'Comun') {
                     if (metodo_division === 'Partes Iguales') total_deuda_apto += (parseFloat(c.monto_cuota_usd) / propiedades.length);
                     else total_deuda_apto += (parseFloat(c.monto_cuota_usd) * (parseFloat(p.alicuota) / 100));
                 } 
-                // Si es Gasto NO COMÚN (Verificamos si el apto está en la zona del gasto)
                 else if (c.tipo === 'No Comun' && zonaIds.includes(c.zona_id)) {
-                    // Contamos cuántas propiedades hay en esa zona específica para dividir
                     const propsEnZonaRes = await pool.query('SELECT COUNT(*) FROM propiedades_zonas WHERE zona_id = $1', [c.zona_id]);
                     const cantidadEnZona = parseInt(propsEnZonaRes.rows[0].count);
 
                     if (metodo_division === 'Partes Iguales') {
                         total_deuda_apto += (parseFloat(c.monto_cuota_usd) / cantidadEnZona);
                     } else {
-                        // En No Comun por Alicuota, calculamos el % relativo a la zona
                         const alicuotasZonaRes = await pool.query(`
-                            SELECT SUM(p.alicuota) as total 
-                            FROM propiedades p 
-                            JOIN propiedades_zonas pz ON p.id = pz.propiedad_id 
-                            WHERE pz.zona_id = $1
+                            SELECT SUM(p.alicuota) as total FROM propiedades p JOIN propiedades_zonas pz ON p.id = pz.propiedad_id WHERE pz.zona_id = $1
                         `, [c.zona_id]);
                         const totalAlicuotaZona = parseFloat(alicuotasZonaRes.rows[0].total) || 100;
-                        
                         total_deuda_apto += (parseFloat(c.monto_cuota_usd) * (parseFloat(p.alicuota) / totalAlicuotaZona));
                     }
                 }
             }
+
+            if (total_deuda_apto > 0) {
+                await pool.query(`INSERT INTO recibos (propiedad_id, mes_cobro, monto_usd, estado) VALUES ($1, $2, $3, 'Aviso de Cobro')`,
+                [p.id, mes_cobro_texto, total_deuda_apto.toFixed(2)]);
+            }
         }
 
-        await pool.query(`UPDATE gastos_cuotas SET estado = 'Procesado' FROM gastos WHERE gastos_cuotas.gasto_id = gastos.id AND gastos.condominio_id = $1 AND gastos_cuotas.ciclo_asignado = $2`, [condo_id, ciclo_actual]);
-        await pool.query('UPDATE condominios SET ciclo_actual = ciclo_actual + 1 WHERE id = $1', [condo_id]);
+        // Marcar procesadas
+        await pool.query(`UPDATE gastos_cuotas SET estado = 'Procesado' FROM gastos WHERE gastos_cuotas.gasto_id = gastos.id AND gastos.condominio_id = $1 AND gastos_cuotas.mes_asignado = $2`, [condo_id, mes_actual]);
+        
+        // Avanzar el reloj al próximo mes calendario
+        const proximoMes = addMonths(mes_actual, 1);
+        await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [proximoMes, condo_id]);
 
-        res.json({ status: 'success', message: 'Cierre completado con reparto por zonas.' });
+        res.json({ status: 'success', message: `Recibos de ${mes_cobro_texto} generados. El condominio ha avanzado a ${formatMonthText(proximoMes)}.` });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // ==========================================
