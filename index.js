@@ -109,24 +109,21 @@ const upload = multer({
 app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount: 1 }, { name: 'soportes', maxCount: 4 }]), async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
-    const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota, tipo, zona_id, fecha_gasto } = req.body;
+    // Agregamos propiedad_id
+    const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota, tipo, zona_id, propiedad_id, fecha_gasto } = req.body;
     const parseNum = (v) => parseFloat(v.toString().replace(/\./g, '').replace(',', '.'));
 
     try {
         let facturaGuardada = null;
         let soportesGuardados = [];
 
-        // PROCESAMIENTO DE IMÁGENES
         if (req.files) {
-            // 1. Procesar la Factura Principal (Si viene)
             if (req.files['factura_img'] && req.files['factura_img'].length > 0) {
                 const file = req.files['factura_img'][0];
                 const uniqueName = `factura_${Date.now()}_${Math.round(Math.random() * 1E9)}.webp`;
                 await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
                 facturaGuardada = `/uploads/gastos/${uniqueName}`;
             }
-
-            // 2. Procesar los Soportes Adicionales (Si vienen)
             if (req.files['soportes'] && req.files['soportes'].length > 0) {
                 for (const file of req.files['soportes']) {
                     const uniqueName = `soporte_${Date.now()}_${Math.round(Math.random() * 1E9)}.webp`;
@@ -149,11 +146,15 @@ app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount:
         const mes_factura = fecha_gasto ? fecha_gasto.substring(0, 7) : mes_actual;
         const mes_inicio_cobro = (mes_factura > mes_actual) ? mes_factura : mes_actual;
 
-        // INSERTAMOS EL GASTO (Agregamos factura_img)
+        // Lógica de validación de campos según el tipo
+        const dbTipo = tipo || 'Comun';
+        const zId = (dbTipo === 'Zona' || dbTipo === 'No Comun') ? (zona_id || null) : null;
+        const pId = dbTipo === 'Individual' ? (propiedad_id || null) : null;
+
         const result = await pool.query(`
-            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, tipo, zona_id, fecha_gasto, factura_img, imagenes)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id
-        `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, tipo || 'Comun', zona_id || null, fecha_gasto || null, facturaGuardada, soportesGuardados]);
+            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, tipo, zona_id, propiedad_id, fecha_gasto, factura_img, imagenes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id
+        `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, dbTipo, zId, pId, fecha_gasto || null, facturaGuardada, soportesGuardados]);
 
         for (let i = 1; i <= total_cuotas; i++) {
             const mes_cuota = addMonths(mes_inicio_cobro, i - 1);
@@ -173,14 +174,15 @@ app.get('/gastos', verifyToken, async (req, res) => {
                    gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.mes_asignado, gc.estado,
                    TO_CHAR(g.created_at, 'DD/MM/YYYY') as fecha_registro,
                    TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha_factura,
-                   g.tipo, z.nombre as zona_nombre, 
-                   g.factura_img, g.imagenes, -- Traemos ambas columnas
+                   g.tipo, z.nombre as zona_nombre, prop.identificador as propiedad_identificador,
+                   g.factura_img, g.imagenes, 
                    GREATEST(0, g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_pendiente
             FROM gastos g
             JOIN gastos_cuotas gc ON g.id = gc.gasto_id
             JOIN proveedores p ON g.proveedor_id = p.id
             JOIN condominios c ON g.condominio_id = c.id
             LEFT JOIN zonas z ON g.zona_id = z.id
+            LEFT JOIN propiedades prop ON g.propiedad_id = prop.id
             WHERE c.admin_user_id = $1 ORDER BY g.id DESC, gc.numero_cuota ASC
         `, [req.user.id]);
         res.json({ status: 'success', gastos: result.rows });
@@ -240,21 +242,31 @@ app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
         const condoRes = await pool.query('SELECT id, mes_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         const { id: condo_id, mes_actual, metodo_division } = condoRes.rows[0];
         const propRes = await pool.query('SELECT id, alicuota, zona_id FROM propiedades WHERE condominio_id = $1', [condo_id]);
-        const cuotasRes = await pool.query(`SELECT gc.monto_cuota_usd, g.tipo, g.zona_id FROM gastos_cuotas gc JOIN gastos g ON gc.gasto_id = g.id WHERE g.condominio_id = $1 AND gc.mes_asignado = $2 AND gc.estado = 'Pendiente'`, [condo_id, mes_actual]);
+        
+        // Incluimos g.propiedad_id
+        const cuotasRes = await pool.query(`SELECT gc.monto_cuota_usd, g.tipo, g.zona_id, g.propiedad_id FROM gastos_cuotas gc JOIN gastos g ON gc.gasto_id = g.id WHERE g.condominio_id = $1 AND gc.mes_asignado = $2 AND gc.estado = 'Pendiente'`, [condo_id, mes_actual]);
+        
         for (let p of propRes.rows) {
             let total_deuda = 0;
             const zonasApto = await pool.query('SELECT zona_id FROM propiedades_zonas WHERE propiedad_id = $1', [p.id]);
             const zonaIds = zonasApto.rows.map(z => z.zona_id); 
+            
             for (let c of cuotasRes.rows) {
                 if (c.tipo === 'Comun') {
-                    if (metodo_division === 'Partes Iguales') total_deuda += (parseFloat(c.monto_cuota_usd) / propRes.rows.length); else total_deuda += (parseFloat(c.monto_cuota_usd) * (parseFloat(p.alicuota) / 100));
-                } else if (c.tipo === 'No Comun' && zonaIds.includes(c.zona_id)) {
+                    if (metodo_division === 'Partes Iguales') total_deuda += (parseFloat(c.monto_cuota_usd) / propRes.rows.length); 
+                    else total_deuda += (parseFloat(c.monto_cuota_usd) * (parseFloat(p.alicuota) / 100));
+                } 
+                else if ((c.tipo === 'No Comun' || c.tipo === 'Zona') && zonaIds.includes(c.zona_id)) {
                     const propsZona = await pool.query('SELECT COUNT(*) FROM propiedades_zonas WHERE zona_id = $1', [c.zona_id]);
                     if (metodo_division === 'Partes Iguales') total_deuda += (parseFloat(c.monto_cuota_usd) / parseInt(propsZona.rows[0].count));
                     else {
                         const sumAl = await pool.query(`SELECT SUM(p.alicuota) as total FROM propiedades p JOIN propiedades_zonas pz ON p.id = pz.propiedad_id WHERE pz.zona_id = $1`, [c.zona_id]);
                         total_deuda += (parseFloat(c.monto_cuota_usd) * (parseFloat(p.alicuota) / parseFloat(sumAl.rows[0].total)));
                     }
+                }
+                // NUEVA REGLA: GASTO INDIVIDUAL
+                else if (c.tipo === 'Individual' && c.propiedad_id === p.id) {
+                    total_deuda += parseFloat(c.monto_cuota_usd); // Se le suma el 100% de la cuota a su recibo
                 }
             }
             if (total_deuda > 0) await pool.query(`INSERT INTO recibos (propiedad_id, mes_cobro, monto_usd, estado) VALUES ($1, $2, $3, 'Aviso de Cobro')`, [p.id, formatMonthText(mes_actual), total_deuda.toFixed(2)]);
