@@ -27,12 +27,7 @@ if (!fs.existsSync(uploadsDir)) {
 // Hacer pública la carpeta de uploads para que el frontend pueda verlas
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Configurar Multer (Guarda temporalmente en memoria para que Sharp lo procese)
-const storage = multer.memoryStorage();
-const upload = multer({ 
-    storage: storage,
-    limits: { files: 4, fileSize: 10 * 1024 * 1024 } // Max 4 archivos, 10MB c/u
-});
+// Multer se configura más abajo en el módulo de gastos
 
 // Conexión a PostgreSQL
 const pool = new Pool({
