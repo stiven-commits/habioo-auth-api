@@ -98,32 +98,41 @@ const formatMonthText = (y_m) => {
 };
 
 // ==========================================
-// MÓDULO DE GASTOS (AHORA CON IMÁGENES)
+// MÓDULO DE GASTOS (FACTURA + SOPORTES)
 // ==========================================
-// Usamos upload.array('imagenes', 4) para atrapar los archivos
-app.post('/gastos', verifyToken, upload.array('imagenes', 4), async (req, res) => {
+// Configurar Multer para aceptar 2 campos distintos
+const upload = multer({ 
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 } // Max 10MB por archivo
+});
+
+app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount: 1 }, { name: 'soportes', maxCount: 4 }]), async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
-    // Al usar FormData, los campos de texto vienen en req.body
     const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota, tipo, zona_id, fecha_gasto } = req.body;
     const parseNum = (v) => parseFloat(v.toString().replace(/\./g, '').replace(',', '.'));
 
     try {
-        // PROCESAMIENTO DE IMÁGENES CON SHARP (A WebP)
-        let imagenesGuardadas = [];
-        if (req.files && req.files.length > 0) {
-            for (const file of req.files) {
-                // Generamos un nombre único: gasto_170000000_123.webp
-                const uniqueName = `gasto_${Date.now()}_${Math.round(Math.random() * 1E9)}.webp`;
-                const outputPath = path.join(uploadsDir, uniqueName);
+        let facturaGuardada = null;
+        let soportesGuardados = [];
 
-                await sharp(file.buffer)
-                    .resize({ width: 1200, withoutEnlargement: true }) // No más ancho de 1200px
-                    .webp({ quality: 80 }) // Compresión WebP al 80%
-                    .toFile(outputPath);
+        // PROCESAMIENTO DE IMÁGENES
+        if (req.files) {
+            // 1. Procesar la Factura Principal (Si viene)
+            if (req.files['factura_img'] && req.files['factura_img'].length > 0) {
+                const file = req.files['factura_img'][0];
+                const uniqueName = `factura_${Date.now()}_${Math.round(Math.random() * 1E9)}.webp`;
+                await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
+                facturaGuardada = `/uploads/gastos/${uniqueName}`;
+            }
 
-                // Guardamos la ruta relativa para la DB
-                imagenesGuardadas.push(`/uploads/gastos/${uniqueName}`);
+            // 2. Procesar los Soportes Adicionales (Si vienen)
+            if (req.files['soportes'] && req.files['soportes'].length > 0) {
+                for (const file of req.files['soportes']) {
+                    const uniqueName = `soporte_${Date.now()}_${Math.round(Math.random() * 1E9)}.webp`;
+                    await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
+                    soportesGuardados.push(`/uploads/gastos/${uniqueName}`);
+                }
             }
         }
 
@@ -140,18 +149,18 @@ app.post('/gastos', verifyToken, upload.array('imagenes', 4), async (req, res) =
         const mes_factura = fecha_gasto ? fecha_gasto.substring(0, 7) : mes_actual;
         const mes_inicio_cobro = (mes_factura > mes_actual) ? mes_factura : mes_actual;
 
-        // INSERTAMOS EL GASTO INCLUYENDO EL ARREGLO DE IMÁGENES
+        // INSERTAMOS EL GASTO (Agregamos factura_img)
         const result = await pool.query(`
-            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, tipo, zona_id, fecha_gasto, imagenes)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id
-        `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, tipo || 'Comun', zona_id || null, fecha_gasto || null, imagenesGuardadas]);
+            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, tipo, zona_id, fecha_gasto, factura_img, imagenes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id
+        `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, tipo || 'Comun', zona_id || null, fecha_gasto || null, facturaGuardada, soportesGuardados]);
 
         for (let i = 1; i <= total_cuotas; i++) {
             const mes_cuota = addMonths(mes_inicio_cobro, i - 1);
             await pool.query(`INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado) VALUES ($1, $2, $3, $4)`, 
             [result.rows[0].id, i, monto_cuota_usd, mes_cuota]);
         }
-        res.json({ status: 'success', message: 'Gasto e imágenes registrados con éxito.' });
+        res.json({ status: 'success', message: 'Gasto registrado con éxito.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -164,7 +173,8 @@ app.get('/gastos', verifyToken, async (req, res) => {
                    gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.mes_asignado, gc.estado,
                    TO_CHAR(g.created_at, 'DD/MM/YYYY') as fecha_registro,
                    TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha_factura,
-                   g.tipo, z.nombre as zona_nombre, g.imagenes,
+                   g.tipo, z.nombre as zona_nombre, 
+                   g.factura_img, g.imagenes, -- Traemos ambas columnas
                    GREATEST(0, g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_pendiente
             FROM gastos g
             JOIN gastos_cuotas gc ON g.id = gc.gasto_id
@@ -183,18 +193,26 @@ app.delete('/gastos/:id', verifyToken, async (req, res) => {
         const cuotasCheck = await pool.query("SELECT id FROM gastos_cuotas WHERE gasto_id = $1 AND estado != 'Pendiente'", [gastoId]);
         if (cuotasCheck.rows.length > 0) return res.status(400).json({ status: 'error', message: 'No puedes eliminar un gasto con cuotas procesadas.' });
 
-        // Extraer rutas de imagenes para borrarlas del servidor
-        const imgRes = await pool.query('SELECT imagenes FROM gastos WHERE id = $1', [gastoId]);
-        const imagenes = imgRes.rows[0]?.imagenes || [];
+        // Extraer rutas de imágenes para borrarlas del servidor
+        const imgRes = await pool.query('SELECT factura_img, imagenes FROM gastos WHERE id = $1', [gastoId]);
+        const { factura_img, imagenes } = imgRes.rows[0] || {};
 
         await pool.query('DELETE FROM gastos_cuotas WHERE gasto_id = $1', [gastoId]);
         await pool.query('DELETE FROM gastos WHERE id = $1', [gastoId]);
 
-        // Borrar fisicamente las imagenes
-        imagenes.forEach(imgPath => {
-            const fullPath = path.join(__dirname, imgPath);
+        // Borrar factura principal
+        if (factura_img) {
+            const fullPath = path.join(__dirname, factura_img);
             if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
-        });
+        }
+
+        // Borrar soportes
+        if (imagenes && imagenes.length > 0) {
+            imagenes.forEach(imgPath => {
+                const fullPath = path.join(__dirname, imgPath);
+                if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+            });
+        }
 
         res.json({ status: 'success', message: 'Gasto eliminado.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
