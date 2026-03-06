@@ -47,7 +47,6 @@ app.get('/', (req, res) => {
 // ==========================================
 app.get('/init-db', async (req, res) => {
     try {
-        // 1. Usuarios
         await pool.query(`
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -58,7 +57,6 @@ app.get('/init-db', async (req, res) => {
             );
         `);
 
-        // 2. Condominios
         await pool.query(`
             CREATE TABLE IF NOT EXISTS condominios (
                 id SERIAL PRIMARY KEY,
@@ -66,11 +64,11 @@ app.get('/init-db', async (req, res) => {
                 tipo VARCHAR(50) CHECK (tipo IN ('Junta General', 'Junta Individual')),
                 junta_general_id INT REFERENCES condominios(id),
                 tasa_interes DECIMAL(5,2) DEFAULT 0.00,
+                mes_actual VARCHAR(7) DEFAULT '2026-03',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
 
-        // 3. Propiedades
         await pool.query(`
             CREATE TABLE IF NOT EXISTS propiedades (
                 id SERIAL PRIMARY KEY,
@@ -81,7 +79,6 @@ app.get('/init-db', async (req, res) => {
             );
         `);
 
-        // 4. Tabla Puente (Usuarios - Propiedades)
         await pool.query(`
             CREATE TABLE IF NOT EXISTS usuarios_propiedades (
                 id SERIAL PRIMARY KEY,
@@ -92,21 +89,20 @@ app.get('/init-db', async (req, res) => {
             );
         `);
 
-        // 5. Recibos
         await pool.query(`
             CREATE TABLE IF NOT EXISTS recibos (
                 id SERIAL PRIMARY KEY,
                 propiedad_id INT REFERENCES propiedades(id) ON DELETE CASCADE,
-                mes_cobro VARCHAR(20) NOT NULL,
+                mes_cobro VARCHAR(50) NOT NULL,
                 monto_usd DECIMAL(10,2) NOT NULL,
-                estado VARCHAR(50) CHECK (estado IN ('Preliminar', 'Aviso de Cobro', 'Pagado', 'Validado')),
+                estado VARCHAR(50) CHECK (estado IN ('Preliminar', 'Aviso de Cobro', 'Pagado', 'Validado', 'Solvente', 'Abonado Parcial')),
                 fecha_emision TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 fecha_vencimiento TIMESTAMP,
                 n8n_pdf_url VARCHAR(255)
             );
         `);
 
-        res.json({ status: 'success', message: '¡Estructura de la Bóveda creada con éxito!' });
+        res.json({ status: 'success', message: '¡Estructura de la Bóveda actualizada con éxito!' });
     } catch (err) {
         res.status(500).json({ status: 'error', error: err.message });
     }
@@ -132,18 +128,13 @@ app.post('/register', async (req, res) => {
 
 app.post('/login', async (req, res) => {
     let { cedula, password } = req.body;
-    
     try {
-        // 1. LIMPIEZA AUTOMÁTICA: Quitamos guiones, espacios y ponemos mayúsculas
-        // Si llega "V-12345678", lo convertimos en "V12345678" antes de buscar
         const cedulaLimpia = cedula.toUpperCase().replace(/[^A-Z0-9]/g, '');
-
         const result = await pool.query('SELECT * FROM users WHERE cedula = $1', [cedulaLimpia]);
         const user = result.rows[0];
 
         if (!user) return res.status(401).json({ status: 'error', message: 'Credenciales inválidas' });
 
-        // 2. Comparamos la contraseña
         const validPassword = await bcrypt.compare(password, user.password);
         if (!validPassword) return res.status(401).json({ status: 'error', message: 'Credenciales inválidas' });
 
@@ -209,10 +200,9 @@ app.get('/mis-finanzas', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// REGISTRAR PROVEEDOR (Solo Juntas)
+// PROVEEDORES
 // ==========================================
 app.post('/proveedores', verifyToken, async (req, res) => {
-    // Validamos que el usuario sea una Junta (J-)
     if (!req.user.cedula.startsWith('J')) {
         return res.status(403).json({ status: 'error', message: 'Solo las Juntas de Condominio pueden registrar proveedores.' });
     }
@@ -227,23 +217,18 @@ app.post('/proveedores', verifyToken, async (req, res) => {
         
         res.json({ status: 'success', message: 'Proveedor registrado', id: result.rows[0].id });
     } catch (err) {
-        if (err.code === '23505') { // Código de Postgres para "Ya existe" (Unique Constraint)
-            return res.status(400).json({ status: 'error', message: 'Este proveedor ya existe en el directorio nacional.' });
+        if (err.code === '23505') { 
+            return res.status(400).json({ status: 'error', message: 'Este proveedor ya existe.' });
         }
         res.status(500).json({ status: 'error', error: err.message });
     }
 });
 
-// ==========================================
-// OBTENER DIRECTORIO DE PROVEEDORES
-// ==========================================
 app.get('/proveedores', verifyToken, async (req, res) => {
     try {
-        // Ahora sí pedimos todos los datos: telefonos, direccion y estado
         const result = await pool.query(`
             SELECT id, identificador, nombre, telefono1, telefono2, direccion, estado_venezuela 
-            FROM proveedores 
-            ORDER BY nombre ASC
+            FROM proveedores ORDER BY nombre ASC
         `);
         res.json({ status: 'success', proveedores: result.rows });
     } catch (err) {
@@ -252,10 +237,10 @@ app.get('/proveedores', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// HELPERS DE CALENDARIO (NUEVO)
+// HELPERS DE CALENDARIO (NUEVO MOTOR)
 // ==========================================
-// Suma meses a una fecha YYYY-MM y avanza el año si es necesario
 const addMonths = (yyyy_mm, monthsToAdd) => {
+    if (!yyyy_mm) return null;
     let [year, month] = yyyy_mm.split('-').map(Number);
     month += monthsToAdd;
     while (month > 12) {
@@ -265,59 +250,83 @@ const addMonths = (yyyy_mm, monthsToAdd) => {
     return `${year}-${month.toString().padStart(2, '0')}`;
 };
 
-// Convierte "2026-03" en "Marzo 2026"
 const formatMonthText = (yyyy_mm) => {
     if (!yyyy_mm) return '';
     const [year, month] = yyyy_mm.split('-');
     const meses = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
     return `${meses[parseInt(month) - 1]} ${year}`;
 };
-
 // ==========================================
-// RUTA: REGISTRAR GASTO (Meses Calendario)
+// RUTA: REGISTRAR GASTO (Con Fecha Inteligente)
 // ==========================================
 app.post('/gastos', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
-    const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota, tipo, zona_id } = req.body;
+    // 1. AQUÍ RECIBIMOS fecha_gasto DEL FRONTEND:
+    const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota, tipo, zona_id, fecha_gasto } = req.body;
     const parseNum = (v) => parseFloat(v.toString().replace(/\./g, '').replace(',', '.'));
 
     try {
         const m_bs = parseNum(monto_bs);
         const t_c = parseNum(tasa_cambio);
         
-        // CORRECCIÓN AQUÍ: Pedimos 'mes_actual' en lugar de 'ciclo_actual'
         const condoRes = await pool.query('SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        if (condoRes.rows.length === 0) return res.status(404).json({ error: 'Condominio no encontrado' });
         
         const condominio_id = condoRes.rows[0].id;
-        const mes_actual = condoRes.rows[0].mes_actual;
+        const mes_actual = condoRes.rows[0].mes_actual; 
         
         const monto_usd = (m_bs / t_c).toFixed(2);
         const monto_cuota_usd = (monto_usd / parseInt(total_cuotas)).toFixed(2);
 
-        const result = await pool.query(`
-            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, tipo, zona_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id
-        `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, tipo || 'Comun', zona_id || null]);
+        // 2. LÓGICA PARA ASIGNAR EL MES:
+        const mes_factura = fecha_gasto ? fecha_gasto.substring(0, 7) : mes_actual;
+        const mes_inicio_cobro = (mes_factura > mes_actual) ? mes_factura : mes_actual;
 
-        // Inyectar cuotas proyectando los meses al futuro
+        // 3. AQUÍ INSERTAMOS LA fecha_gasto EN LA BASE DE DATOS:
+        const result = await pool.query(`
+            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, tipo, zona_id, fecha_gasto)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id
+        `, [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, tipo || 'Comun', zona_id || null, fecha_gasto || null]);
+
         for (let i = 1; i <= total_cuotas; i++) {
-            // Usamos la función addMonths para calcular "Marzo + 1 = Abril"
-            const mes_cuota = addMonths(mes_actual, i - 1);
-            
-            // CORRECCIÓN AQUÍ: Insertamos en 'mes_asignado' en lugar de 'ciclo_asignado'
+            const mes_cuota = addMonths(mes_inicio_cobro, i - 1);
             await pool.query(`INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado) VALUES ($1, $2, $3, $4)`, 
             [result.rows[0].id, i, monto_cuota_usd, mes_cuota]);
         }
-        res.json({ status: 'success', message: 'Gasto registrado correctamente.' });
+        res.json({ status: 'success', message: 'Gasto registrado y asignado al mes correspondiente.' });
     } catch (err) { 
         res.status(500).json({ error: err.message }); 
     }
 });
+// ==========================================
+// OBTENER HISTORIAL DE GASTOS (Con 2 fechas)
+// ==========================================
+app.get('/gastos', verifyToken, async (req, res) => {
+    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
+    try {
+        const result = await pool.query(`
+            SELECT g.id as gasto_id, gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio, 
+                   g.monto_usd as monto_total_usd, g.nota, p.nombre as proveedor, 
+                   gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.mes_asignado, gc.estado,
+                   TO_CHAR(g.created_at, 'DD/MM/YYYY') as fecha_registro,
+                   TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha_factura,
+                   g.tipo, z.nombre as zona_nombre,
+                   GREATEST(0, g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_pendiente
+            FROM gastos g
+            JOIN gastos_cuotas gc ON g.id = gc.gasto_id
+            JOIN proveedores p ON g.proveedor_id = p.id
+            JOIN condominios c ON g.condominio_id = c.id
+            LEFT JOIN zonas z ON g.zona_id = z.id
+            WHERE c.admin_user_id = $1
+            ORDER BY g.id DESC, gc.numero_cuota ASC
+        `, [req.user.id]);
+        
+        res.json({ status: 'success', gastos: result.rows });
+    } catch (err) { res.status(500).json({ status: 'error', error: err.message }); }
+});
 
-// ==========================================
-// OBTENER HISTORIAL DE GASTOS
-// ==========================================
 app.get('/gastos', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
@@ -339,29 +348,34 @@ app.get('/gastos', verifyToken, async (req, res) => {
         `, [req.user.id]);
         
         res.json({ status: 'success', gastos: result.rows });
-    } catch (err) { res.status(500).json({ status: 'error', error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
 });
 
-// ==========================================
-// ELIMINAR UN GASTO (Se mantiene igual)
-// ==========================================
 app.delete('/gastos/:id', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+    
     try {
         const gastoId = req.params.id;
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         
         const cuotasCheck = await pool.query("SELECT id FROM gastos_cuotas WHERE gasto_id = $1 AND estado != 'Pendiente'", [gastoId]);
-        if (cuotasCheck.rows.length > 0) return res.status(400).json({ status: 'error', message: 'Por auditoría, no puedes eliminar un gasto con cuotas procesadas.' });
+        if (cuotasCheck.rows.length > 0) {
+            return res.status(400).json({ status: 'error', message: 'Por auditoría, no puedes eliminar un gasto con cuotas procesadas.' });
+        }
 
         await pool.query('DELETE FROM gastos_cuotas WHERE gasto_id = $1', [gastoId]);
         await pool.query('DELETE FROM gastos WHERE id = $1 AND condominio_id = $2', [gastoId, condoRes.rows[0].id]);
-        res.json({ status: 'success', message: 'Gasto eliminado.' });
-    } catch (err) { res.status(500).json({ status: 'error', error: err.message }); }
+
+        res.json({ status: 'success', message: 'Gasto eliminado exitosamente.' });
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
 });
 
 // ==========================================
-// VER EL PRELIMINAR (Mes Calendario)
+// VER EL PRELIMINAR Y PROYECCIONES FUTURAS
 // ==========================================
 app.get('/preliminar', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
@@ -372,46 +386,52 @@ app.get('/preliminar', verifyToken, async (req, res) => {
         
         const { id: condominio_id, mes_actual, metodo_division } = condoRes.rows[0];
 
+        // Traemos los gastos del mes actual Y DE LOS FUTUROS (>=)
         const gastosRes = await pool.query(`
             SELECT 
                 g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, 
                 p.nombre as proveedor, g.nota, g.monto_usd as monto_total_usd,
+                gc.mes_asignado,
                 (g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_restante
             FROM gastos_cuotas gc
             JOIN gastos g ON gc.gasto_id = g.id
             JOIN proveedores p ON g.proveedor_id = p.id
             WHERE g.condominio_id = $1 
-              AND gc.mes_asignado = $2 
+              AND gc.mes_asignado >= $2 
               AND (gc.estado = 'Pendiente' OR gc.estado IS NULL)
               AND g.tipo = 'Comun' 
+            ORDER BY gc.mes_asignado ASC
         `, [condominio_id, mes_actual]);
 
-        const total_usd = gastosRes.rows.reduce((sum, item) => sum + parseFloat(item.monto_cuota_usd), 0);
+        // El Total USD real a cobrar es SOLO lo del mes_actual
+        const total_usd = gastosRes.rows
+            .filter(g => g.mes_asignado === mes_actual)
+            .reduce((sum, item) => sum + parseFloat(item.monto_cuota_usd), 0);
 
-        const alicuotasRes = await pool.query('SELECT DISTINCT alicuota FROM propiedades WHERE condominio_id = $1 ORDER BY alicuota ASC', [condominio_id]);
+        const alicuotasRes = await pool.query(`SELECT DISTINCT alicuota FROM propiedades WHERE condominio_id = $1 ORDER BY alicuota ASC`, [condominio_id]);
         const alicuotas = alicuotasRes.rows.map(r => parseFloat(r.alicuota));
 
         res.json({ 
             status: 'success', 
             mes_actual, 
-            mes_texto: formatMonthText(mes_actual), // Enviamos el texto "Marzo 2026" listo
+            mes_texto: formatMonthText(mes_actual),
             metodo_division, 
-            gastos: gastosRes.rows, 
+            gastos: gastosRes.rows, // Enviamos TODO (Presente y Futuro)
             total_usd: total_usd.toFixed(2),
             alicuotas_disponibles: alicuotas
         });
-    } catch (err) { res.status(500).json({ status: 'error', error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ status: 'error', error: err.message });
+    }
 });
 
-// ==========================================
-// MOTOR DE CIERRE: REPARTO POR MES Y ZONAS
-// ==========================================
 app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
     try {
         const condoRes = await pool.query('SELECT id, mes_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         const { id: condo_id, mes_actual, metodo_division } = condoRes.rows[0];
+        
         const mes_cobro_texto = formatMonthText(mes_actual);
 
         const propRes = await pool.query('SELECT id, alicuota, zona_id FROM propiedades WHERE condominio_id = $1', [condo_id]);
@@ -442,9 +462,7 @@ app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
                     if (metodo_division === 'Partes Iguales') {
                         total_deuda_apto += (parseFloat(c.monto_cuota_usd) / cantidadEnZona);
                     } else {
-                        const alicuotasZonaRes = await pool.query(`
-                            SELECT SUM(p.alicuota) as total FROM propiedades p JOIN propiedades_zonas pz ON p.id = pz.propiedad_id WHERE pz.zona_id = $1
-                        `, [c.zona_id]);
+                        const alicuotasZonaRes = await pool.query(`SELECT SUM(p.alicuota) as total FROM propiedades p JOIN propiedades_zonas pz ON p.id = pz.propiedad_id WHERE pz.zona_id = $1`, [c.zona_id]);
                         const totalAlicuotaZona = parseFloat(alicuotasZonaRes.rows[0].total) || 100;
                         total_deuda_apto += (parseFloat(c.monto_cuota_usd) * (parseFloat(p.alicuota) / totalAlicuotaZona));
                     }
@@ -457,21 +475,18 @@ app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
             }
         }
 
-        // Marcar procesadas
         await pool.query(`UPDATE gastos_cuotas SET estado = 'Procesado' FROM gastos WHERE gastos_cuotas.gasto_id = gastos.id AND gastos.condominio_id = $1 AND gastos_cuotas.mes_asignado = $2`, [condo_id, mes_actual]);
         
-        // Avanzar el reloj al próximo mes calendario
         const proximoMes = addMonths(mes_actual, 1);
         await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [proximoMes, condo_id]);
 
-        res.json({ status: 'success', message: `Recibos de ${mes_cobro_texto} generados. El condominio ha avanzado a ${formatMonthText(proximoMes)}.` });
+        res.json({ status: 'success', message: `Recibos de ${mes_cobro_texto} generados con éxito. Avanzando a ${formatMonthText(proximoMes)}.` });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-// ==========================================
-// GESTIÓN DE PROPIEDADES E INQUILINOS (Lógica Fase 3)
-// ==========================================
 
-// 1. OBTENER (Con datos de Dueño e Inquilino)
+// ==========================================
+// GESTIÓN DE PROPIEDADES E INQUILINOS
+// ==========================================
 app.get('/propiedades-admin', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
@@ -499,7 +514,6 @@ app.get('/propiedades-admin', verifyToken, async (req, res) => {
     }
 });
 
-// 2. CREAR (Genera usuarios automáticos)
 app.post('/propiedades-admin', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
@@ -509,7 +523,6 @@ app.post('/propiedades-admin', verifyToken, async (req, res) => {
         tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono 
     } = req.body;
     
-    // Función auxiliar para buscar o crear usuario
     const findOrCreateUser = async (nombre, cedula, email, telefono) => {
         if (!cedula) return null;
         let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedula]);
@@ -521,7 +534,7 @@ app.post('/propiedades-admin', verifyToken, async (req, res) => {
             return userRes.rows[0].id;
         } else {
             const salt = await bcrypt.genSalt(10);
-            const hashedPassword = await bcrypt.hash(cedula, salt); // Clave inicial = Cédula
+            const hashedPassword = await bcrypt.hash(cedula, salt);
             const newUser = await pool.query(
                 'INSERT INTO users (nombre, cedula, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
                 [nombre, cedula, email, telefono, hashedPassword]
@@ -532,9 +545,7 @@ app.post('/propiedades-admin', verifyToken, async (req, res) => {
 
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
-        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
         const condominio_id = condoRes.rows[0].id;
-        
         const parsedAlicuota = parseFloat(alicuota.toString().replace(',', '.')) || 0;
 
         const propRes = await pool.query(
@@ -544,30 +555,17 @@ app.post('/propiedades-admin', verifyToken, async (req, res) => {
         const propiedad_id = propRes.rows[0].id;
 
         const propUserId = await findOrCreateUser(prop_nombre, prop_cedula, prop_email, prop_telefono);
-        if (propUserId) {
-            await pool.query(
-                'INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)',
-                [propUserId, propiedad_id, 'Propietario']
-            );
-        }
+        if (propUserId) await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [propUserId, propiedad_id, 'Propietario']);
 
         if (tiene_inquilino && inq_cedula) {
             const inqUserId = await findOrCreateUser(inq_nombre, inq_cedula, inq_email, inq_telefono);
-            if (inqUserId) {
-                await pool.query(
-                    'INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)',
-                    [inqUserId, propiedad_id, 'Inquilino']
-                );
-            }
+            if (inqUserId) await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [inqUserId, propiedad_id, 'Inquilino']);
         }
 
-        res.json({ status: 'success', message: 'Inmueble y residentes registrados con acceso.' });
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
+        res.json({ status: 'success', message: 'Inmueble registrado.' });
+    } catch (err) { res.status(500).json({ status: 'error', error: err.message }); }
 });
 
-// 3. EDITAR (Permite cambiar contraseñas y corregir datos)
 app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
     
@@ -580,7 +578,6 @@ app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
 
     const upsertUser = async (rol, nombre, cedula, email, telefono, password) => {
         if (!cedula) return;
-
         let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedula]);
         let userId;
 
@@ -602,18 +599,12 @@ app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
         } else {
             const salt = await bcrypt.genSalt(10);
             const hash = await bcrypt.hash(password || cedula, salt); 
-            const newUser = await pool.query(
-                'INSERT INTO users (nombre, cedula, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-                [nombre, cedula, email, telefono, hash]
-            );
+            const newUser = await pool.query('INSERT INTO users (nombre, cedula, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [nombre, cedula, email, telefono, hash]);
             userId = newUser.rows[0].id;
         }
 
         await pool.query("DELETE FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2", [propId, rol]);
-        await pool.query(
-            'INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-            [userId, propId, rol]
-        );
+        await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [userId, propId, rol]);
     };
 
     try {
@@ -627,114 +618,69 @@ app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
             await pool.query("DELETE FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = 'Inquilino'", [propId]);
         }
 
-        res.json({ status: 'success', message: 'Datos actualizados correctamente.' });
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
+        res.json({ status: 'success', message: 'Datos actualizados.' });
+    } catch (err) { res.status(500).json({ status: 'error', error: err.message }); }
 });
+
 // ==========================================
 // CUENTAS POR COBRAR (Avisos de Cobro)
 // ==========================================
 app.get('/cuentas-por-cobrar', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
-    
     try {
-        // 1. Buscamos la Junta
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 ORDER BY id ASC LIMIT 1', [req.user.id]);
-        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
-        
-        const condominio_id = condoRes.rows[0].id;
-
-        // 2. Buscamos todos los recibos de las propiedades de este condominio
         const result = await pool.query(`
-            SELECT r.id, p.identificador as inmueble, r.mes_cobro as ciclo, r.monto_usd, r.estado, 
-                   TO_CHAR(r.fecha_emision, 'DD/MM/YYYY') as fecha
-            FROM recibos r
-            JOIN propiedades p ON r.propiedad_id = p.id
-            WHERE p.condominio_id = $1
-            ORDER BY r.id DESC
-        `, [condominio_id]);
-
+            SELECT r.id, p.identificador as inmueble, r.mes_cobro as ciclo, r.monto_usd, r.estado, TO_CHAR(r.fecha_emision, 'DD/MM/YYYY') as fecha
+            FROM recibos r JOIN propiedades p ON r.propiedad_id = p.id WHERE p.condominio_id = $1 ORDER BY r.id DESC
+        `, [condoRes.rows[0].id]);
         res.json({ status: 'success', recibos: result.rows });
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 // ==========================================
 // GESTIÓN DE CUENTAS BANCARIAS
 // ==========================================
 app.get('/bancos', verifyToken, async (req, res) => {
     try {
-        const result = await pool.query(`
-            SELECT cb.* FROM cuentas_bancarias cb
-            JOIN condominios c ON cb.condominio_id = c.id
-            WHERE c.admin_user_id = $1 ORDER BY cb.nombre_banco ASC
-        `, [req.user.id]);
+        const result = await pool.query(`SELECT cb.* FROM cuentas_bancarias cb JOIN condominios c ON cb.condominio_id = c.id WHERE c.admin_user_id = $1 ORDER BY cb.nombre_banco ASC`, [req.user.id]);
         res.json({ status: 'success', bancos: result.rows });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// CREAR BANCO (Con Tipo)
 app.post('/bancos', verifyToken, async (req, res) => {
     const { numero_cuenta, nombre_banco, apodo, tipo } = req.body;
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
-        await pool.query(
-            'INSERT INTO cuentas_bancarias (condominio_id, numero_cuenta, nombre_banco, apodo, tipo) VALUES ($1, $2, $3, $4, $5)',
-            [condoRes.rows[0].id, numero_cuenta, nombre_banco, apodo, tipo]
-        );
+        await pool.query('INSERT INTO cuentas_bancarias (condominio_id, numero_cuenta, nombre_banco, apodo, tipo) VALUES ($1, $2, $3, $4, $5)', [condoRes.rows[0].id, numero_cuenta, nombre_banco, apodo, tipo]);
         res.json({ status: 'success', message: 'Cuenta registrada.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-// ELIMINAR BANCO
+
 app.delete('/bancos/:id', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
-
     try {
-        // Opcional: Podrías validar aquí si la cuenta ya tiene pagos asociados para no romper la contabilidad
-        // const check = await pool.query('SELECT id FROM pagos WHERE cuenta_bancaria_id = $1 LIMIT 1', [req.params.id]);
-        // if (check.rows.length > 0) return res.status(400).json({ status: 'error', message: 'No se puede eliminar: Tiene pagos registrados.' });
-
         await pool.query('DELETE FROM cuentas_bancarias WHERE id = $1', [req.params.id]);
         res.json({ status: 'success', message: 'Cuenta eliminada.' });
-    } catch (err) { 
-        res.status(500).json({ error: err.message }); 
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 // ==========================================
 // GESTIÓN DE ZONAS (Multizona con Auditoría)
 // ==========================================
 app.get('/zonas', verifyToken, async (req, res) => {
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
-        if (condoRes.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado' });
         const condo_id = condoRes.rows[0].id;
 
-        // Buscamos zonas y calculamos si tienen gastos asociados (Auditoría)
-        const zonasRes = await pool.query(`
-            SELECT z.id, z.nombre, z.activa,
-                   (SELECT COUNT(*) FROM gastos g WHERE g.zona_id = z.id) > 0 as tiene_gastos
-            FROM zonas z 
-            WHERE z.condominio_id = $1 
-            ORDER BY z.activa DESC, z.nombre ASC
-        `, [condo_id]);
-        
+        const zonasRes = await pool.query(`SELECT z.id, z.nombre, z.activa, (SELECT COUNT(*) FROM gastos g WHERE g.zona_id = z.id) > 0 as tiene_gastos FROM zonas z WHERE z.condominio_id = $1 ORDER BY z.activa DESC, z.nombre ASC`, [condo_id]);
         const zonas = zonasRes.rows;
 
-        // Adjuntamos las propiedades de cada zona
         for (let zona of zonas) {
-            const propsRes = await pool.query(`
-                SELECT p.id, p.identificador 
-                FROM propiedades p
-                JOIN propiedades_zonas pz ON p.id = pz.propiedad_id
-                WHERE pz.zona_id = $1
-            `, [zona.id]);
+            const propsRes = await pool.query(`SELECT p.id, p.identificador FROM propiedades p JOIN propiedades_zonas pz ON p.id = pz.propiedad_id WHERE pz.zona_id = $1`, [zona.id]);
             zona.propiedades = propsRes.rows;
-            zona.propiedades_ids = propsRes.rows.map(p => p.id); // Para facilitar la edición en frontend
+            zona.propiedades_ids = propsRes.rows.map(p => p.id);
         }
 
         const allProps = await pool.query('SELECT id, identificador FROM propiedades WHERE condominio_id = $1 ORDER BY identificador ASC', [condo_id]);
-
         res.json({ status: 'success', zonas, todas_propiedades: allProps.rows });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -743,91 +689,56 @@ app.post('/zonas', verifyToken, async (req, res) => {
     const { nombre, propiedades_ids } = req.body;
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        const zonaRes = await pool.query('INSERT INTO zonas (condominio_id, nombre, activa) VALUES ($1, $2, true) RETURNING id', [condoRes.rows[0].id, nombre]);
         
-        const zonaRes = await pool.query(
-            'INSERT INTO zonas (condominio_id, nombre, activa) VALUES ($1, $2, true) RETURNING id',
-            [condoRes.rows[0].id, nombre]
-        );
-        const zona_id = zonaRes.rows[0].id;
-
         if (propiedades_ids && propiedades_ids.length > 0) {
-            for (let prop_id of propiedades_ids) {
-                await pool.query('INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [zona_id, prop_id]);
-            }
+            for (let prop_id of propiedades_ids) await pool.query('INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [zonaRes.rows[0].id, prop_id]);
         }
         res.json({ status: 'success', message: 'Zona creada exitosamente.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// NUEVO: Editar Zona (Nombre, Propiedades y Estado)
 app.put('/zonas/:id', verifyToken, async (req, res) => {
     const { id } = req.params;
     const { nombre, propiedades_ids, activa } = req.body;
-    
     try {
-        // 1. Verificar si tiene gastos (Seguridad extra aunque el frontend lo bloquee)
         const checkGastos = await pool.query('SELECT COUNT(*) FROM gastos WHERE zona_id = $1', [id]);
         const tieneGastos = parseInt(checkGastos.rows[0].count) > 0;
 
-        // Actualizamos datos básicos
         await pool.query('UPDATE zonas SET nombre = $1, activa = $2 WHERE id = $3', [nombre, activa, id]);
 
-        // Si NO tiene gastos, permitimos cambiar la estructura de apartamentos
-        // Si TIENE gastos, protegemos la estructura para no romper recibos viejos, pero permitimos cambiar nombre/estado
         if (!tieneGastos && propiedades_ids) {
-            // Borramos relaciones viejas y ponemos las nuevas
             await pool.query('DELETE FROM propiedades_zonas WHERE zona_id = $1', [id]);
-            for (let prop_id of propiedades_ids) {
-                await pool.query('INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [id, prop_id]);
-            }
+            for (let prop_id of propiedades_ids) await pool.query('INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [id, prop_id]);
         }
-
         res.json({ status: 'success', message: 'Zona actualizada.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete('/zonas/:id', verifyToken, async (req, res) => {
     try {
-        // Validación de seguridad: No borrar si hay gastos
         const check = await pool.query('SELECT id FROM gastos WHERE zona_id = $1 LIMIT 1', [req.params.id]);
-        if (check.rows.length > 0) {
-            return res.status(400).json({ status: 'error', message: 'No se puede eliminar: Esta zona tiene historial contable. Desactívala en su lugar.' });
-        }
+        if (check.rows.length > 0) return res.status(400).json({ status: 'error', message: 'No se puede eliminar: Tiene historial contable.' });
 
         await pool.query('DELETE FROM zonas WHERE id = $1', [req.params.id]);
         res.json({ status: 'success', message: 'Zona eliminada.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 // ==========================================
 // HISTORIAL DE RECIBOS (Administrador)
 // ==========================================
 app.get('/recibos-historial', verifyToken, async (req, res) => {
-    if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
-
     try {
         const result = await pool.query(`
-            SELECT 
-                r.id, 
-                r.mes_cobro, 
-                r.monto_usd, 
-                r.estado, 
-                TO_CHAR(r.fecha_emision, 'DD/MM/YYYY') as fecha,
-                p.identificador as apto,
-                u.nombre as propietario
-            FROM recibos r
-            JOIN propiedades p ON r.propiedad_id = p.id
-            LEFT JOIN usuarios_propiedades up ON p.id = up.propiedad_id AND up.rol = 'Propietario'
-            LEFT JOIN users u ON up.user_id = u.id
-            JOIN condominios c ON p.condominio_id = c.id
-            WHERE c.admin_user_id = $1
-            ORDER BY r.id DESC
+            SELECT r.id, r.mes_cobro, r.monto_usd, r.estado, TO_CHAR(r.fecha_emision, 'DD/MM/YYYY') as fecha, p.identificador as apto, u.nombre as propietario
+            FROM recibos r JOIN propiedades p ON r.propiedad_id = p.id LEFT JOIN usuarios_propiedades up ON p.id = up.propiedad_id AND up.rol = 'Propietario' LEFT JOIN users u ON up.user_id = u.id JOIN condominios c ON p.condominio_id = c.id
+            WHERE c.admin_user_id = $1 ORDER BY r.id DESC
         `, [req.user.id]);
-
         res.json({ status: 'success', recibos: result.rows });
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 // ==========================================
 // TESORERÍA: REGISTRAR PAGO (ADMIN)
 // ==========================================
@@ -835,51 +746,33 @@ app.post('/pagos-admin', verifyToken, async (req, res) => {
     if (!req.user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
 
     const { recibo_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota } = req.body;
-
-    // Helper para limpiar números (1.000,50 -> 1000.50)
     const parseMonto = (val) => parseFloat(val.toString().replace(/\./g, '').replace(',', '.'));
 
     try {
         const monto = parseMonto(monto_origen);
-        const tasa = parseMonto(tasa_cambio) || 1; // Si es Zelle/Efectivo tasa es 1
-        
-        // 1. Calcular el valor real en Dólares
+        const tasa = parseMonto(tasa_cambio) || 1; 
         const monto_usd_final = (monto / tasa).toFixed(2);
 
-        // 2. Obtener datos de la cuenta para saber el método
         const cuentaRes = await pool.query('SELECT tipo FROM cuentas_bancarias WHERE id = $1', [cuenta_id]);
         const metodo = cuentaRes.rows[0]?.tipo || 'Desconocido';
 
-        // 3. Registrar el Pago (Ya nace VALIDADO porque lo hace el Admin)
-        await pool.query(`
-            INSERT INTO pagos (recibo_id, cuenta_bancaria_id, monto_origen, tasa_cambio, monto_usd, referencia, fecha_pago, metodo, estado, nota)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Validado', $9)
-        `, [recibo_id, cuenta_id, monto, tasa, monto_usd_final, referencia, fecha_pago, metodo, nota]);
+        await pool.query(`INSERT INTO pagos (recibo_id, cuenta_bancaria_id, monto_origen, tasa_cambio, monto_usd, referencia, fecha_pago, metodo, estado, nota) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Validado', $9)`, 
+        [recibo_id, cuenta_id, monto, tasa, monto_usd_final, referencia, fecha_pago, metodo, nota]);
 
-        // 4. Actualizar el estado del Recibo (Conciliación)
-        // Sumamos todos los pagos validados de este recibo
         const pagosRes = await pool.query("SELECT SUM(monto_usd) as total_pagado FROM pagos WHERE recibo_id = $1 AND estado = 'Validado'", [recibo_id]);
         const totalPagado = parseFloat(pagosRes.rows[0].total_pagado || 0);
 
-        // Buscamos el monto original del recibo
         const reciboRes = await pool.query('SELECT monto_usd FROM recibos WHERE id = $1', [recibo_id]);
         const deudaTotal = parseFloat(reciboRes.rows[0].monto_usd);
 
-        // Decidimos el nuevo estado
         let nuevoEstado = 'Aviso de Cobro';
-        if (totalPagado >= deudaTotal - 0.05) { // Tolerancia de 5 centavos por redondeo
-            nuevoEstado = 'Solvente';
-        } else if (totalPagado > 0) {
-            nuevoEstado = 'Abonado Parcial';
-        }
+        if (totalPagado >= deudaTotal - 0.05) nuevoEstado = 'Solvente';
+        else if (totalPagado > 0) nuevoEstado = 'Abonado Parcial';
 
         await pool.query('UPDATE recibos SET estado = $1 WHERE id = $2', [nuevoEstado, recibo_id]);
+        res.json({ status: 'success', message: 'Pago registrado exitosamente.', nuevo_estado: nuevoEstado });
 
-        res.json({ status: 'success', message: 'Pago registrado y conciliado exitosamente.', nuevo_estado: nuevoEstado });
-
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
