@@ -236,7 +236,7 @@ app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
     try {
         const condoRes = await pool.query('SELECT id, mes_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         const { id: condo_id, mes_actual, metodo_division } = condoRes.rows[0];
-        const propRes = await pool.query('SELECT id, alicuota, zona_id FROM propiedades WHERE condominio_id = $1', [condo_id]);
+        const propRes = await pool.query('SELECT id, alicuota FROM propiedades WHERE condominio_id = $1', [condo_id]);
         
         // Incluimos g.propiedad_id
         const cuotasRes = await pool.query(`SELECT gc.monto_cuota_usd, g.tipo, g.zona_id, g.propiedad_id FROM gastos_cuotas gc JOIN gastos g ON gc.gasto_id = g.id WHERE g.condominio_id = $1 AND gc.mes_asignado = $2 AND gc.estado = 'Pendiente'`, [condo_id, mes_actual]);
@@ -318,6 +318,31 @@ app.post('/bancos', verifyToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// RUTA PARA SETEAR LA CUENTA PREDETERMINADA
+app.put('/bancos/:id/predeterminada', verifyToken, async (req, res) => {
+    try {
+        const cuentaId = req.params.id;
+        const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        const condoId = c.rows[0].id;
+
+        // Iniciamos la transacción para asegurar que no queden 2 cuentas activas por error
+        await pool.query('BEGIN');
+        
+        // 1. Apagamos el marcador en todas las cuentas de este condominio
+        await pool.query('UPDATE cuentas_bancarias SET es_predeterminada = false WHERE condominio_id = $1', [condoId]);
+        
+        // 2. Encendemos el marcador SÓLO en la cuenta seleccionada
+        await pool.query('UPDATE cuentas_bancarias SET es_predeterminada = true WHERE id = $1 AND condominio_id = $2', [cuentaId, condoId]);
+        
+        await pool.query('COMMIT'); // Guardamos los cambios de forma segura
+        
+        res.json({ status: 'success', message: 'Cuenta principal actualizada con éxito.' });
+    } catch (err) { 
+        await pool.query('ROLLBACK'); // Si algo falla, deshacemos para no romper nada
+        res.status(500).json({ error: err.message }); 
+    }
+});
+
 app.delete('/bancos/:id', verifyToken, async (req, res) => {
     try { await pool.query('DELETE FROM cuentas_bancarias WHERE id = $1', [req.params.id]); res.json({ status: 'success' }); } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -357,4 +382,108 @@ app.get('/recibos-historial', verifyToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Obtener fondos del condominio
+app.get('/fondos', verifyToken, async (req, res) => {
+    try {
+        const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        const result = await pool.query(`
+            SELECT f.*, cb.nombre_banco, cb.apodo 
+            FROM fondos f 
+            JOIN cuentas_bancarias cb ON f.cuenta_bancaria_id = cb.id 
+            WHERE f.condominio_id = $1 
+            ORDER BY cb.nombre_banco ASC, f.es_operativo DESC, f.nombre ASC
+        `, [condoRes.rows[0].id]);
+        res.json({ status: 'success', fondos: result.rows });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Crear fondo con saldo inicial
+app.post('/fondos', verifyToken, async (req, res) => {
+    const { cuenta_bancaria_id, nombre, moneda, porcentaje, saldo_inicial, es_operativo } = req.body;
+    try {
+        const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        const fondo = await pool.query(
+            'INSERT INTO fondos (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+            [condoRes.rows[0].id, cuenta_bancaria_id, nombre, moneda, porcentaje, saldo_inicial, es_operativo || false]
+        );
+        
+        if (parseFloat(saldo_inicial) !== 0) {
+            await pool.query('INSERT INTO movimientos_fondos (fondo_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
+            [fondo.rows[0].id, 'AJUSTE_INICIAL', saldo_inicial, 'Saldo de apertura del fondo']);
+        }
+        res.json({ status: 'success', message: 'Fondo creado y anclado a la cuenta.' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+// ==========================================
+// MÓDULO DE PAGOS Y FONDOS VIRTUALES
+// ==========================================
+app.post('/pagos', verifyToken, async (req, res) => {
+    // Datos que vienen del ModalRegistrarPago.jsx
+    const { recibo_id, cuenta_id, monto_pago, tasa_cambio, referencia, fecha_pago, moneda, metodo } = req.body;
+    
+    // Limpiamos los números para que la BD no arroje error
+    const monto_pagado_num = parseFloat(monto_pago.toString().replace(/\./g, '').replace(',', '.'));
+    const tasa_num = parseFloat(tasa_cambio?.toString().replace(/\./g, '').replace(',', '.')) || 1;
+    
+    // Calculamos el equivalente en USD para mantener tu historial contable perfecto
+    const moneda_final = moneda || 'BS';
+    const monto_usd_num = (moneda_final === 'USD' || moneda_final === 'EUR') 
+        ? monto_pagado_num 
+        : parseFloat((monto_pagado_num / tasa_num).toFixed(2));
+
+    try {
+        await pool.query('BEGIN'); // Iniciamos transacción segura
+
+        // 1. Registrar el pago usando TU ESTRUCTURA REAL
+        const resultPago = await pool.query(`
+            INSERT INTO pagos (recibo_id, cuenta_bancaria_id, monto_origen, tasa_cambio, monto_usd, moneda, referencia, fecha_pago, metodo, estado) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Validado') RETURNING id
+        `, [recibo_id, cuenta_id, monto_pagado_num, tasa_num, monto_usd_num, moneda_final, referencia, fecha_pago || new Date(), metodo || 'Transferencia']);
+        
+        const pagoId = resultPago.rows[0].id;
+
+        // ========================================================
+        // 🌟 LA MAGIA DE LOS FONDOS: DISTRIBUCIÓN AUTOMÁTICA
+        // ========================================================
+        const fondos = await pool.query('SELECT * FROM fondos WHERE cuenta_bancaria_id = $1', [cuenta_id]);
+
+        if (fondos.rows.length > 0) {
+            let acumuladoOtros = 0;
+            let fondoOperativoId = null;
+
+            for (let f of fondos.rows) {
+                if (f.es_operativo) {
+                    fondoOperativoId = f.id;
+                    continue;
+                }
+                
+                // Calculamos la tajada de este fondo
+                const tajada = (monto_pagado_num * (parseFloat(f.porcentaje_asignacion) / 100)).toFixed(2);
+                acumuladoOtros += parseFloat(tajada);
+                
+                // Sumamos al saldo virtual y registramos auditoría
+                await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [tajada, f.id]);
+                await pool.query('INSERT INTO movimientos_fondos (fondo_id, tipo, monto, referencia_id, nota) VALUES ($1, $2, $3, $4, $5)',
+                [f.id, 'INGRESO_PAGO', tajada, pagoId, `Aporte automático (Recibo #${recibo_id})`]);
+            }
+
+            // Todo lo que sobró va al Fondo Operativo
+            if (fondoOperativoId) {
+                const resto = (monto_pagado_num - acumuladoOtros).toFixed(2);
+                await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [resto, fondoOperativoId]);
+                await pool.query('INSERT INTO movimientos_fondos (fondo_id, tipo, monto, referencia_id, nota) VALUES ($1, $2, $3, $4, $5)',
+                [fondoOperativoId, 'INGRESO_PAGO', resto, pagoId, `Ingreso operativo (Recibo #${recibo_id})`]);
+            }
+        }
+
+        // 3. Actualizamos el recibo a Pagado
+        await pool.query('UPDATE recibos SET estado = $1 WHERE id = $2', ['Pagado', recibo_id]);
+
+        await pool.query('COMMIT'); // Guardamos todo
+        res.json({ status: 'success', message: 'Pago registrado y fondos distribuidos correctamente.' });
+    } catch (err) { 
+        await pool.query('ROLLBACK'); // Si algo falla, cancelamos todo para no dañar las cuentas
+        res.status(500).json({ error: err.message }); 
+    }
+});
 app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
