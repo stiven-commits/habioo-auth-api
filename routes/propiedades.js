@@ -30,11 +30,70 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
         } catch (err) { res.status(500).json({ error: err.message }); }
     });
 
-    // 3. CREAR PROPIEDAD
+    // 💡 3. NUEVA RUTA: CARGA MASIVA DE INMUEBLES POR LOTE (EXCEL)
+    app.post('/propiedades-admin/lote', verifyToken, async (req, res) => {
+        const { inmuebles } = req.body; 
+        
+        if (!inmuebles || !Array.isArray(inmuebles) || inmuebles.length === 0) {
+            return res.status(400).json({ error: 'No se enviaron datos válidos.' });
+        }
+
+        try {
+            await pool.query('BEGIN');
+            const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+            const condoId = c.rows[0].id;
+
+            for (const item of inmuebles) {
+                const alicuotaNum = parseFloat((item.alicuota || '0').toString().replace(',', '.')) || 0;
+                let saldoBase = parseFloat((item.saldo_inicial || '0').toString().replace(',', '.')) || 0;
+                let cedulaFmt = (item.cedula || '').toUpperCase().replace(/[^VEJPG0-9]/g, '');
+                
+                let userId = null;
+                if (cedulaFmt && item.nombre) {
+                    let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedulaFmt]);
+                    if (userRes.rows.length === 0) {
+                        userRes = await pool.query(
+                            'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+                            [cedulaFmt, item.nombre, item.correo || null, item.telefono || null, cedulaFmt]
+                        );
+                    } else {
+                        await pool.query('UPDATE users SET nombre = $1 WHERE cedula = $2', [item.nombre, cedulaFmt]);
+                    }
+                    userId = userRes.rows[0].id;
+                }
+
+                const propRes = await pool.query(
+                    'INSERT INTO propiedades (condominio_id, identificador, alicuota, saldo_actual) VALUES ($1, $2, $3, $4) RETURNING id', 
+                    [condoId, item.identificador, alicuotaNum, saldoBase]
+                );
+                const nuevaPropId = propRes.rows[0].id;
+
+                if (saldoBase !== 0) {
+                    const tipoSaldo = saldoBase > 0 ? 'DEUDA' : 'FAVOR';
+                    await pool.query(
+                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)', 
+                        [nuevaPropId, 'SALDO_INICIAL', Math.abs(saldoBase), `Carga masiva Excel (${tipoSaldo})`]
+                    );
+                }
+
+                if (userId) {
+                    await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, nuevaPropId, 'Propietario']);
+                }
+            }
+
+            await pool.query('COMMIT');
+            res.json({ status: 'success', message: `${inmuebles.length} inmuebles cargados correctamente.` });
+        } catch (err) {
+            await pool.query('ROLLBACK');
+            if (err.code === '23505' && err.message.includes('identificador')) return res.status(400).json({ error: `Uno de los inmuebles (Apto/Casa) del archivo ya existe en el sistema.` });
+            if (err.code === '23505' && err.message.includes('email')) return res.status(400).json({ error: `Uno de los correos en el archivo ya está en uso.` });
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // 4. CREAR PROPIEDAD INDIVIDUAL
     app.post('/propiedades-admin', verifyToken, async (req, res) => {
         const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password, monto_saldo_inicial, tipo_saldo_inicial } = req.body;
-        
-        // 💡 Limpieza estricta de correos para evitar conflictos únicos
         const ownerEmail = (prop_email || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
         const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
@@ -79,15 +138,12 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
             res.json({ status: 'success', message: 'Inmueble guardado correctamente' });
         } catch (err) {
             await pool.query('ROLLBACK');
-            // 💡 CONTROL DE ERROR AMIGABLE: Correo duplicado
-            if (err.code === '23505' && err.message.includes('email')) {
-                return res.status(400).json({ error: 'El correo ingresado ya pertenece a otro usuario en el sistema. Debe usar un correo distinto.' });
-            }
+            if (err.code === '23505' && err.message.includes('email')) return res.status(400).json({ error: 'El correo ingresado ya pertenece a otro usuario en el sistema. Debe usar un correo distinto.' });
             res.status(500).json({ error: err.message });
         }
     });
 
-    // 4. EDITAR PROPIEDAD
+    // 5. EDITAR PROPIEDAD INDIVIDUAL
     app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
         const propiedadId = req.params.id;
         const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password } = req.body;
@@ -134,15 +190,12 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
             res.json({ status: 'success', message: 'Inmueble actualizado correctamente' });
         } catch (err) {
             await pool.query('ROLLBACK');
-            // 💡 CONTROL DE ERROR AMIGABLE: Correo duplicado
-            if (err.code === '23505' && err.message.includes('email')) {
-                return res.status(400).json({ error: 'El correo ingresado ya pertenece a otro usuario en el sistema. Debe usar un correo distinto.' });
-            }
+            if (err.code === '23505' && err.message.includes('email')) return res.status(400).json({ error: 'El correo ingresado ya pertenece a otro usuario en el sistema. Debe usar un correo distinto.' });
             res.status(500).json({ error: err.message });
         }
     });
 
-    // 5. AJUSTAR SALDO
+    // 6. AJUSTAR SALDO MANUALMENTE
     app.post('/propiedades-admin/:id/ajustar-saldo', verifyToken, async (req, res) => {
         const propiedadId = req.params.id;
         const { monto, tipo_ajuste, nota } = req.body; 
