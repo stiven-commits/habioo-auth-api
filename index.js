@@ -95,6 +95,28 @@ const parseLocaleNumber = (value, fallback = 0) => {
     const parsed = parseFloat(normalized);
     return Number.isFinite(parsed) ? parsed : fallback;
 };
+
+let pagosOptionalColumnsCache = null;
+const getPagosOptionalColumns = async () => {
+    if (pagosOptionalColumnsCache) return pagosOptionalColumnsCache;
+    try {
+        const result = await pool.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'pagos'
+              AND column_name IN ('nota', 'cedula_origen', 'banco_origen')
+        `);
+        const cols = new Set(result.rows.map(r => r.column_name));
+        pagosOptionalColumnsCache = {
+            nota: cols.has('nota'),
+            cedula_origen: cols.has('cedula_origen'),
+            banco_origen: cols.has('banco_origen')
+        };
+    } catch (err) {
+        pagosOptionalColumnsCache = { nota: false, cedula_origen: false, banco_origen: false };
+    }
+    return pagosOptionalColumnsCache;
+};
 const formatMonthText = (YYYYMM) => {
     if (!YYYYMM) return '';
     const [year, month] = YYYYMM.split('-');
@@ -311,83 +333,190 @@ app.get('/propiedades-admin', verifyToken, async (req, res) => {
         res.json({ status: 'success', propiedades: r.rows });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// ==========================================
+// MÓDULO DE INMUEBLES Y PROPIETARIOS
+// ==========================================
+
 // Crear Propiedad y enlazar Propietario
 app.post('/propiedades-admin', verifyToken, async (req, res) => {
-    const { identificador, alicuota, zona_id, nombre, cedula, correo, telefono } = req.body;
+    const {
+        identificador, alicuota, zona_id,
+        prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password,
+        tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password,
+        nombre, cedula, correo, telefono, password
+    } = req.body;
+    const ownerNombre = prop_nombre || nombre || '';
+    const ownerCedula = prop_cedula || cedula || '';
+    const ownerEmail = prop_email || correo || null;
+    const ownerTelefono = prop_telefono || telefono || null;
+    const ownerPassword = prop_password || password || '123456';
+    
+    // Parseo seguro de la alícuota a 3 decimales
+    const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
+
     try {
         await pool.query('BEGIN');
         const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         const condoId = c.rows[0].id;
 
-        // 1. Guardar Usuario
+        // 1. Guardar o Actualizar Usuario (Propietario)
         let userId = null;
-        if (cedula && nombre) {
-            let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedula]);
+        if (ownerCedula && ownerNombre) {
+            let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [ownerCedula]);
+            
             if (userRes.rows.length === 0) {
+                // Si el usuario no existe, lo creamos (usamos la clave del form o '123456' por defecto)
                 userRes = await pool.query(
                     'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-                    [cedula, nombre, correo || null, telefono || null, '123456']
+                    [ownerCedula, ownerNombre, ownerEmail, ownerTelefono, ownerPassword]
                 );
             } else {
-                await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [nombre, correo || null, telefono || null, cedula]);
+                // Si ya existe en la BD (quizás tiene otro apartamento), le actualizamos sus datos de contacto
+                await pool.query(
+                    'UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', 
+                    [ownerNombre, ownerEmail, ownerTelefono, ownerCedula]
+                );
+                
+                // Si escribieron una nueva clave en el formulario, se la actualizamos
+                if (prop_password || password) {
+                    await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [ownerPassword, ownerCedula]);
+                }
             }
             userId = userRes.rows[0].id;
         }
 
-        // 2. Guardar Propiedad
+        // 2. Guardar la Propiedad en el condominio
         const propRes = await pool.query(
             'INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id) VALUES ($1, $2, $3, $4) RETURNING id', 
-            [condoId, identificador, parseLocaleNumber(alicuota || '0'), zona_id || null]
+            [condoId, identificador, alicuotaNum, zona_id || null]
         );
 
-        // 3. Vincularlos
+        // 3. Vincular el Propietario con la Propiedad
         if (userId) {
             await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, propRes.rows[0].id, 'Propietario']);
         }
 
+        // 4. Vincular Inquilino (si aplica)
+        const tieneInquilino = tiene_inquilino === true || tiene_inquilino === 'true';
+        if (tieneInquilino && inq_cedula && inq_nombre) {
+            let tenantRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [inq_cedula]);
+            if (tenantRes.rows.length === 0) {
+                tenantRes = await pool.query(
+                    'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+                    [inq_cedula, inq_nombre, inq_email || null, inq_telefono || null, inq_password || '123456']
+                );
+            } else {
+                await pool.query(
+                    'UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4',
+                    [inq_nombre, inq_email || null, inq_telefono || null, inq_cedula]
+                );
+                if (inq_password) {
+                    await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inq_cedula]);
+                }
+            }
+            const tenantId = tenantRes.rows[0].id;
+            await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [tenantId, propRes.rows[0].id, 'Inquilino']);
+        }
+
         await pool.query('COMMIT');
-        res.json({ status: 'success', message: 'Inmueble guardado' });
+        res.json({ status: 'success', message: 'Inmueble y residente guardados correctamente' });
     } catch (err) { 
         await pool.query('ROLLBACK');
         res.status(500).json({ error: err.message }); 
     }
 });
 
-// Editar Propiedad (Ajustado a REST: recibe ID en la URL)
+// Editar Propiedad
 app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
-    // Tomamos el ID de la URL (params), y el resto de los datos del body
     const propiedadId = req.params.id; 
-    const { identificador, alicuota, zona_id, nombre, cedula, correo, telefono } = req.body;
+    
+    const {
+        identificador, alicuota, zona_id,
+        prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password,
+        tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password,
+        nombre, cedula, correo, telefono, password
+    } = req.body;
+    const ownerNombre = prop_nombre || nombre || '';
+    const ownerCedula = prop_cedula || cedula || '';
+    const ownerEmail = prop_email || correo || null;
+    const ownerTelefono = prop_telefono || telefono || null;
+    const ownerPassword = prop_password || password || null;
+    
+    const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
     
     try {
         await pool.query('BEGIN');
         
-        // Actualizamos la propiedad usando propiedadId
+        // 1. Actualizamos la propiedad (número de apto y alícuota)
         await pool.query(
             'UPDATE propiedades SET identificador = $1, alicuota = $2, zona_id = $3 WHERE id = $4', 
-            [identificador, parseLocaleNumber(alicuota || '0'), zona_id || null, propiedadId]
+            [identificador, alicuotaNum, zona_id || null, propiedadId]
         );
 
-        if (cedula && nombre) {
-            let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedula]);
+        // 2. Actualizar o crear al Propietario vinculado
+        if (ownerCedula && ownerNombre) {
+            let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [ownerCedula]);
             let userId = null;
+            
             if (userRes.rows.length === 0) {
-                userRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [cedula, nombre, correo, telefono, '123456']);
+                userRes = await pool.query(
+                    'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', 
+                    [ownerCedula, ownerNombre, ownerEmail, ownerTelefono, ownerPassword || '123456']
+                );
             } else {
-                await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [nombre, correo, telefono, cedula]);
+                await pool.query(
+                    'UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', 
+                    [ownerNombre, ownerEmail, ownerTelefono, ownerCedula]
+                );
+                
+                // Actualizar clave si la escribieron en la modal
+                if (ownerPassword) {
+                    await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [ownerPassword, ownerCedula]);
+                }
             }
             userId = userRes.rows[0].id;
 
-            // Usamos propiedadId para buscar el vínculo
+            // 3. Revisar si la relación Propiedad <-> Usuario existe, sino crearla
             const linkRes = await pool.query('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Propietario']);
+            
             if (linkRes.rows.length > 0) {
                 await pool.query('UPDATE usuarios_propiedades SET user_id = $1 WHERE id = $2', [userId, linkRes.rows[0].id]);
             } else {
                 await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, propiedadId, 'Propietario']);
             }
         }
+
+        // 4. Gestionar relación de inquilino
+        const tieneInquilino = tiene_inquilino === true || tiene_inquilino === 'true';
+        if (tieneInquilino && inq_cedula && inq_nombre) {
+            let tenantRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [inq_cedula]);
+            if (tenantRes.rows.length === 0) {
+                tenantRes = await pool.query(
+                    'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+                    [inq_cedula, inq_nombre, inq_email || null, inq_telefono || null, inq_password || '123456']
+                );
+            } else {
+                await pool.query(
+                    'UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4',
+                    [inq_nombre, inq_email || null, inq_telefono || null, inq_cedula]
+                );
+                if (inq_password) {
+                    await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inq_cedula]);
+                }
+            }
+            const tenantId = tenantRes.rows[0].id;
+            const tenantLink = await pool.query('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
+            if (tenantLink.rows.length > 0) {
+                await pool.query('UPDATE usuarios_propiedades SET user_id = $1 WHERE id = $2', [tenantId, tenantLink.rows[0].id]);
+            } else {
+                await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [tenantId, propiedadId, 'Inquilino']);
+            }
+        } else {
+            await pool.query('DELETE FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
+        }
+        
         await pool.query('COMMIT');
-        res.json({ status: 'success', message: 'Inmueble actualizado' });
+        res.json({ status: 'success', message: 'Inmueble actualizado correctamente' });
     } catch (err) { 
         await pool.query('ROLLBACK');
         res.status(500).json({ error: err.message }); 
@@ -495,11 +624,25 @@ app.post('/zonas', verifyToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.put('/zonas/:id', verifyToken, async (req, res) => {
-    const { nombre, activa } = req.body;
+    const { nombre, activa, propiedades_ids } = req.body;
     try {
+        await pool.query('BEGIN');
         await pool.query('UPDATE zonas SET nombre = $1, activa = $2 WHERE id = $3', [nombre, activa, req.params.id]);
-        res.json({ status: 'success', message: 'Zona actualizada' }); // <-- Agregado message
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        if (Array.isArray(propiedades_ids)) {
+            await pool.query('DELETE FROM propiedades_zonas WHERE zona_id = $1', [req.params.id]);
+            for (const pId of propiedades_ids) {
+                await pool.query(
+                    'INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                    [req.params.id, pId]
+                );
+            }
+        }
+        await pool.query('COMMIT');
+        res.json({ status: 'success', message: 'Zona actualizada' });
+    } catch (err) {
+        await pool.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    }
 });
 app.delete('/zonas/:id', verifyToken, async (req, res) => {
     try { await pool.query('DELETE FROM zonas WHERE id = $1', [req.params.id]); res.json({ status: 'success' }); } catch (err) { res.status(500).json({ error: err.message }); }
@@ -580,7 +723,10 @@ app.delete('/fondos/:id', verifyToken, async (req, res) => {
 // ==========================================
 app.post('/pagos-admin', verifyToken, async (req, res) => {
     // 💡 Ajustado: Ahora escucha en /pagos-admin y recibe monto_origen
-    const { recibo_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, moneda, metodo } = req.body;
+    const {
+        recibo_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, moneda, metodo,
+        nota, cedula_origen, banco_origen
+    } = req.body;
     
     // Limpiamos los números
     const monto_pagado_num = parseLocaleNumber(monto_origen);
@@ -595,10 +741,35 @@ app.post('/pagos-admin', verifyToken, async (req, res) => {
         await pool.query('BEGIN');
 
         // 1. Registrar el pago
-        const resultPago = await pool.query(`
-            INSERT INTO pagos (recibo_id, cuenta_bancaria_id, monto_origen, tasa_cambio, monto_usd, moneda, referencia, fecha_pago, metodo, estado) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Validado') RETURNING id
-        `, [recibo_id, cuenta_id, monto_pagado_num, tasa_num, monto_usd_num, moneda_final, referencia, fecha_pago || new Date(), metodo || 'Transferencia']);
+        const optionalCols = await getPagosOptionalColumns();
+        const insertColumns = [
+            'recibo_id', 'cuenta_bancaria_id', 'monto_origen', 'tasa_cambio',
+            'monto_usd', 'moneda', 'referencia', 'fecha_pago', 'metodo', 'estado'
+        ];
+        const insertValues = [
+            recibo_id, cuenta_id, monto_pagado_num, tasa_num,
+            monto_usd_num, moneda_final, referencia, fecha_pago || new Date(),
+            metodo || 'Transferencia', 'Validado'
+        ];
+
+        if (optionalCols.nota) {
+            insertColumns.push('nota');
+            insertValues.push(nota || null);
+        }
+        if (optionalCols.cedula_origen) {
+            insertColumns.push('cedula_origen');
+            insertValues.push(cedula_origen || null);
+        }
+        if (optionalCols.banco_origen) {
+            insertColumns.push('banco_origen');
+            insertValues.push(banco_origen || null);
+        }
+
+        const placeholders = insertValues.map((_, idx) => `$${idx + 1}`).join(', ');
+        const resultPago = await pool.query(
+            `INSERT INTO pagos (${insertColumns.join(', ')}) VALUES (${placeholders}) RETURNING id`,
+            insertValues
+        );
         
         const pagoId = resultPago.rows[0].id;
 
