@@ -353,12 +353,20 @@ app.post('/propiedades-admin', verifyToken, async (req, res) => {
     }
 });
 
-// Editar Propiedad
-app.put('/propiedades-admin', verifyToken, async (req, res) => {
-    const { id, identificador, alicuota, zona_id, nombre, cedula, correo, telefono } = req.body;
+// Editar Propiedad (Ajustado a REST: recibe ID en la URL)
+app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
+    // Tomamos el ID de la URL (params), y el resto de los datos del body
+    const propiedadId = req.params.id; 
+    const { identificador, alicuota, zona_id, nombre, cedula, correo, telefono } = req.body;
+    
     try {
         await pool.query('BEGIN');
-        await pool.query('UPDATE propiedades SET identificador = $1, alicuota = $2, zona_id = $3 WHERE id = $4', [identificador, parseLocaleNumber(alicuota || '0'), zona_id || null, id]);
+        
+        // Actualizamos la propiedad usando propiedadId
+        await pool.query(
+            'UPDATE propiedades SET identificador = $1, alicuota = $2, zona_id = $3 WHERE id = $4', 
+            [identificador, parseLocaleNumber(alicuota || '0'), zona_id || null, propiedadId]
+        );
 
         if (cedula && nombre) {
             let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedula]);
@@ -370,11 +378,12 @@ app.put('/propiedades-admin', verifyToken, async (req, res) => {
             }
             userId = userRes.rows[0].id;
 
-            const linkRes = await pool.query('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [id, 'Propietario']);
+            // Usamos propiedadId para buscar el vínculo
+            const linkRes = await pool.query('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Propietario']);
             if (linkRes.rows.length > 0) {
                 await pool.query('UPDATE usuarios_propiedades SET user_id = $1 WHERE id = $2', [userId, linkRes.rows[0].id]);
             } else {
-                await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, id, 'Propietario']);
+                await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, propiedadId, 'Propietario']);
             }
         }
         await pool.query('COMMIT');
