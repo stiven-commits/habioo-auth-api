@@ -398,21 +398,31 @@ app.get('/fondos', verifyToken, async (req, res) => {
 });
 
 // Crear fondo con saldo inicial
+// Crear fondo con saldo inicial
 app.post('/fondos', verifyToken, async (req, res) => {
     const { cuenta_bancaria_id, nombre, moneda, porcentaje, saldo_inicial, es_operativo } = req.body;
+    
+    // 💡 LA SOLUCIÓN: Sanitizamos los números. Si viene vacío (""), lo convertimos en un 0 matemático.
+    const porcNum = parseFloat(porcentaje) || 0;
+    const saldoNum = parseFloat(saldo_inicial) || 0;
+
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         const fondo = await pool.query(
             'INSERT INTO fondos (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
-            [condoRes.rows[0].id, cuenta_bancaria_id, nombre, moneda, porcentaje, saldo_inicial, es_operativo || false]
+            [condoRes.rows[0].id, cuenta_bancaria_id, nombre, moneda, porcNum, saldoNum, es_operativo || false]
         );
         
-        if (parseFloat(saldo_inicial) !== 0) {
+        // Solo registramos movimiento si el saldo inicial no es cero
+        if (saldoNum !== 0) {
             await pool.query('INSERT INTO movimientos_fondos (fondo_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
-            [fondo.rows[0].id, 'AJUSTE_INICIAL', saldo_inicial, 'Saldo de apertura del fondo']);
+            [fondo.rows[0].id, 'AJUSTE_INICIAL', saldoNum, 'Saldo de apertura del fondo']);
         }
         res.json({ status: 'success', message: 'Fondo creado y anclado a la cuenta.' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error("Error al crear fondo:", err.message); // Esto nos ayudará a ver el error exacto en los logs si ocurre otra cosa
+        res.status(500).json({ error: err.message }); 
+    }
 });
 // ==========================================
 // MÓDULO DE PAGOS Y FONDOS VIRTUALES
