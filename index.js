@@ -95,6 +95,12 @@ const parseLocaleNumber = (value, fallback = 0) => {
     const parsed = parseFloat(normalized);
     return Number.isFinite(parsed) ? parsed : fallback;
 };
+const formatMonthText = (YYYYMM) => {
+    if (!YYYYMM) return '';
+    const [year, month] = YYYYMM.split('-');
+    const months = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+    return `${months[parseInt(month, 10) - 1]} ${year}`;
+};
 
 // ==========================================
 // MÃ“DULO DE GASTOS (FACTURA + SOPORTES)
@@ -305,29 +311,78 @@ app.get('/propiedades-admin', verifyToken, async (req, res) => {
         res.json({ status: 'success', propiedades: r.rows });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-// Crear una Propiedad
+// Crear Propiedad y enlazar Propietario
 app.post('/propiedades-admin', verifyToken, async (req, res) => {
-    const { identificador, alicuota, zona_id } = req.body;
+    const { identificador, alicuota, zona_id, nombre, cedula, correo, telefono } = req.body;
     try {
+        await pool.query('BEGIN');
         const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
-        await pool.query(
-            'INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id) VALUES ($1, $2, $3, $4)', 
-            [c.rows[0].id, identificador, parseLocaleNumber(alicuota || '0'), zona_id || null]
+        const condoId = c.rows[0].id;
+
+        // 1. Guardar Usuario
+        let userId = null;
+        if (cedula && nombre) {
+            let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedula]);
+            if (userRes.rows.length === 0) {
+                userRes = await pool.query(
+                    'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+                    [cedula, nombre, correo || null, telefono || null, '123456']
+                );
+            } else {
+                await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [nombre, correo || null, telefono || null, cedula]);
+            }
+            userId = userRes.rows[0].id;
+        }
+
+        // 2. Guardar Propiedad
+        const propRes = await pool.query(
+            'INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id) VALUES ($1, $2, $3, $4) RETURNING id', 
+            [condoId, identificador, parseLocaleNumber(alicuota || '0'), zona_id || null]
         );
-        res.json({ status: 'success' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+
+        // 3. Vincularlos
+        if (userId) {
+            await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, propRes.rows[0].id, 'Propietario']);
+        }
+
+        await pool.query('COMMIT');
+        res.json({ status: 'success', message: 'Inmueble guardado' });
+    } catch (err) { 
+        await pool.query('ROLLBACK');
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
-// Editar una Propiedad
+// Editar Propiedad
 app.put('/propiedades-admin', verifyToken, async (req, res) => {
-    const { id, identificador, alicuota, zona_id } = req.body;
+    const { id, identificador, alicuota, zona_id, nombre, cedula, correo, telefono } = req.body;
     try {
-        await pool.query(
-            'UPDATE propiedades SET identificador = $1, alicuota = $2, zona_id = $3 WHERE id = $4', 
-            [identificador, parseLocaleNumber(alicuota || '0'), zona_id || null, id]
-        );
-        res.json({ status: 'success' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        await pool.query('BEGIN');
+        await pool.query('UPDATE propiedades SET identificador = $1, alicuota = $2, zona_id = $3 WHERE id = $4', [identificador, parseLocaleNumber(alicuota || '0'), zona_id || null, id]);
+
+        if (cedula && nombre) {
+            let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [cedula]);
+            let userId = null;
+            if (userRes.rows.length === 0) {
+                userRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [cedula, nombre, correo, telefono, '123456']);
+            } else {
+                await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [nombre, correo, telefono, cedula]);
+            }
+            userId = userRes.rows[0].id;
+
+            const linkRes = await pool.query('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [id, 'Propietario']);
+            if (linkRes.rows.length > 0) {
+                await pool.query('UPDATE usuarios_propiedades SET user_id = $1 WHERE id = $2', [userId, linkRes.rows[0].id]);
+            } else {
+                await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, id, 'Propietario']);
+            }
+        }
+        await pool.query('COMMIT');
+        res.json({ status: 'success', message: 'Inmueble actualizado' });
+    } catch (err) { 
+        await pool.query('ROLLBACK');
+        res.status(500).json({ error: err.message }); 
+    }
 });
 app.get('/bancos', verifyToken, async (req, res) => {
     try {
@@ -427,14 +482,14 @@ app.post('/zonas', verifyToken, async (req, res) => {
         const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         const z = await pool.query('INSERT INTO zonas (condominio_id, nombre, activa) VALUES ($1, $2, true) RETURNING id', [c.rows[0].id, nombre]);
         if (propiedades_ids) for (let p of propiedades_ids) await pool.query('INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [z.rows[0].id, p]);
-        res.json({ status: 'success' });
+        res.json({ status: 'success', message: 'Zona agregada exitosamente' }); // <-- Agregado message
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.put('/zonas/:id', verifyToken, async (req, res) => {
     const { nombre, activa } = req.body;
     try {
         await pool.query('UPDATE zonas SET nombre = $1, activa = $2 WHERE id = $3', [nombre, activa, req.params.id]);
-        res.json({ status: 'success' });
+        res.json({ status: 'success', message: 'Zona actualizada' }); // <-- Agregado message
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.delete('/zonas/:id', verifyToken, async (req, res) => {
@@ -565,8 +620,18 @@ app.post('/pagos-admin', verifyToken, async (req, res) => {
             }
         }
 
-        // 3. Actualizamos el recibo
-        await pool.query('UPDATE recibos SET estado = $1 WHERE id = $2', ['Pagado', recibo_id]);
+        // 3. Evaluar si es Pagado Completo o Abonado Parcial
+        const recRes = await pool.query('SELECT monto_usd FROM recibos WHERE id = $1', [recibo_id]);
+        const montoRecibo = parseFloat(recRes.rows[0].monto_usd);
+        
+        // Sumar todos los pagos validados de este recibo
+        const sumRes = await pool.query('SELECT SUM(monto_usd) as total_pagado FROM pagos WHERE recibo_id = $1 AND estado = $2', [recibo_id, 'Validado']);
+        const totalPagado = parseFloat(sumRes.rows[0].total_pagado || 0);
+
+        // Si lo que ha pagado alcanza o supera el costo del recibo (con un pequeño margen de error de céntimos)
+        const nuevoEstado = (totalPagado >= (montoRecibo - 0.05)) ? 'Pagado' : 'Abonado Parcial';
+        
+        await pool.query('UPDATE recibos SET estado = $1 WHERE id = $2', [nuevoEstado, recibo_id]);
 
         await pool.query('COMMIT');
         res.json({ status: 'success', message: 'Pago registrado y fondos distribuidos correctamente.' });
