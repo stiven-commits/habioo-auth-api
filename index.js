@@ -348,7 +348,32 @@ app.put('/bancos/:id/predeterminada', verifyToken, async (req, res) => {
 });
 
 app.delete('/bancos/:id', verifyToken, async (req, res) => {
-    try { await pool.query('DELETE FROM cuentas_bancarias WHERE id = $1', [req.params.id]); res.json({ status: 'success' }); } catch (err) { res.status(500).json({ error: err.message }); }
+    try {
+        const cuentaId = req.params.id;
+        const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+        const condoId = c.rows[0].id;
+
+        // Verificamos si hay movimientos en CUALQUIER fondo atado a esta cuenta
+        const movs = await pool.query(`
+            SELECT COUNT(*) 
+            FROM movimientos_fondos mf
+            JOIN fondos f ON mf.fondo_id = f.id
+            WHERE f.cuenta_bancaria_id = $1 AND mf.tipo != 'AJUSTE_INICIAL'
+        `, [cuentaId]);
+        
+        if (parseInt(movs.rows[0].count) > 0) {
+            return res.status(400).json({ 
+                status: 'error', 
+                message: 'No se puede eliminar: Esta cuenta tiene fondos con ingresos o gastos activos.' 
+            });
+        }
+
+        // Si está limpia, la eliminamos (los fondos se borrarán en cascada automáticamente)
+        await pool.query('DELETE FROM cuentas_bancarias WHERE id = $1 AND condominio_id = $2', [cuentaId, condoId]);
+        res.json({ status: 'success', message: 'Cuenta eliminada con éxito.' });
+    } catch (err) { 
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
 app.get('/zonas', verifyToken, async (req, res) => {
@@ -405,9 +430,11 @@ app.get('/fondos', verifyToken, async (req, res) => {
 app.post('/fondos', verifyToken, async (req, res) => {
     const { cuenta_bancaria_id, nombre, moneda, porcentaje, saldo_inicial, es_operativo } = req.body;
     
-    // Limpiamos los nÃºmeros para evitar errores de la Base de Datos
-    const porcNum = parseLocaleNumber(porcentaje); // El porcentaje sigue siendo un nÃºmero normal
-    // Esta lÃ­nea limpia los puntos y cambia la coma por punto para el saldo inicial
+    // 💡 SOLUCIÓN: Si es el Fondo Principal (es_operativo = true), forzamos a que guarde un 0.
+    // De lo contrario, usamos tu excelente función parseLocaleNumber para limpiar el porcentaje escrito.
+    const porcNum = es_operativo ? 0 : parseLocaleNumber(porcentaje); 
+    
+    // El saldo inicial sigue usando tu función normal
     const saldoNum = parseLocaleNumber(saldo_inicial);
 
     try {
@@ -425,6 +452,25 @@ app.post('/fondos', verifyToken, async (req, res) => {
         res.json({ status: 'success', message: 'Fondo creado y anclado a la cuenta.' });
     } catch (err) { 
         console.error("Error al crear fondo:", err.message);
+        res.status(500).json({ error: err.message }); 
+    }
+});
+// ELIMINAR FONDO VIRTUAL (Solo si no tiene movimientos)
+app.delete('/fondos/:id', verifyToken, async (req, res) => {
+    try {
+        const fondoId = req.params.id;
+        
+        // Verificamos que el fondo no tenga movimientos reales (ignoramos el AJUSTE_INICIAL de cuando se creó)
+        const movs = await pool.query("SELECT COUNT(*) FROM movimientos_fondos WHERE fondo_id = $1 AND tipo != 'AJUSTE_INICIAL'", [fondoId]);
+        
+        if (parseInt(movs.rows[0].count) > 0) {
+            return res.status(400).json({ status: 'error', message: 'No se puede eliminar: El fondo ya tiene ingresos o gastos registrados.' });
+        }
+        
+        // Si está limpio, lo borramos de forma segura
+        await pool.query('DELETE FROM fondos WHERE id = $1', [fondoId]);
+        res.json({ status: 'success', message: 'Fondo eliminado correctamente.' });
+    } catch (err) { 
         res.status(500).json({ error: err.message }); 
     }
 });
