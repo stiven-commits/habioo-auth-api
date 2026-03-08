@@ -1,11 +1,11 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
-// NUEVAS LIBRERÍAS PARA IMÁGENES
+// NUEVAS LIBRERÃAS PARA IMÃGENES
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
@@ -18,18 +18,18 @@ app.use(cors());
 app.use(express.json());
 
 // ==========================================
-// CONFIGURACIÓN DE ALMACENAMIENTO DE IMÁGENES
+// CONFIGURACIÃ“N DE ALMACENAMIENTO DE IMÃGENES
 // ==========================================
 const uploadsDir = path.join(__dirname, 'uploads', 'gastos');
 if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true }); // Crea la carpeta si no existe
 }
-// Hacer pública la carpeta de uploads para que el frontend pueda verlas
+// Hacer pÃºblica la carpeta de uploads para que el frontend pueda verlas
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Multer se configura más abajo en el módulo de gastos
+// Multer se configura mÃ¡s abajo en el mÃ³dulo de gastos
 
-// Conexión a PostgreSQL
+// ConexiÃ³n a PostgreSQL
 const pool = new Pool({
     host: process.env.DB_HOST, port: process.env.DB_PORT,
     user: process.env.DB_USER, password: process.env.DB_PASSWORD,
@@ -43,13 +43,13 @@ const verifyToken = (req, res, next) => {
         const token = authHeader.split(' ')[1];
         req.user = jwt.verify(token, process.env.JWT_SECRET);
         next();
-    } catch (err) { return res.status(401).json({ status: 'error', message: 'Token inválido.' }); }
+    } catch (err) { return res.status(401).json({ status: 'error', message: 'Token invÃ¡lido.' }); }
 };
 
 app.get('/', (req, res) => res.json({ status: 'success', message: 'Auth Service is running!' }));
 
 // ==========================================
-// RUTAS DE AUTENTICACIÓN (Resumidas)
+// RUTAS DE AUTENTICACIÃ“N (Resumidas)
 // ==========================================
 app.post('/register', async (req, res) => {
     const { cedula, nombre, password } = req.body;
@@ -67,7 +67,7 @@ app.post('/login', async (req, res) => {
         const cedulaLimpia = cedula.toUpperCase().replace(/[^A-Z0-9]/g, '');
         const result = await pool.query('SELECT * FROM users WHERE cedula = $1', [cedulaLimpia]);
         if (!result.rows[0] || !(await bcrypt.compare(password, result.rows[0].password))) {
-            return res.status(401).json({ status: 'error', message: 'Credenciales inválidas' });
+            return res.status(401).json({ status: 'error', message: 'Credenciales invÃ¡lidas' });
         }
         const token = jwt.sign({ id: result.rows[0].id, cedula: result.rows[0].cedula, nombre: result.rows[0].nombre }, process.env.JWT_SECRET, { expiresIn: '24h' });
         res.json({ status: 'success', token, user: result.rows[0] });
@@ -87,13 +87,17 @@ const addMonths = (yyyy_mm, m) => {
     month += m; while (month > 12) { month -= 12; year += 1; }
     return `${year}-${month.toString().padStart(2, '0')}`;
 };
-const formatMonthText = (y_m) => {
-    const [y, m] = y_m.split('-');
-    return `${["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"][parseInt(m) - 1]} ${y}`;
+
+// Parsea formato ES: 1.234,56 -> 1234.56
+const parseLocaleNumber = (value, fallback = 0) => {
+    if (value === null || value === undefined || value === '') return fallback;
+    const normalized = value.toString().replace(/\./g, '').replace(',', '.');
+    const parsed = parseFloat(normalized);
+    return Number.isFinite(parsed) ? parsed : fallback;
 };
 
 // ==========================================
-// MÓDULO DE GASTOS (FACTURA + SOPORTES)
+// MÃ“DULO DE GASTOS (FACTURA + SOPORTES)
 // ==========================================
 // Configurar Multer para aceptar 2 campos distintos
 const upload = multer({ 
@@ -128,8 +132,8 @@ app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount:
             }
         }
 
-        const m_bs = parseNum(monto_bs);
-        const t_c = parseNum(tasa_cambio);
+        const m_bs = parseLocaleNumber(monto_bs);
+        const t_c = parseLocaleNumber(tasa_cambio);
         
         const condoRes = await pool.query('SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         const condominio_id = condoRes.rows[0].id;
@@ -141,7 +145,7 @@ app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount:
         const mes_factura = fecha_gasto ? fecha_gasto.substring(0, 7) : mes_actual;
         const mes_inicio_cobro = (mes_factura > mes_actual) ? mes_factura : mes_actual;
 
-        // Lógica de validación de campos según el tipo
+        // LÃ³gica de validaciÃ³n de campos segÃºn el tipo
         const dbTipo = tipo || 'Comun';
         const zId = (dbTipo === 'Zona' || dbTipo === 'No Comun') ? (zona_id || null) : null;
         const pId = dbTipo === 'Individual' ? (propiedad_id || null) : null;
@@ -156,7 +160,7 @@ app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount:
             await pool.query(`INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado) VALUES ($1, $2, $3, $4)`, 
             [result.rows[0].id, i, monto_cuota_usd, mes_cuota]);
         }
-        res.json({ status: 'success', message: 'Gasto registrado con éxito.' });
+        res.json({ status: 'success', message: 'Gasto registrado con Ã©xito.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -190,7 +194,7 @@ app.delete('/gastos/:id', verifyToken, async (req, res) => {
         const cuotasCheck = await pool.query("SELECT id FROM gastos_cuotas WHERE gasto_id = $1 AND estado != 'Pendiente'", [gastoId]);
         if (cuotasCheck.rows.length > 0) return res.status(400).json({ status: 'error', message: 'No puedes eliminar un gasto con cuotas procesadas.' });
 
-        // Extraer rutas de imágenes para borrarlas del servidor
+        // Extraer rutas de imÃ¡genes para borrarlas del servidor
         const imgRes = await pool.query('SELECT factura_img, imagenes FROM gastos WHERE id = $1', [gastoId]);
         const { factura_img, imagenes } = imgRes.rows[0] || {};
 
@@ -215,7 +219,7 @@ app.delete('/gastos/:id', verifyToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ... PRELIMINAR, ZONAS, PROVEEDORES (Todo igual a lo que tenías) ...
+// ... PRELIMINAR, ZONAS, PROVEEDORES (Todo igual a lo que tenÃ­as) ...
 app.get('/preliminar', verifyToken, async (req, res) => {
     try {
         const condoRes = await pool.query('SELECT id, mes_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
@@ -325,18 +329,18 @@ app.put('/bancos/:id/predeterminada', verifyToken, async (req, res) => {
         const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
         const condoId = c.rows[0].id;
 
-        // Iniciamos la transacción para asegurar que no queden 2 cuentas activas por error
+        // Iniciamos la transacciÃ³n para asegurar que no queden 2 cuentas activas por error
         await pool.query('BEGIN');
         
         // 1. Apagamos el marcador en todas las cuentas de este condominio
         await pool.query('UPDATE cuentas_bancarias SET es_predeterminada = false WHERE condominio_id = $1', [condoId]);
         
-        // 2. Encendemos el marcador SÓLO en la cuenta seleccionada
+        // 2. Encendemos el marcador SÃ“LO en la cuenta seleccionada
         await pool.query('UPDATE cuentas_bancarias SET es_predeterminada = true WHERE id = $1 AND condominio_id = $2', [cuentaId, condoId]);
         
         await pool.query('COMMIT'); // Guardamos los cambios de forma segura
         
-        res.json({ status: 'success', message: 'Cuenta principal actualizada con éxito.' });
+        res.json({ status: 'success', message: 'Cuenta principal actualizada con Ã©xito.' });
     } catch (err) { 
         await pool.query('ROLLBACK'); // Si algo falla, deshacemos para no romper nada
         res.status(500).json({ error: err.message }); 
@@ -401,10 +405,10 @@ app.get('/fondos', verifyToken, async (req, res) => {
 app.post('/fondos', verifyToken, async (req, res) => {
     const { cuenta_bancaria_id, nombre, moneda, porcentaje, saldo_inicial, es_operativo } = req.body;
     
-    // Limpiamos los números para evitar errores de la Base de Datos
-    const porcNum = parseFloat(porcentaje) || 0; // El porcentaje sigue siendo un número normal
-    // Esta línea limpia los puntos y cambia la coma por punto para el saldo inicial
-    const saldoNum = parseFloat(saldo_inicial?.toString().replace(/\./g, '').replace(',', '.')) || 0;
+    // Limpiamos los nÃºmeros para evitar errores de la Base de Datos
+    const porcNum = parseLocaleNumber(porcentaje); // El porcentaje sigue siendo un nÃºmero normal
+    // Esta lÃ­nea limpia los puntos y cambia la coma por punto para el saldo inicial
+    const saldoNum = parseLocaleNumber(saldo_inicial);
 
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
@@ -425,15 +429,15 @@ app.post('/fondos', verifyToken, async (req, res) => {
     }
 });
 // ==========================================
-// MÓDULO DE PAGOS Y FONDOS VIRTUALES
+// MÃ“DULO DE PAGOS Y FONDOS VIRTUALES
 // ==========================================
 app.post('/pagos', verifyToken, async (req, res) => {
     // Datos que vienen del ModalRegistrarPago.jsx
     const { recibo_id, cuenta_id, monto_pago, tasa_cambio, referencia, fecha_pago, moneda, metodo } = req.body;
     
-    // Limpiamos los números para que la BD no arroje error
-    const monto_pagado_num = parseFloat(monto_pago.toString().replace(/\./g, '').replace(',', '.'));
-    const tasa_num = parseFloat(tasa_cambio?.toString().replace(/\./g, '').replace(',', '.')) || 1;
+    // Limpiamos los nÃºmeros para que la BD no arroje error
+    const monto_pagado_num = parseLocaleNumber(monto_pago);
+    const tasa_num = parseLocaleNumber(tasa_cambio, 1);
     
     // Calculamos el equivalente en USD para mantener tu historial contable perfecto
     const moneda_final = moneda || 'BS';
@@ -442,7 +446,7 @@ app.post('/pagos', verifyToken, async (req, res) => {
         : parseFloat((monto_pagado_num / tasa_num).toFixed(2));
 
     try {
-        await pool.query('BEGIN'); // Iniciamos transacción segura
+        await pool.query('BEGIN'); // Iniciamos transacciÃ³n segura
 
         // 1. Registrar el pago usando TU ESTRUCTURA REAL
         const resultPago = await pool.query(`
@@ -453,7 +457,7 @@ app.post('/pagos', verifyToken, async (req, res) => {
         const pagoId = resultPago.rows[0].id;
 
         // ========================================================
-        // 🌟 LA MAGIA DE LOS FONDOS: DISTRIBUCIÓN AUTOMÁTICA
+        // ðŸŒŸ LA MAGIA DE LOS FONDOS: DISTRIBUCIÃ“N AUTOMÃTICA
         // ========================================================
         const fondos = await pool.query('SELECT * FROM fondos WHERE cuenta_bancaria_id = $1', [cuenta_id]);
 
@@ -471,13 +475,13 @@ app.post('/pagos', verifyToken, async (req, res) => {
                 const tajada = (monto_pagado_num * (parseFloat(f.porcentaje_asignacion) / 100)).toFixed(2);
                 acumuladoOtros += parseFloat(tajada);
                 
-                // Sumamos al saldo virtual y registramos auditoría
+                // Sumamos al saldo virtual y registramos auditorÃ­a
                 await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [tajada, f.id]);
                 await pool.query('INSERT INTO movimientos_fondos (fondo_id, tipo, monto, referencia_id, nota) VALUES ($1, $2, $3, $4, $5)',
-                [f.id, 'INGRESO_PAGO', tajada, pagoId, `Aporte automático (Recibo #${recibo_id})`]);
+                [f.id, 'INGRESO_PAGO', tajada, pagoId, `Aporte automÃ¡tico (Recibo #${recibo_id})`]);
             }
 
-            // Todo lo que sobró va al Fondo Operativo
+            // Todo lo que sobrÃ³ va al Fondo Operativo
             if (fondoOperativoId) {
                 const resto = (monto_pagado_num - acumuladoOtros).toFixed(2);
                 await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [resto, fondoOperativoId]);
@@ -492,8 +496,9 @@ app.post('/pagos', verifyToken, async (req, res) => {
         await pool.query('COMMIT'); // Guardamos todo
         res.json({ status: 'success', message: 'Pago registrado y fondos distribuidos correctamente.' });
     } catch (err) { 
-        await pool.query('ROLLBACK'); // Si algo falla, cancelamos todo para no dañar las cuentas
+        await pool.query('ROLLBACK'); // Si algo falla, cancelamos todo para no daÃ±ar las cuentas
         res.status(500).json({ error: err.message }); 
     }
 });
 app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
+
