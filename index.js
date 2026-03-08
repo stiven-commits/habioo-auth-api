@@ -398,13 +398,13 @@ app.get('/fondos', verifyToken, async (req, res) => {
 });
 
 // Crear fondo con saldo inicial
-// Crear fondo con saldo inicial
 app.post('/fondos', verifyToken, async (req, res) => {
     const { cuenta_bancaria_id, nombre, moneda, porcentaje, saldo_inicial, es_operativo } = req.body;
     
-    // 💡 LA SOLUCIÓN: Sanitizamos los números. Si viene vacío (""), lo convertimos en un 0 matemático.
-    const porcNum = parseFloat(porcentaje) || 0;
-    const saldoNum = parseFloat(saldo_inicial) || 0;
+    // Limpiamos los números para evitar errores de la Base de Datos
+    const porcNum = parseFloat(porcentaje) || 0; // El porcentaje sigue siendo un número normal
+    // Esta línea limpia los puntos y cambia la coma por punto para el saldo inicial
+    const saldoNum = parseFloat(saldo_inicial?.toString().replace(/\./g, '').replace(',', '.')) || 0;
 
     try {
         const condoRes = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
@@ -420,7 +420,7 @@ app.post('/fondos', verifyToken, async (req, res) => {
         }
         res.json({ status: 'success', message: 'Fondo creado y anclado a la cuenta.' });
     } catch (err) { 
-        console.error("Error al crear fondo:", err.message); // Esto nos ayudará a ver el error exacto en los logs si ocurre otra cosa
+        console.error("Error al crear fondo:", err.message);
         res.status(500).json({ error: err.message }); 
     }
 });
