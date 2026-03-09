@@ -215,4 +215,3 @@ const registerGastosRoutes = (app, { pool, verifyToken, parseLocaleNumber, addMo
 };
 
 module.exports = { registerGastosRoutes };
-

@@ -21,13 +21,33 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
     app.get('/propiedades-admin/:id/estado-cuenta', verifyToken, async (req, res) => {
         const propiedadId = req.params.id;
         try {
-            const recibos = await pool.query(`SELECT 'RECIBO' as tipo, id as ref_id, 'Aviso de Cobro: ' || mes_cobro as concepto, monto_usd as cargo, 0 as abono, fecha_emision as fecha_operacion, fecha_emision as fecha_registro FROM recibos WHERE propiedad_id = $1`, [propiedadId]);
-            const pagos = await pool.query(`SELECT 'PAGO' as tipo, p.id as ref_id, 'Pago Ref: ' || p.referencia as concepto, 0 as cargo, p.monto_usd as abono, p.fecha_pago as fecha_operacion, COALESCE(p.created_at, p.fecha_pago) as fecha_registro FROM pagos p JOIN recibos r ON p.recibo_id = r.id WHERE r.propiedad_id = $1 AND p.estado = 'Validado'`, [propiedadId]);
-            const ajustes = await pool.query(`SELECT 'AJUSTE' as tipo, id as ref_id, nota as concepto, CASE WHEN tipo = 'CARGAR_DEUDA' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(DEUDA)%') THEN monto ELSE 0 END as cargo, CASE WHEN tipo = 'AGREGAR_FAVOR' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(FAVOR)%') THEN monto ELSE 0 END as abono, fecha as fecha_operacion, fecha as fecha_registro FROM historial_saldos_inmuebles WHERE propiedad_id = $1`, [propiedadId]);
+            // 1. Cargos (Recibos / Deudas)
+            const recibos = await pool.query(
+                `SELECT 'RECIBO' as tipo, id as ref_id, 'Aviso de Cobro: ' || mes_cobro as concepto, monto_usd as cargo, 0 as abono, fecha_emision as fecha_operacion, fecha_emision as fecha_registro FROM recibos WHERE propiedad_id = $1`, 
+                [propiedadId]
+            );
+            
+            // 💡 2. Abonos (Pagos) - CORREGIDO: Ahora busca directamente por propiedad_id
+            const pagos = await pool.query(
+                `SELECT 'PAGO' as tipo, id as ref_id, 'Pago Ref: ' || referencia as concepto, 0 as cargo, monto_usd as abono, fecha_pago as fecha_operacion, COALESCE(created_at, fecha_pago) as fecha_registro FROM pagos WHERE propiedad_id = $1 AND estado = 'Validado'`, 
+                [propiedadId]
+            );
+            
+            // 3. Ajustes Manuales (Saldos a favor / Deudas cargadas a mano)
+            const ajustes = await pool.query(
+                `SELECT 'AJUSTE' as tipo, id as ref_id, nota as concepto, CASE WHEN tipo = 'CARGAR_DEUDA' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(DEUDA)%') THEN monto ELSE 0 END as cargo, CASE WHEN tipo = 'AGREGAR_FAVOR' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(FAVOR)%') THEN monto ELSE 0 END as abono, fecha as fecha_operacion, fecha as fecha_registro FROM historial_saldos_inmuebles WHERE propiedad_id = $1`, 
+                [propiedadId]
+            );
+            
             let movimientos = [...recibos.rows, ...pagos.rows, ...ajustes.rows];
+            
+            // Ordenamos cronológicamente
             movimientos.sort((a, b) => new Date(a.fecha_registro) - new Date(b.fecha_registro));
+            
             res.json({ status: 'success', movimientos });
-        } catch (err) { res.status(500).json({ error: err.message }); }
+        } catch (err) { 
+            res.status(500).json({ error: err.message }); 
+        }
     });
 
     // 💡 3. NUEVA RUTA: CARGA MASIVA DE INMUEBLES POR LOTE (EXCEL)
