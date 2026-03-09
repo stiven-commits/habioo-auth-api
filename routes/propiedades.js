@@ -1,18 +1,27 @@
 const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
+
+    const getCondominioIdByAdmin = async (adminUserId) => {
+        const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [adminUserId]);
+        return c.rows[0]?.id || null;
+    };
     
     // 1. OBTENER PROPIEDADES
     app.get('/propiedades-admin', verifyToken, async (req, res) => {
         try {
-            const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+            const condominioId = await getCondominioIdByAdmin(req.user.id);
+            if (!condominioId) {
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
             const r = await pool.query(`
                 SELECT p.id, p.identificador, p.alicuota, p.saldo_actual,
                     u1.id as prop_id, u1.nombre as prop_nombre, u1.cedula as prop_cedula, u1.email as prop_email, u1.telefono as prop_telefono,
-                    u2.id as inq_id, u2.nombre as inq_nombre, u2.cedula as inq_cedula, u2.email as inq_email, u2.telefono as inq_telefono
+                    u2.id as inq_id, u2.nombre as inq_nombre, u2.cedula as inq_cedula, u2.email as inq_email, u2.telefono as inq_telefono,
+                    COALESCE(up2.acceso_portal, true) as inq_acceso_portal
                 FROM propiedades p 
                 LEFT JOIN usuarios_propiedades up1 ON p.id = up1.propiedad_id AND up1.rol = 'Propietario' LEFT JOIN users u1 ON up1.user_id = u1.id 
                 LEFT JOIN usuarios_propiedades up2 ON p.id = up2.propiedad_id AND up2.rol = 'Inquilino' LEFT JOIN users u2 ON up2.user_id = u2.id
                 WHERE p.condominio_id = $1 ORDER BY p.identificador ASC
-            `, [c.rows[0].id]);
+            `, [condominioId]);
             res.json({ status: 'success', propiedades: r.rows });
         } catch (err) { res.status(500).json({ error: err.message }); }
     });
@@ -60,8 +69,11 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
 
         try {
             await pool.query('BEGIN');
-            const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
-            const condoId = c.rows[0].id;
+            const condoId = await getCondominioIdByAdmin(req.user.id);
+            if (!condoId) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
 
             for (const item of inmuebles) {
                 const alicuotaNum = parseFloat((item.alicuota || '0').toString().replace(',', '.')) || 0;
@@ -113,7 +125,7 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
 
     // 4. CREAR PROPIEDAD INDIVIDUAL
     app.post('/propiedades-admin', verifyToken, async (req, res) => {
-        const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password, monto_saldo_inicial, tipo_saldo_inicial } = req.body;
+        const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password, inq_permitir_acceso, monto_saldo_inicial, tipo_saldo_inicial } = req.body;
         const ownerEmail = (prop_email || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
         const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
@@ -124,13 +136,17 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
 
         try {
             await pool.query('BEGIN');
-            const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+            const condominioId = await getCondominioIdByAdmin(req.user.id);
+            if (!condominioId) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
             
             let userId = null;
             if (prop_cedula && prop_nombre) {
                 let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [prop_cedula]);
                 if (userRes.rows.length === 0) {
-                    userRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [prop_cedula, prop_nombre, ownerEmail, prop_telefono || null, prop_password || '123456']);
+                    userRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [prop_cedula, prop_nombre, ownerEmail, prop_telefono || null, prop_password || prop_cedula]);
                 } else {
                     await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [prop_nombre, ownerEmail, prop_telefono || null, prop_cedula]);
                     if (prop_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [prop_password, prop_cedula]);
@@ -138,21 +154,22 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
                 userId = userRes.rows[0].id;
             }
 
-            const propRes = await pool.query('INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual) VALUES ($1, $2, $3, $4, $5) RETURNING id', [c.rows[0].id, identificador, alicuotaNum, zona_id || null, saldoBase]);
+            const propRes = await pool.query('INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual) VALUES ($1, $2, $3, $4, $5) RETURNING id', [condominioId, identificador, alicuotaNum, zona_id || null, saldoBase]);
             const nuevaPropId = propRes.rows[0].id;
 
             if (saldoBase !== 0) await pool.query('INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)', [nuevaPropId, 'SALDO_INICIAL', Math.abs(saldoBase), `Saldo inicial cargado al crear el inmueble (${tipo_saldo_inicial})`]);
             if (userId) await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, nuevaPropId, 'Propietario']);
 
             if (tiene_inquilino && inq_cedula && inq_nombre) {
+                const inqPermitirAcceso = inq_permitir_acceso !== false;
                 let tenantRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [inq_cedula]);
                 if (tenantRes.rows.length === 0) {
-                    tenantRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inq_cedula, inq_nombre, tenantEmail, inq_telefono || null, inq_password || '123456']);
+                    tenantRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inq_cedula, inq_nombre, tenantEmail, inq_telefono || null, inq_password || inq_cedula]);
                 } else {
                     await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [inq_nombre, tenantEmail, inq_telefono || null, inq_cedula]);
                     if (inq_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inq_cedula]);
                 }
-                await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [tenantRes.rows[0].id, nuevaPropId, 'Inquilino']);
+                await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol, acceso_portal) VALUES ($1, $2, $3, $4)', [tenantRes.rows[0].id, nuevaPropId, 'Inquilino', inqPermitirAcceso]);
             }
             await pool.query('COMMIT');
             res.json({ status: 'success', message: 'Inmueble guardado correctamente' });
@@ -166,7 +183,7 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
     // 5. EDITAR PROPIEDAD INDIVIDUAL
     app.put('/propiedades-admin/:id', verifyToken, async (req, res) => {
         const propiedadId = req.params.id;
-        const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password } = req.body;
+        const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password, inq_permitir_acceso } = req.body;
         
         const ownerEmail = (prop_email || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
@@ -180,7 +197,7 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
                 let userRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [prop_cedula]);
                 let userId = null;
                 if (userRes.rows.length === 0) {
-                    userRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [prop_cedula, prop_nombre, ownerEmail, prop_telefono || null, prop_password || '123456']);
+                    userRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [prop_cedula, prop_nombre, ownerEmail, prop_telefono || null, prop_password || prop_cedula]);
                 } else {
                     await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [prop_nombre, ownerEmail, prop_telefono || null, prop_cedula]);
                     if (prop_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [prop_password, prop_cedula]);
@@ -192,17 +209,18 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
             }
 
             if (tiene_inquilino && inq_cedula && inq_nombre) {
+                const inqPermitirAcceso = inq_permitir_acceso !== false;
                 let tenantRes = await pool.query('SELECT id FROM users WHERE cedula = $1', [inq_cedula]);
                 if (tenantRes.rows.length === 0) {
-                    tenantRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inq_cedula, inq_nombre, tenantEmail, inq_telefono || null, inq_password || '123456']);
+                    tenantRes = await pool.query('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inq_cedula, inq_nombre, tenantEmail, inq_telefono || null, inq_password || inq_cedula]);
                 } else {
                     await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [inq_nombre, tenantEmail, inq_telefono || null, inq_cedula]);
                     if (inq_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inq_cedula]);
                 }
                 const tenantId = tenantRes.rows[0].id;
                 const tenantLink = await pool.query('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
-                if (tenantLink.rows.length > 0) { await pool.query('UPDATE usuarios_propiedades SET user_id = $1 WHERE id = $2', [tenantId, tenantLink.rows[0].id]); } 
-                else { await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [tenantId, propiedadId, 'Inquilino']); }
+                if (tenantLink.rows.length > 0) { await pool.query('UPDATE usuarios_propiedades SET user_id = $1, acceso_portal = $2 WHERE id = $3', [tenantId, inqPermitirAcceso, tenantLink.rows[0].id]); } 
+                else { await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol, acceso_portal) VALUES ($1, $2, $3, $4)', [tenantId, propiedadId, 'Inquilino', inqPermitirAcceso]); }
             } else {
                 await pool.query('DELETE FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
             }

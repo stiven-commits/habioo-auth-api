@@ -25,6 +25,23 @@ const registerAuthRoutes = (app, { pool, verifyToken }) => {
             if (!result.rows[0] || !(await bcrypt.compare(password, result.rows[0].password))) {
                 return res.status(401).json({ status: 'error', message: 'Credenciales invalidas' });
             }
+
+            const userId = result.rows[0].id;
+            const adminRes = await pool.query('SELECT 1 FROM condominios WHERE admin_user_id = $1 LIMIT 1', [userId]);
+            const hasAdminAccess = adminRes.rows.length > 0;
+
+            if (!hasAdminAccess) {
+                const upRes = await pool.query(
+                    "SELECT rol, COALESCE(acceso_portal, true) AS acceso_portal FROM usuarios_propiedades WHERE user_id = $1",
+                    [userId]
+                );
+                const hasLinks = upRes.rows.length > 0;
+                const hasPortalAccess = upRes.rows.some((r) => r.acceso_portal === true);
+                if (hasLinks && !hasPortalAccess) {
+                    return res.status(403).json({ status: 'error', message: 'Acceso al portal deshabilitado para este usuario.' });
+                }
+            }
+
             const token = jwt.sign(
                 { id: result.rows[0].id, cedula: result.rows[0].cedula, nombre: result.rows[0].nombre },
                 process.env.JWT_SECRET,
@@ -47,4 +64,3 @@ const registerAuthRoutes = (app, { pool, verifyToken }) => {
 };
 
 module.exports = { registerAuthRoutes };
-

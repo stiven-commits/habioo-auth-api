@@ -6,7 +6,7 @@ const registerDashboardRoutes = (app, { pool, verifyToken }) => {
             FROM propiedades p
             JOIN usuarios_propiedades up ON p.id = up.propiedad_id
             JOIN condominios c ON p.condominio_id = c.id
-            WHERE up.user_id = $1
+            WHERE up.user_id = $1 AND COALESCE(up.acceso_portal, true) = true
         `;
             const result = await pool.query(query, [req.user.id]);
             res.json({ status: 'success', propiedades: result.rows });
@@ -22,7 +22,7 @@ const registerDashboardRoutes = (app, { pool, verifyToken }) => {
             FROM recibos r
             JOIN propiedades p ON r.propiedad_id = p.id
             JOIN usuarios_propiedades up ON p.id = up.propiedad_id
-            WHERE up.user_id = $1 AND r.estado NOT IN ('Pagado', 'Solvente')
+            WHERE up.user_id = $1 AND COALESCE(up.acceso_portal, true) = true AND r.estado NOT IN ('Pagado', 'Solvente')
         `;
             const resultDeuda = await pool.query(queryDeuda, [req.user.id]);
 
@@ -59,4 +59,3 @@ const registerDashboardRoutes = (app, { pool, verifyToken }) => {
 };
 
 module.exports = { registerDashboardRoutes };
-

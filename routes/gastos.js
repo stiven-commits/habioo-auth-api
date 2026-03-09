@@ -161,6 +161,22 @@ const registerGastosRoutes = (app, { pool, verifyToken, parseLocaleNumber, addMo
             res.status(500).json({ error: err.message });
         }
     });
+    // 💡 NUEVA RUTA: CAMBIAR REGLA DE DIVISIÓN DE GASTOS
+    app.put('/metodo-division', verifyToken, async (req, res) => {
+        const { metodo } = req.body;
+        if (!['Alicuota', 'Partes Iguales'].includes(metodo)) {
+            return res.status(400).json({ error: 'Método inválido.' });
+        }
+        try {
+            await pool.query(
+                'UPDATE condominios SET metodo_division = $1 WHERE admin_user_id = $2',
+                [metodo, req.user.id]
+            );
+            res.json({ status: 'success', message: `Método actualizado a ${metodo}` });
+        } catch (err) {
+            res.status(500).json({ error: err.message });
+        }
+    });
 
     app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
         try {
