@@ -4,6 +4,11 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
         const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [adminUserId]);
         return c.rows[0]?.id || null;
     };
+
+    const isValidEmail = (value) => {
+        if (!value) return true;
+        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value).trim());
+    };
     
     // 1. OBTENER PROPIEDADES
     app.get('/propiedades-admin', verifyToken, async (req, res) => {
@@ -125,14 +130,14 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
 
     // 4. CREAR PROPIEDAD INDIVIDUAL
     app.post('/propiedades-admin', verifyToken, async (req, res) => {
-        const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password, inq_permitir_acceso, monto_saldo_inicial, tipo_saldo_inicial } = req.body;
+        const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password, inq_permitir_acceso, monto_saldo_inicial } = req.body;
         const ownerEmail = (prop_email || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
         const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
         
         let saldoBase = parseFloat((monto_saldo_inicial || '0').toString().replace(',', '.')) || 0;
-        if (tipo_saldo_inicial === 'FAVOR') saldoBase = -Math.abs(saldoBase);
-        if (tipo_saldo_inicial === 'DEUDA') saldoBase = Math.abs(saldoBase);
+        if (!isValidEmail(ownerEmail)) return res.status(400).json({ error: 'Email del propietario inválido.' });
+        if (!isValidEmail(tenantEmail)) return res.status(400).json({ error: 'Email del inquilino inválido.' });
 
         try {
             await pool.query('BEGIN');
@@ -157,7 +162,10 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
             const propRes = await pool.query('INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual) VALUES ($1, $2, $3, $4, $5) RETURNING id', [condominioId, identificador, alicuotaNum, zona_id || null, saldoBase]);
             const nuevaPropId = propRes.rows[0].id;
 
-            if (saldoBase !== 0) await pool.query('INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)', [nuevaPropId, 'SALDO_INICIAL', Math.abs(saldoBase), `Saldo inicial cargado al crear el inmueble (${tipo_saldo_inicial})`]);
+            if (saldoBase !== 0) {
+                const tipoSaldo = saldoBase > 0 ? 'DEUDA' : 'FAVOR';
+                await pool.query('INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)', [nuevaPropId, 'SALDO_INICIAL', Math.abs(saldoBase), `Saldo inicial cargado al crear el inmueble (${tipoSaldo})`]);
+            }
             if (userId) await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, nuevaPropId, 'Propietario']);
 
             if (tiene_inquilino && inq_cedula && inq_nombre) {
@@ -188,6 +196,8 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
         const ownerEmail = (prop_email || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
         const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
+        if (!isValidEmail(ownerEmail)) return res.status(400).json({ error: 'Email del propietario inválido.' });
+        if (!isValidEmail(tenantEmail)) return res.status(400).json({ error: 'Email del inquilino inválido.' });
 
         try {
             await pool.query('BEGIN');
