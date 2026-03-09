@@ -164,9 +164,13 @@ const registerGastosRoutes = (app, { pool, verifyToken, parseLocaleNumber, addMo
 
     app.post('/cerrar-ciclo', verifyToken, async (req, res) => {
         try {
+            await pool.query('BEGIN'); 
+
             const condoRes = await pool.query('SELECT id, mes_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
             const { id: condo_id, mes_actual, metodo_division } = condoRes.rows[0];
-            const propRes = await pool.query('SELECT id, alicuota FROM propiedades WHERE condominio_id = $1', [condo_id]);
+            
+            // 💡 1. Agregamos "saldo_actual" a la búsqueda de propiedades
+            const propRes = await pool.query('SELECT id, alicuota, saldo_actual FROM propiedades WHERE condominio_id = $1', [condo_id]);
 
             const cuotasRes = await pool.query(
                 `SELECT gc.monto_cuota_usd, g.tipo, g.zona_id, g.propiedad_id FROM gastos_cuotas gc JOIN gastos g ON gc.gasto_id = g.id WHERE g.condominio_id = $1 AND gc.mes_asignado = $2 AND gc.estado = 'Pendiente'`,
@@ -175,6 +179,8 @@ const registerGastosRoutes = (app, { pool, verifyToken, parseLocaleNumber, addMo
 
             for (const p of propRes.rows) {
                 let total_deuda = 0;
+                const viejoSaldo = parseFloat(p.saldo_actual || 0); // 💡 Capturamos la plata que tenía a favor
+
                 const zonasApto = await pool.query('SELECT zona_id FROM propiedades_zonas WHERE propiedad_id = $1', [p.id]);
                 const zonaIds = zonasApto.rows.map((z) => z.zona_id);
 
@@ -198,17 +204,45 @@ const registerGastosRoutes = (app, { pool, verifyToken, parseLocaleNumber, addMo
                 }
 
                 if (total_deuda > 0) {
-                    await pool.query("INSERT INTO recibos (propiedad_id, mes_cobro, monto_usd, estado) VALUES ($1, $2, $3, 'Aviso de Cobro')", [p.id, formatMonthText(mes_actual), total_deuda.toFixed(2)]);
+                    const deudaFinal = total_deuda.toFixed(2);
+                    
+                    // 1. Guardamos el recibo inicial
+                    const recRes = await pool.query(
+                        "INSERT INTO recibos (propiedad_id, mes_cobro, monto_usd, estado) VALUES ($1, $2, $3, 'Aviso de Cobro') RETURNING id", 
+                        [p.id, formatMonthText(mes_actual), deudaFinal]
+                    );
+                    const nuevoReciboId = recRes.rows[0].id;
+
+                    // 2. Aumentar la deuda global
+                    await pool.query(
+                        'UPDATE propiedades SET saldo_actual = saldo_actual + $1 WHERE id = $2',
+                        [deudaFinal, p.id]
+                    );
+
+                    // 🌟 3. RECONCILIACIÓN AUTOMÁTICA (El Autopago) 🌟
+                    if (viejoSaldo < 0) {
+                        let saldoAFavor = Math.abs(viejoSaldo);
+                        
+                        if (saldoAFavor >= total_deuda) {
+                            // Tenía suficiente dinero a favor para pagar el recibo entero
+                            await pool.query("UPDATE recibos SET monto_pagado_usd = monto_usd, estado = 'Pagado' WHERE id = $1", [nuevoReciboId]);
+                        } else {
+                            // Su saldo a favor no alcanzó para todo, se abona lo que tenía
+                            await pool.query("UPDATE recibos SET monto_pagado_usd = $1, estado = 'Abonado' WHERE id = $2", [saldoAFavor, nuevoReciboId]);
+                        }
+                    }
                 }
             }
-            await pool.query(
-                "UPDATE gastos_cuotas SET estado = 'Procesado' FROM gastos WHERE gastos_cuotas.gasto_id = gastos.id AND gastos.condominio_id = $1 AND gastos_cuotas.mes_asignado = $2",
-                [condo_id, mes_actual]
-            );
+
+            await pool.query("UPDATE gastos_cuotas SET estado = 'Procesado' FROM gastos WHERE gastos_cuotas.gasto_id = gastos.id AND gastos.condominio_id = $1 AND gastos_cuotas.mes_asignado = $2", [condo_id, mes_actual]);
+            
             const proximoMes = addMonths(mes_actual, 1);
             await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [proximoMes, condo_id]);
-            res.json({ status: 'success', message: `Recibos generados. Avanzando a ${formatMonthText(proximoMes)}.` });
+            
+            await pool.query('COMMIT'); 
+            res.json({ status: 'success', message: `Recibos generados y saldos actualizados. Avanzando a ${formatMonthText(proximoMes)}.` });
         } catch (err) {
+            await pool.query('ROLLBACK'); 
             res.status(500).json({ error: err.message });
         }
     });

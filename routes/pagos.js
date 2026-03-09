@@ -156,8 +156,8 @@ const registerPagosRoutes = (app, { pool, verifyToken, parseLocaleNumber, getPag
                     await pool.query("UPDATE recibos SET monto_pagado_usd = monto_usd, estado = 'Pagado' WHERE id = $1", [rec.id]);
                     dineroRestante -= deudaRecibo;
                 } else {
-                    // Si es un abono parcial y no alcanza
-                    await pool.query("UPDATE recibos SET monto_pagado_usd = monto_pagado_usd + $1, estado = 'Parcial' WHERE id = $2", [dineroRestante, rec.id]);
+                    // 💡 CORREGIDO: Usamos 'Abonado'
+                    await pool.query("UPDATE recibos SET monto_pagado_usd = monto_pagado_usd + $1, estado = 'Abonado' WHERE id = $2", [dineroRestante, rec.id]);
                     dineroRestante = 0; // Se acabó el dinero
                 }
             }
