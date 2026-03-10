@@ -1,8 +1,11 @@
 const registerProveedoresRoutes = (app, { pool, verifyToken }) => {
+    const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
     
     // 1. CREAR O REACTIVAR PROVEEDOR INDIVIDUAL
     app.post('/proveedores', verifyToken, async (req, res) => {
-        const { identificador, nombre, telefono1, telefono2, direccion, estado_venezuela, rubro } = req.body;
+        const { identificador, nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro } = req.body;
+        const emailFmt = String(email || '').trim().toLowerCase();
+        if (!isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrónico inválido.' });
         try {
             const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
             const condoId = c.rows[0].id;
@@ -13,16 +16,16 @@ const registerProveedoresRoutes = (app, { pool, verifyToken }) => {
                 if (exist.rows[0].activo) return res.status(400).json({ error: 'Ya existe un proveedor activo registrado con este RIF.' });
                 else {
                     await pool.query(
-                        'UPDATE proveedores SET nombre=$1, telefono1=$2, telefono2=$3, direccion=$4, estado_venezuela=$5, rubro=$6, activo=true WHERE id=$7',
-                        [nombre, telefono1, telefono2, direccion, estado_venezuela, rubro || null, exist.rows[0].id]
+                        'UPDATE proveedores SET nombre=$1, email=$2, telefono1=$3, telefono2=$4, direccion=$5, estado_venezuela=$6, rubro=$7, activo=true WHERE id=$8',
+                        [nombre, emailFmt, telefono1, telefono2, direccion, estado_venezuela, rubro || null, exist.rows[0].id]
                     );
                     return res.json({ status: 'success', message: 'El proveedor estaba oculto, ha sido reactivado y actualizado.' });
                 }
             }
 
             await pool.query(
-                'INSERT INTO proveedores (condominio_id, identificador, nombre, telefono1, telefono2, direccion, estado_venezuela, rubro) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-                [condoId, identificador, nombre, telefono1, telefono2, direccion, estado_venezuela, rubro || null]
+                'INSERT INTO proveedores (condominio_id, identificador, nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+                [condoId, identificador, nombre, emailFmt, telefono1, telefono2, direccion, estado_venezuela, rubro || null]
             );
             res.json({ status: 'success', message: 'Proveedor registrado exitosamente.' });
         } catch (err) { res.status(500).json({ error: err.message }); }
@@ -43,6 +46,8 @@ const registerProveedoresRoutes = (app, { pool, verifyToken }) => {
 
             for (const item of proveedores) {
                 let rifFmt = (item.identificador || '').toUpperCase().replace(/[^VEJPG0-9]/g, '');
+                const emailFmt = String(item.email || '').trim().toLowerCase();
+                if (!isValidEmail(emailFmt)) throw new Error(`Correo inválido para el proveedor con RIF ${rifFmt || '(sin RIF)'}.`);
                 
                 const exist = await pool.query('SELECT id, activo FROM proveedores WHERE identificador = $1 AND condominio_id = $2', [rifFmt, condoId]);
 
@@ -53,15 +58,15 @@ const registerProveedoresRoutes = (app, { pool, verifyToken }) => {
                     } else {
                         // Si estaba eliminado, lo reactivamos
                         await pool.query(
-                            'UPDATE proveedores SET nombre=$1, telefono1=$2, telefono2=$3, direccion=$4, estado_venezuela=$5, rubro=$6, activo=true WHERE id=$7',
-                            [item.nombre, item.telefono1, item.telefono2 || null, item.direccion, item.estado_venezuela, item.rubro || null, exist.rows[0].id]
+                            'UPDATE proveedores SET nombre=$1, email=$2, telefono1=$3, telefono2=$4, direccion=$5, estado_venezuela=$6, rubro=$7, activo=true WHERE id=$8',
+                            [item.nombre, emailFmt, item.telefono1, item.telefono2 || null, item.direccion, item.estado_venezuela, item.rubro || null, exist.rows[0].id]
                         );
                     }
                 } else {
                     // Si no existe, lo insertamos
                     await pool.query(
-                        'INSERT INTO proveedores (condominio_id, identificador, nombre, telefono1, telefono2, direccion, estado_venezuela, rubro) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-                        [condoId, rifFmt, item.nombre, item.telefono1, item.telefono2 || null, item.direccion, item.estado_venezuela, item.rubro || null]
+                        'INSERT INTO proveedores (condominio_id, identificador, nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+                        [condoId, rifFmt, item.nombre, emailFmt, item.telefono1, item.telefono2 || null, item.direccion, item.estado_venezuela, item.rubro || null]
                     );
                 }
             }
@@ -76,11 +81,13 @@ const registerProveedoresRoutes = (app, { pool, verifyToken }) => {
 
     // 3. EDITAR PROVEEDOR EXISTENTE
     app.put('/proveedores/:id', verifyToken, async (req, res) => {
-        const { nombre, telefono1, telefono2, direccion, estado_venezuela, rubro } = req.body;
+        const { nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro } = req.body;
+        const emailFmt = String(email || '').trim().toLowerCase();
+        if (!isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrónico inválido.' });
         try {
             await pool.query(
-                'UPDATE proveedores SET nombre=$1, telefono1=$2, telefono2=$3, direccion=$4, estado_venezuela=$5, rubro=$6 WHERE id=$7',
-                [nombre, telefono1, telefono2, direccion, estado_venezuela, rubro || null, req.params.id]
+                'UPDATE proveedores SET nombre=$1, email=$2, telefono1=$3, telefono2=$4, direccion=$5, estado_venezuela=$6, rubro=$7 WHERE id=$8',
+                [nombre, emailFmt, telefono1, telefono2, direccion, estado_venezuela, rubro || null, req.params.id]
             );
             res.json({ status: 'success', message: 'Proveedor actualizado correctamente.' });
         } catch (err) { res.status(500).json({ error: err.message }); }

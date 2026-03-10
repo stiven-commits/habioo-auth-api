@@ -1,13 +1,32 @@
+﻿const getFaker = async () => {
+    try {
+        const pkg = require('@faker-js/faker');
+        return pkg.faker || pkg.fakerES || pkg;
+    } catch (err) {
+        const pkg = await import('@faker-js/faker');
+        return pkg.faker || pkg.fakerES;
+    }
+};
+
 const registerDashboardRoutes = (app, { pool, verifyToken }) => {
+    const buildCedula = (faker, seedNum) => `V${String(10000000 + seedNum).slice(-8)}`;
+    const buildRif = (seedNum) => `J${String(100000000 + seedNum).slice(-9)}`;
+    const buildVzlaPhone = (faker) => `04${faker.helpers.arrayElement(['12', '14', '16', '24', '26'])}${faker.string.numeric(7)}`;
+    const buildSeedEmail = (prefix, seedNum) => `${prefix}.${seedNum}@seed.habioo.test`;
+    const VENEZUELA_ESTADOS = [
+        'Distrito Capital', 'Miranda', 'Carabobo', 'Aragua', 'Lara', 'Zulia', 'Anzoategui',
+        'Bolivar', 'Merida', 'Tachira', 'Nueva Esparta', 'Monagas', 'Sucre', 'Falcon',
+    ];
+
     app.get('/mis-propiedades', verifyToken, async (req, res) => {
         try {
             const query = `
-            SELECT p.*, c.nombre as condominio_nombre 
-            FROM propiedades p
-            JOIN usuarios_propiedades up ON p.id = up.propiedad_id
-            JOIN condominios c ON p.condominio_id = c.id
-            WHERE up.user_id = $1 AND COALESCE(up.acceso_portal, true) = true
-        `;
+                SELECT p.*, c.nombre as condominio_nombre
+                FROM propiedades p
+                JOIN usuarios_propiedades up ON p.id = up.propiedad_id
+                JOIN condominios c ON p.condominio_id = c.id
+                WHERE up.user_id = $1 AND COALESCE(up.acceso_portal, true) = true
+            `;
             const result = await pool.query(query, [req.user.id]);
             res.json({ status: 'success', propiedades: result.rows });
         } catch (err) {
@@ -18,12 +37,14 @@ const registerDashboardRoutes = (app, { pool, verifyToken }) => {
     app.get('/mis-finanzas', verifyToken, async (req, res) => {
         try {
             const queryDeuda = `
-            SELECT SUM(r.monto_usd) as total_deuda
-            FROM recibos r
-            JOIN propiedades p ON r.propiedad_id = p.id
-            JOIN usuarios_propiedades up ON p.id = up.propiedad_id
-            WHERE up.user_id = $1 AND COALESCE(up.acceso_portal, true) = true AND r.estado NOT IN ('Pagado', 'Solvente')
-        `;
+                SELECT SUM(r.monto_usd) as total_deuda
+                FROM recibos r
+                JOIN propiedades p ON r.propiedad_id = p.id
+                JOIN usuarios_propiedades up ON p.id = up.propiedad_id
+                WHERE up.user_id = $1
+                  AND COALESCE(up.acceso_portal, true) = true
+                  AND r.estado NOT IN ('Pagado', 'Solvente')
+            `;
             const resultDeuda = await pool.query(queryDeuda, [req.user.id]);
 
             res.json({
@@ -39,169 +60,306 @@ const registerDashboardRoutes = (app, { pool, verifyToken }) => {
 
     app.get('/cuentas-por-cobrar', verifyToken, async (req, res) => {
         try {
-            const c = await pool.query('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+            const c = await pool.query(
+                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                [req.user.id],
+            );
             if (c.rows.length === 0) return res.status(403).json({ error: 'No autorizado' });
             const condoId = c.rows[0].id;
 
             const query = `
-            SELECT r.*, p.identificador as apto
-            FROM recibos r
-            JOIN propiedades p ON r.propiedad_id = p.id
-            WHERE p.condominio_id = $1 AND r.estado NOT IN ('Pagado', 'Solvente')
-            ORDER BY r.fecha_emision DESC
-        `;
+                SELECT r.*, p.identificador as apto
+                FROM recibos r
+                JOIN propiedades p ON r.propiedad_id = p.id
+                WHERE p.condominio_id = $1
+                  AND r.estado NOT IN ('Pagado', 'Solvente')
+                ORDER BY r.fecha_emision DESC
+            `;
             const result = await pool.query(query, [condoId]);
             res.json({ status: 'success', recibos: result.rows });
         } catch (err) {
             res.status(500).json({ error: err.message });
         }
     });
-    // 🧪 RUTA DE DESARROLLO: INYECTAR DATOS DE PRUEBA COMPLETOS
+
     app.post('/dashboard-admin/seed-prueba', verifyToken, async (req, res) => {
         try {
+            const faker = await getFaker();
+
             await pool.query('BEGIN');
-            
-            const condoRes = await pool.query('SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [req.user.id]);
+
+            const condoRes = await pool.query(
+                'SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                [req.user.id],
+            );
+
+            if (condoRes.rows.length === 0) {
+                throw new Error('Condominio no encontrado para este administrador.');
+            }
+
             const condoId = condoRes.rows[0].id;
             const mesActual = condoRes.rows[0].mes_actual;
 
-            // 1. Limpieza segura: Borramos pruebas anteriores (en estricto orden para no romper Foreign Keys)
-            
-            // A. Primero borramos los historiales (Transferencias y Pagos a proveedores) amarrados a los fondos de prueba
-            await pool.query(`
-                DELETE FROM transferencias 
-                WHERE fondo_origen_id IN (SELECT id FROM fondos WHERE nombre LIKE '[TEST]%') 
-                   OR fondo_destino_id IN (SELECT id FROM fondos WHERE nombre LIKE '[TEST]%')
-            `);
-            await pool.query(`
-                DELETE FROM pagos_proveedores 
-                WHERE fondo_id IN (SELECT id FROM fondos WHERE nombre LIKE '[TEST]%')
-            `);
+            // 1) Limpieza completa operativa del condominio para pruebas
+            // Se borra TODO lo operativo del condominio para evitar residuos de pruebas manuales anteriores.
+            await pool.query(
+                `DELETE FROM pagos p
+                 USING recibos r, propiedades pr
+                 WHERE p.recibo_id = r.id
+                   AND r.propiedad_id = pr.id
+                   AND pr.condominio_id = $1`,
+                [condoId],
+            );
 
-            // B. Ahora sí, borramos las entidades principales
-            await pool.query("DELETE FROM gastos WHERE concepto LIKE '[TEST]%' AND condominio_id = $1", [condoId]);
-            await pool.query("DELETE FROM proveedores WHERE nombre LIKE '[TEST]%' AND condominio_id = $1", [condoId]);
-            await pool.query("DELETE FROM propiedades WHERE identificador LIKE 'TEST-%' AND condominio_id = $1", [condoId]);
-            await pool.query("DELETE FROM zonas WHERE nombre LIKE 'TEST-%' AND condominio_id = $1", [condoId]);
-            
-            // C. Borramos los fondos y las cuentas bancarias por último
-            await pool.query("DELETE FROM fondos WHERE nombre LIKE '[TEST]%' AND condominio_id = $1", [condoId]);
-            await pool.query("DELETE FROM cuentas_bancarias WHERE apodo LIKE '[TEST]%' AND condominio_id = $1", [condoId]);
+            await pool.query(
+                `DELETE FROM pagos p
+                 USING propiedades pr
+                 WHERE p.propiedad_id = pr.id
+                   AND pr.condominio_id = $1`,
+                [condoId],
+            );
 
-            // 2. Crear 3 Cuentas Bancarias
+            await pool.query(
+                `DELETE FROM recibos r
+                 USING propiedades pr
+                 WHERE r.propiedad_id = pr.id
+                   AND pr.condominio_id = $1`,
+                [condoId],
+            );
+
+            await pool.query(
+                `DELETE FROM transferencias WHERE condominio_id = $1`,
+                [condoId],
+            );
+
+            await pool.query(
+                `DELETE FROM pagos_proveedores
+                 WHERE fondo_id IN (SELECT id FROM fondos WHERE condominio_id = $1)
+                    OR gasto_id IN (SELECT id FROM gastos WHERE condominio_id = $1)`,
+                [condoId],
+            );
+
+            await pool.query(
+                `DELETE FROM movimientos_fondos
+                 WHERE fondo_id IN (SELECT id FROM fondos WHERE condominio_id = $1)`,
+                [condoId],
+            );
+
+            await pool.query(
+                `DELETE FROM historial_saldos_inmuebles
+                 WHERE propiedad_id IN (SELECT id FROM propiedades WHERE condominio_id = $1)`,
+                [condoId],
+            );
+            await pool.query(
+                `DELETE FROM usuarios_propiedades
+                 WHERE propiedad_id IN (SELECT id FROM propiedades WHERE condominio_id = $1)`,
+                [condoId],
+            );
+            await pool.query(
+                `DELETE FROM propiedades_zonas
+                 WHERE propiedad_id IN (SELECT id FROM propiedades WHERE condominio_id = $1)`,
+                [condoId],
+            );
+
+            await pool.query(
+                "DELETE FROM gastos_cuotas WHERE gasto_id IN (SELECT id FROM gastos WHERE condominio_id = $1)",
+                [condoId],
+            );
+            await pool.query("DELETE FROM gastos WHERE condominio_id = $1", [condoId]);
+            await pool.query("DELETE FROM proveedores WHERE condominio_id = $1", [condoId]);
+            await pool.query("DELETE FROM fondos WHERE condominio_id = $1", [condoId]);
+            await pool.query("DELETE FROM cuentas_bancarias WHERE condominio_id = $1", [condoId]);
+            await pool.query("DELETE FROM propiedades WHERE condominio_id = $1", [condoId]);
+            await pool.query("DELETE FROM zonas WHERE condominio_id = $1", [condoId]);
+
+            await pool.query(
+                `DELETE FROM users u
+                 WHERE u.email ILIKE '%@seed.habioo.test'
+                   AND NOT EXISTS (SELECT 1 FROM usuarios_propiedades up WHERE up.user_id = u.id)
+                   AND u.id <> $1`,
+                [req.user.id],
+            );
+
+            // 2) Datos de prueba frescos
+            const nombresBancos = ['Banco de Venezuela', 'Banesco', 'Mercantil', 'Provincial', 'Bancamiga'];
             const cuenta1 = await pool.query(
-                "INSERT INTO cuentas_bancarias (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada) VALUES ($1, '01020000111122223333', 'Banco de Venezuela', '[TEST] Cuenta Principal (2 Fondos)', 'Corriente', 'Junta de Condominio', 'J-12345678-9', '0414-1234567', true) RETURNING id", 
-                [condoId]
+                `INSERT INTO cuentas_bancarias
+                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
+                 VALUES
+                    ($1, $2, $3, $4, $5, $6, $7, $8, true)
+                 RETURNING id`,
+                [
+                    condoId,
+                    faker.finance.accountNumber({ length: 20 }),
+                    faker.helpers.arrayElement(nombresBancos),
+                    '[TEST] Cuenta Principal',
+                    'Transferencia',
+                    faker.person.fullName(),
+                    `J${faker.string.numeric(9)}`,
+                    buildVzlaPhone(faker),
+                ],
             );
+
+            await pool.query(
+                `INSERT INTO fondos
+                    (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo)
+                 VALUES
+                    ($1, $2, '[TEST] Fondo Operativo Principal', 'BS', 0, 8000, true)`,
+                [condoId, cuenta1.rows[0].id],
+            );
+
             const cuenta2 = await pool.query(
-                "INSERT INTO cuentas_bancarias (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada) VALUES ($1, '01340000111122223333', 'Banesco', '[TEST] Cuenta Reserva (1 Fondo)', 'Ahorros', 'Junta de Condominio', 'J-12345678-9', '0414-1234567', false) RETURNING id", 
-                [condoId]
-            );
-            const cuenta3 = await pool.query(
-                "INSERT INTO cuentas_bancarias (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada) VALUES ($1, 'Zelle', 'Bank of America', '[TEST] Cuenta Zelle (0 Fondos)', 'Extranjera', 'Administrador', 'V-12345678', '0412-1234567', false) RETURNING id", 
-                [condoId]
-            );
-            
-            const idC1 = cuenta1.rows[0].id;
-            const idC2 = cuenta2.rows[0].id;
-
-            // 3. Crear Fondos y asociarlos a las cuentas
-            // Cuenta 1 (2 Fondos: 1 Operativo, 1 Reserva)
-            await pool.query(
-                "INSERT INTO fondos (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo) VALUES ($1, $2, '[TEST] Fondo Operativo Principal', 'BS', 0, 5000, true)", 
-                [condoId, idC1]
-            );
-            await pool.query(
-                "INSERT INTO fondos (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo) VALUES ($1, $2, '[TEST] Fondo Prestaciones Empleados', 'BS', 10, 1500, false)", 
-                [condoId, idC1]
+                `INSERT INTO cuentas_bancarias
+                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
+                 VALUES
+                    ($1, $2, $3, $4, $5, $6, $7, $8, false)
+                 RETURNING id`,
+                [
+                    condoId,
+                    faker.finance.accountNumber({ length: 20 }),
+                    faker.helpers.arrayElement(nombresBancos),
+                    '[TEST] Cuenta Secundaria',
+                    'Transferencia',
+                    faker.person.fullName(),
+                    `J${faker.string.numeric(9)}`,
+                    buildVzlaPhone(faker),
+                ],
             );
 
-            // Cuenta 2 (1 Fondo de Reserva USD)
             await pool.query(
-                "INSERT INTO fondos (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo) VALUES ($1, $2, '[TEST] Fondo Reserva Ascensores', 'USD', 5, 300, false)", 
-                [condoId, idC2]
+                `INSERT INTO fondos
+                    (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo)
+                 VALUES
+                    ($1, $2, '[TEST] Fondo Reserva General', 'BS', 0, 3200, false),
+                    ($1, $2, '[TEST] Fondo Prestaciones Empleados', 'USD', 0, 1500, false)`,
+                [condoId, cuenta2.rows[0].id],
             );
 
-            // 4. Crear 2 Zonas
             const zA = await pool.query("INSERT INTO zonas (condominio_id, nombre) VALUES ($1, 'TEST-Torre A') RETURNING id", [condoId]);
             const zB = await pool.query("INSERT INTO zonas (condominio_id, nombre) VALUES ($1, 'TEST-Torre B') RETURNING id", [condoId]);
-            const idZa = zA.rows[0].id;
-            const idZb = zB.rows[0].id;
+            const zC = await pool.query("INSERT INTO zonas (condominio_id, nombre) VALUES ($1, 'TEST-Torre C') RETURNING id", [condoId]);
+            const zD = await pool.query("INSERT INTO zonas (condominio_id, nombre) VALUES ($1, 'TEST-Torre D') RETURNING id", [condoId]);
+            const zonas = [zA.rows[0].id, zB.rows[0].id, zC.rows[0].id, zD.rows[0].id];
 
-            // 5. Crear 8 Propiedades
             const props = [];
-            const propConfigs = [
-                { iden: 'TEST-1A', zona: idZa, saldo: 0 },
-                { iden: 'TEST-1B', zona: idZa, saldo: 50 },
-                { iden: 'TEST-2A', zona: idZa, saldo: -30 },
-                { iden: 'TEST-2B', zona: idZa, saldo: 0 },
-                { iden: 'TEST-3A', zona: idZb, saldo: 120 },
-                { iden: 'TEST-3B', zona: idZb, saldo: 0 },
-                { iden: 'TEST-4A', zona: idZb, saldo: -10 },
-                { iden: 'TEST-4B', zona: idZb, saldo: 0 }
-            ];
+            const propConfigs = Array.from({ length: 20 }, (_, idx) => {
+                const i = idx + 1;
+                let saldo = 0;
+                if (i % 3 === 1) saldo = Number((10 + i * 1.75).toFixed(2));
+                if (i % 3 === 2) saldo = Number((-6 - i * 1.35).toFixed(2));
+
+                return {
+                    iden: `TEST-${String(i).padStart(2, '0')}`,
+                    zona: zonas[idx % zonas.length],
+                    saldo,
+                };
+            });
 
             for (const pc of propConfigs) {
                 const p = await pool.query(
-                    "INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual) VALUES ($1, $2, 12.50, $3, $4) RETURNING id",
-                    [condoId, pc.iden, pc.zona, pc.saldo]
+                    `INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual)
+                     VALUES ($1, $2, 5.00, $3, $4)
+                     RETURNING id`,
+                    [condoId, pc.iden, pc.zona, pc.saldo],
                 );
-                const nuevaPropId = p.rows[0].id;
-                props.push(nuevaPropId);
-                
-                await pool.query("INSERT INTO propiedades_zonas (propiedad_id, zona_id) VALUES ($1, $2)", [nuevaPropId, pc.zona]);
-                
+                props.push(p.rows[0].id);
+                await pool.query('INSERT INTO propiedades_zonas (propiedad_id, zona_id) VALUES ($1, $2)', [p.rows[0].id, pc.zona]);
+
                 if (pc.saldo !== 0) {
                     await pool.query(
-                        "INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota, fecha) VALUES ($1, 'SALDO_INICIAL', $2, $3, CURRENT_DATE)",
-                        [nuevaPropId, Math.abs(pc.saldo), pc.saldo > 0 ? 'Saldo Inicial (DEUDA)' : 'Saldo Inicial (FAVOR)']
+                        `INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota, fecha)
+                         VALUES ($1, 'SALDO_INICIAL', $2, $3, CURRENT_DATE)`,
+                        [
+                            p.rows[0].id,
+                            Math.abs(pc.saldo),
+                            pc.saldo > 0 ? 'Saldo inicial de prueba (DEUDA)' : 'Saldo inicial de prueba (FAVOR)',
+                        ],
                     );
                 }
+
+                const seedNum = Date.now() + props.length;
+                const propCedula = buildCedula(faker, seedNum);
+                const propNombre = faker.person.fullName();
+                const propEmail = buildSeedEmail('prop', seedNum);
+                const propTelefono = buildVzlaPhone(faker);
+
+                const ownerUser = await pool.query(
+                    `INSERT INTO users (cedula, nombre, email, telefono, password)
+                     VALUES ($1, $2, $3, $4, $5)
+                     RETURNING id`,
+                    [propCedula, propNombre, propEmail, propTelefono, propCedula],
+                );
+
+                await pool.query(
+                    `INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol)
+                     VALUES ($1, $2, 'Propietario')`,
+                    [ownerUser.rows[0].id, p.rows[0].id],
+                );
             }
 
-            // 6. Crear 2 Proveedores
-            const prov1 = await pool.query(
-                "INSERT INTO proveedores (condominio_id, identificador, nombre, rubro, estado_venezuela, direccion, telefono1) VALUES ($1, 'J111111111', '[TEST] Empresa de Limpieza', 'Limpieza', 'Distrito Capital', 'Sede Principal', '0412-0000000') RETURNING id", 
-                [condoId]
-            );
-            const prov2 = await pool.query(
-                "INSERT INTO proveedores (condominio_id, identificador, nombre, rubro, estado_venezuela, direccion, telefono1) VALUES ($1, 'J222222222', '[TEST] Mantenimiento Técnico', 'Mantenimiento', 'Miranda', 'Taller Central', '0414-1111111') RETURNING id", 
-                [condoId]
-            );
-            const idProv1 = prov1.rows[0].id;
-            const idProv2 = prov2.rows[0].id;
+            const proveedorIds = [];
+            for (let i = 1; i <= 8; i++) {
+                const seedNum = Date.now() + i;
+                const prov = await pool.query(
+                    `INSERT INTO proveedores
+                        (condominio_id, identificador, nombre, email, rubro, estado_venezuela, direccion, telefono1)
+                     VALUES
+                        ($1, $2, $3, $4, $5, $6, $7, $8)
+                     RETURNING id`,
+                    [
+                        condoId,
+                        buildRif(seedNum),
+                        `[TEST] ${faker.company.name()}`.slice(0, 120),
+                        buildSeedEmail('proveedor', seedNum),
+                        faker.company.buzzPhrase().slice(0, 255),
+                        faker.helpers.arrayElement(VENEZUELA_ESTADOS),
+                        `${faker.location.streetAddress()} - ${faker.location.city()}`.slice(0, 255),
+                        buildVzlaPhone(faker),
+                    ],
+                );
+                proveedorIds.push(prov.rows[0].id);
+            }
 
-            // 7. Crear 12 Gastos
             const gastosConfig = [
-                { prov: idProv1, concepto: '[TEST] Limpieza de pasillos comunes', usd: 100, tipo: 'Comun', zona: null, prop: null },
-                { prov: idProv1, concepto: '[TEST] Insumos de conserjería', usd: 40, tipo: 'Comun', zona: null, prop: null },
-                { prov: idProv2, concepto: '[TEST] Revisión de portón principal', usd: 150, tipo: 'Comun', zona: null, prop: null },
-                { prov: idProv1, concepto: '[TEST] Recolección de basura', usd: 60, tipo: 'Comun', zona: null, prop: null },
-                { prov: idProv2, concepto: '[TEST] Mantenimiento cuarto de bombas', usd: 80, tipo: 'Comun', zona: null, prop: null },
-                
-                { prov: idProv1, concepto: '[TEST] Limpieza profunda Torre A', usd: 50, tipo: 'Zona', zona: idZa, prop: null },
-                { prov: idProv2, concepto: '[TEST] Falla eléctrica ascensor Torre A', usd: 120, tipo: 'Zona', zona: idZa, prop: null },
-                { prov: idProv1, concepto: '[TEST] Pintura lobby Torre B', usd: 90, tipo: 'Zona', zona: idZb, prop: null },
-                { prov: idProv2, concepto: '[TEST] Reparación puerta Torre B', usd: 45, tipo: 'Zona', zona: idZb, prop: null },
-                
-                { prov: idProv2, concepto: '[TEST] Destape cañería Apto 1A', usd: 25, tipo: 'Individual', zona: null, prop: props[0] },
-                { prov: idProv2, concepto: '[TEST] Reparación filtración Apto 3B', usd: 75, tipo: 'Individual', zona: null, prop: props[5] },
-                { prov: idProv1, concepto: '[TEST] Limpieza especial post-mudanza Apto 4A', usd: 30, tipo: 'Individual', zona: null, prop: props[6] }
+                { concepto: '[TEST] Limpieza y aseo general', usd: 95, tipo: 'Comun', zona: null, prop: null },
+                { concepto: '[TEST] Mantenimiento portones', usd: 120, tipo: 'Comun', zona: null, prop: null },
+                { concepto: '[TEST] Reparacion bomba hidroneumatica', usd: 160, tipo: 'Comun', zona: null, prop: null },
+                { concepto: '[TEST] Compra insumos de limpieza', usd: 80, tipo: 'Comun', zona: null, prop: null },
+                { concepto: '[TEST] Servicio vigilancia nocturna', usd: 140, tipo: 'Comun', zona: null, prop: null },
+                { concepto: '[TEST] Impermeabilizacion azotea', usd: 210, tipo: 'Comun', zona: null, prop: null },
+                { concepto: '[TEST] Reparacion ascensor Torre A', usd: 110, tipo: 'Zona', zona: zA.rows[0].id, prop: null },
+                { concepto: '[TEST] Pintura pasillos Torre B', usd: 75, tipo: 'Zona', zona: zB.rows[0].id, prop: null },
+                { concepto: '[TEST] Electricidad area comun Torre C', usd: 65, tipo: 'Zona', zona: zC.rows[0].id, prop: null },
+                { concepto: '[TEST] Mantenimiento hidroneumatico Torre D', usd: 98, tipo: 'Zona', zona: zD.rows[0].id, prop: null },
+                { concepto: '[TEST] Reparacion cerradura apto', usd: 32, tipo: 'Individual', zona: null, prop: props[0] },
+                { concepto: '[TEST] Cambio luminaria apto', usd: 28, tipo: 'Individual', zona: null, prop: props[5] },
+                { concepto: '[TEST] Reparacion toma de agua apto', usd: 41, tipo: 'Individual', zona: null, prop: props[10] },
+                { concepto: '[TEST] Servicio tecnico aire acondicionado', usd: 55, tipo: 'Individual', zona: null, prop: props[15] },
             ];
 
             for (const g of gastosConfig) {
+                const proveedorId = faker.helpers.arrayElement(proveedorIds);
                 const gas = await pool.query(
-                    "INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, tipo, zona_id, propiedad_id, fecha_gasto) VALUES ($1, $2, $3, $4, 40, $5, 1, $6, $7, $8, CURRENT_DATE) RETURNING id",
-                    [condoId, g.prov, g.concepto, g.usd * 40, g.usd, g.tipo, g.zona, g.prop]
+                    `INSERT INTO gastos
+                        (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, tipo, zona_id, propiedad_id, fecha_gasto)
+                     VALUES
+                        ($1, $2, $3, $4, 40, $5, 1, $6, $7, $8, CURRENT_DATE)
+                     RETURNING id`,
+                    [condoId, proveedorId, g.concepto, g.usd * 40, g.usd, g.tipo, g.zona, g.prop],
                 );
+
                 await pool.query(
-                    "INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado, estado) VALUES ($1, 1, $2, $3, 'Pendiente')",
-                    [gas.rows[0].id, g.usd, mesActual]
+                    `INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado, estado)
+                     VALUES ($1, 1, $2, $3, 'Pendiente')`,
+                    [gas.rows[0].id, g.usd, mesActual],
                 );
             }
 
             await pool.query('COMMIT');
-            res.json({ status: 'success', message: '📦 Base de datos poblada exitosamente con 3 Cuentas Bancarias, 3 Fondos, 8 Inmuebles, 2 Zonas y 12 Gastos.' });
+            res.json({
+                status: 'success',
+                message: 'Simulacion lista: 20 inmuebles con propietarios, 8 proveedores, 2 cuentas (3 fondos) y 14 gastos.',
+            });
         } catch (err) {
             await pool.query('ROLLBACK');
             res.status(500).json({ error: err.message });
