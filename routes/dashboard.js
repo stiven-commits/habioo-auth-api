@@ -65,11 +65,26 @@ const registerDashboardRoutes = (app, { pool, verifyToken }) => {
             const condoId = condoRes.rows[0].id;
             const mesActual = condoRes.rows[0].mes_actual;
 
-            // 1. Limpieza segura: Borramos pruebas anteriores (en orden para no romper Foreign Keys)
+            // 1. Limpieza segura: Borramos pruebas anteriores (en estricto orden para no romper Foreign Keys)
+            
+            // A. Primero borramos los historiales (Transferencias y Pagos a proveedores) amarrados a los fondos de prueba
+            await pool.query(`
+                DELETE FROM transferencias 
+                WHERE fondo_origen_id IN (SELECT id FROM fondos WHERE nombre LIKE '[TEST]%') 
+                   OR fondo_destino_id IN (SELECT id FROM fondos WHERE nombre LIKE '[TEST]%')
+            `);
+            await pool.query(`
+                DELETE FROM pagos_proveedores 
+                WHERE fondo_id IN (SELECT id FROM fondos WHERE nombre LIKE '[TEST]%')
+            `);
+
+            // B. Ahora sí, borramos las entidades principales
             await pool.query("DELETE FROM gastos WHERE concepto LIKE '[TEST]%' AND condominio_id = $1", [condoId]);
             await pool.query("DELETE FROM proveedores WHERE nombre LIKE '[TEST]%' AND condominio_id = $1", [condoId]);
             await pool.query("DELETE FROM propiedades WHERE identificador LIKE 'TEST-%' AND condominio_id = $1", [condoId]);
             await pool.query("DELETE FROM zonas WHERE nombre LIKE 'TEST-%' AND condominio_id = $1", [condoId]);
+            
+            // C. Borramos los fondos y las cuentas bancarias por último
             await pool.query("DELETE FROM fondos WHERE nombre LIKE '[TEST]%' AND condominio_id = $1", [condoId]);
             await pool.query("DELETE FROM cuentas_bancarias WHERE apodo LIKE '[TEST]%' AND condominio_id = $1", [condoId]);
 
