@@ -67,7 +67,7 @@ const registerPagosRoutes = (app, { pool, verifyToken, parseLocaleNumber, getPag
                 await client.query("UPDATE recibos SET monto_pagado_usd = monto_usd, estado = 'Pagado' WHERE id = $1", [rec.id]);
                 dineroRestante -= deudaRecibo;
             } else {
-                await client.query("UPDATE recibos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1, estado = 'Parcial' WHERE id = $2", [dineroRestante, rec.id]);
+                await client.query("UPDATE recibos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1, estado = 'Abonado' WHERE id = $2", [dineroRestante, rec.id]);
                 dineroRestante = 0;
             }
         }
@@ -217,7 +217,7 @@ const registerPagosRoutes = (app, { pool, verifyToken, parseLocaleNumber, getPag
                 } else {
                     // El dinero NO alcanza para matarlo, queda como un abono parcial
                     await pool.query(
-                        "UPDATE recibos SET monto_pagado_usd = monto_pagado_usd + $1, estado = 'Parcial' WHERE id = $2", 
+                        "UPDATE recibos SET monto_pagado_usd = monto_pagado_usd + $1, estado = 'Abonado' WHERE id = $2", 
                         [dineroRestante, rec.id]
                     );
                     dineroRestante = 0; // Nos quedamos sin dinero

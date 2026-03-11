@@ -37,19 +37,58 @@ const registerPropiedadesRoutes = (app, { pool, verifyToken }) => {
         try {
             // 1. Cargos (Recibos / Deudas)
             const recibos = await pool.query(
-                `SELECT 'RECIBO' as tipo, id as ref_id, 'Aviso de Cobro: ' || mes_cobro as concepto, monto_usd as cargo, 0 as abono, fecha_emision as fecha_operacion, fecha_emision as fecha_registro FROM recibos WHERE propiedad_id = $1`, 
+                `SELECT
+                    'RECIBO' as tipo,
+                    id as ref_id,
+                    CASE
+                      WHEN estado = 'Pagado' THEN 'Recibo: ' || mes_cobro
+                      ELSE 'Aviso de Cobro: ' || mes_cobro
+                    END as concepto,
+                    monto_usd as cargo,
+                    0 as abono,
+                    NULL::numeric as monto_bs,
+                    NULL::numeric as tasa_cambio,
+                    estado as estado_recibo,
+                    fecha_emision as fecha_operacion,
+                    fecha_emision as fecha_registro
+                 FROM recibos
+                 WHERE propiedad_id = $1`,
                 [propiedadId]
             );
             
             // 💡 2. Abonos (Pagos) - CORREGIDO: Ahora busca directamente por propiedad_id
             const pagos = await pool.query(
-                `SELECT 'PAGO' as tipo, id as ref_id, 'Pago Ref: ' || referencia as concepto, 0 as cargo, monto_usd as abono, fecha_pago as fecha_operacion, COALESCE(created_at, fecha_pago) as fecha_registro FROM pagos WHERE propiedad_id = $1 AND estado = 'Validado'`, 
+                `SELECT
+                    'PAGO' as tipo,
+                    id as ref_id,
+                    'Pago Ref: ' || referencia as concepto,
+                    0 as cargo,
+                    monto_usd as abono,
+                    COALESCE(monto_origen, 0) as monto_bs,
+                    tasa_cambio,
+                    NULL::text as estado_recibo,
+                    fecha_pago as fecha_operacion,
+                    COALESCE(created_at, fecha_pago) as fecha_registro
+                 FROM pagos
+                 WHERE propiedad_id = $1 AND estado = 'Validado'`,
                 [propiedadId]
             );
             
             // 3. Ajustes Manuales (Saldos a favor / Deudas cargadas a mano)
             const ajustes = await pool.query(
-                `SELECT 'AJUSTE' as tipo, id as ref_id, nota as concepto, CASE WHEN tipo = 'CARGAR_DEUDA' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(DEUDA)%') THEN monto ELSE 0 END as cargo, CASE WHEN tipo = 'AGREGAR_FAVOR' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(FAVOR)%') THEN monto ELSE 0 END as abono, fecha as fecha_operacion, fecha as fecha_registro FROM historial_saldos_inmuebles WHERE propiedad_id = $1`, 
+                `SELECT
+                    'AJUSTE' as tipo,
+                    id as ref_id,
+                    nota as concepto,
+                    CASE WHEN tipo = 'CARGAR_DEUDA' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(DEUDA)%') THEN monto ELSE 0 END as cargo,
+                    CASE WHEN tipo = 'AGREGAR_FAVOR' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(FAVOR)%') THEN monto ELSE 0 END as abono,
+                    NULL::numeric as monto_bs,
+                    NULL::numeric as tasa_cambio,
+                    NULL::text as estado_recibo,
+                    fecha as fecha_operacion,
+                    fecha as fecha_registro
+                 FROM historial_saldos_inmuebles
+                 WHERE propiedad_id = $1`,
                 [propiedadId]
             );
             
