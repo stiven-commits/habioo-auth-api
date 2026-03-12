@@ -17,6 +17,13 @@ const registerDashboardRoutes = (app, { pool, verifyToken }) => {
         'Distrito Capital', 'Miranda', 'Carabobo', 'Aragua', 'Lara', 'Zulia', 'Anzoategui',
         'Bolivar', 'Merida', 'Tachira', 'Nueva Esparta', 'Monagas', 'Sucre', 'Falcon',
     ];
+    const addMonthsSeed = (yyyyMm, offset) => {
+        const [year, month] = String(yyyyMm).split('-').map(Number);
+        const d = new Date(Date.UTC(year, (month - 1) + offset, 1));
+        const y = d.getUTCFullYear();
+        const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+        return `${y}-${m}`;
+    };
 
     app.get('/mis-propiedades', verifyToken, async (req, res) => {
         try {
@@ -98,7 +105,18 @@ const registerDashboardRoutes = (app, { pool, verifyToken }) => {
             }
 
             const condoId = condoRes.rows[0].id;
-            const mesActual = condoRes.rows[0].mes_actual;
+            const now = new Date();
+            const mesAnteriorDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+            const mesActual = `${mesAnteriorDate.getUTCFullYear()}-${String(mesAnteriorDate.getUTCMonth() + 1).padStart(2, '0')}`;
+            await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [mesActual, condoId]);
+
+            // Asegura compatibilidad del tipo "Extra" en entornos donde el CHECK aun no fue migrado.
+            await pool.query('ALTER TABLE gastos DROP CONSTRAINT IF EXISTS gastos_tipo_check');
+            await pool.query(`
+                ALTER TABLE gastos
+                ADD CONSTRAINT gastos_tipo_check
+                CHECK (tipo IN ('Comun', 'No Comun', 'Zona', 'Individual', 'Extra'))
+            `);
 
             // 1) Limpieza completa operativa del condominio para pruebas
             // Se borra TODO lo operativo del condominio para evitar residuos de pruebas manuales anteriores.
@@ -321,44 +339,51 @@ const registerDashboardRoutes = (app, { pool, verifyToken }) => {
             }
 
             const gastosConfig = [
-                { concepto: '[TEST] Limpieza y aseo general', usd: 95, tipo: 'Comun', zona: null, prop: null },
-                { concepto: '[TEST] Mantenimiento portones', usd: 120, tipo: 'Comun', zona: null, prop: null },
-                { concepto: '[TEST] Reparacion bomba hidroneumatica', usd: 160, tipo: 'Comun', zona: null, prop: null },
-                { concepto: '[TEST] Compra insumos de limpieza', usd: 80, tipo: 'Comun', zona: null, prop: null },
-                { concepto: '[TEST] Servicio vigilancia nocturna', usd: 140, tipo: 'Comun', zona: null, prop: null },
-                { concepto: '[TEST] Impermeabilizacion azotea', usd: 210, tipo: 'Comun', zona: null, prop: null },
-                { concepto: '[TEST] Reparacion ascensor Torre A', usd: 110, tipo: 'Zona', zona: zA.rows[0].id, prop: null },
-                { concepto: '[TEST] Pintura pasillos Torre B', usd: 75, tipo: 'Zona', zona: zB.rows[0].id, prop: null },
-                { concepto: '[TEST] Electricidad area comun Torre C', usd: 65, tipo: 'Zona', zona: zC.rows[0].id, prop: null },
-                { concepto: '[TEST] Mantenimiento hidroneumatico Torre D', usd: 98, tipo: 'Zona', zona: zD.rows[0].id, prop: null },
-                { concepto: '[TEST] Reparacion cerradura apto', usd: 32, tipo: 'Individual', zona: null, prop: props[0] },
-                { concepto: '[TEST] Cambio luminaria apto', usd: 28, tipo: 'Individual', zona: null, prop: props[5] },
-                { concepto: '[TEST] Reparacion toma de agua apto', usd: 41, tipo: 'Individual', zona: null, prop: props[10] },
-                { concepto: '[TEST] Servicio tecnico aire acondicionado', usd: 55, tipo: 'Individual', zona: null, prop: props[15] },
+                { concepto: '[TEST] Limpieza y aseo general', usd: 95, tipo: 'Comun', zona: null, prop: null, cuotas: 1 },
+                { concepto: '[TEST] Mantenimiento portones', usd: 120, tipo: 'Comun', zona: null, prop: null, cuotas: 1 },
+                { concepto: '[TEST] Reparacion bomba hidroneumatica', usd: 160, tipo: 'Comun', zona: null, prop: null, cuotas: 1 },
+                { concepto: '[TEST] Compra insumos de limpieza', usd: 80, tipo: 'Comun', zona: null, prop: null, cuotas: 1 },
+                { concepto: '[TEST] Servicio vigilancia nocturna', usd: 140, tipo: 'Comun', zona: null, prop: null, cuotas: 1 },
+                { concepto: '[TEST] Impermeabilizacion azotea', usd: 210, tipo: 'Comun', zona: null, prop: null, cuotas: 4 },
+                { concepto: '[TEST] Reparacion ascensor Torre A', usd: 110, tipo: 'Zona', zona: zA.rows[0].id, prop: null, cuotas: 1 },
+                { concepto: '[TEST] Pintura pasillos Torre B', usd: 75, tipo: 'Zona', zona: zB.rows[0].id, prop: null, cuotas: 1 },
+                { concepto: '[TEST] Electricidad area comun Torre C', usd: 65, tipo: 'Zona', zona: zC.rows[0].id, prop: null, cuotas: 4 },
+                { concepto: '[TEST] Mantenimiento hidroneumatico Torre D', usd: 98, tipo: 'Zona', zona: zD.rows[0].id, prop: null, cuotas: 1 },
+                { concepto: '[TEST] Reparacion cerradura apto', usd: 32, tipo: 'Individual', zona: null, prop: props[0], cuotas: 1 },
+                { concepto: '[TEST] Cambio luminaria apto', usd: 28, tipo: 'Individual', zona: null, prop: props[5], cuotas: 1 },
+                { concepto: '[TEST] Reparacion toma de agua apto', usd: 41, tipo: 'Individual', zona: null, prop: props[10], cuotas: 4 },
+                { concepto: '[TEST] Servicio tecnico aire acondicionado', usd: 55, tipo: 'Extra', zona: null, prop: null, cuotas: 4 },
             ];
 
             for (const g of gastosConfig) {
                 const proveedorId = faker.helpers.arrayElement(proveedorIds);
+                const totalCuotas = Math.max(1, parseInt(g.cuotas || 1, 10));
+                const fechaGastoSeed = `${mesActual}-05`;
                 const gas = await pool.query(
                     `INSERT INTO gastos
                         (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, tipo, zona_id, propiedad_id, fecha_gasto)
                      VALUES
-                        ($1, $2, $3, $4, 40, $5, 1, $6, $7, $8, CURRENT_DATE)
+                        ($1, $2, $3, $4, 40, $5, $6, $7, $8, $9, $10::date)
                      RETURNING id`,
-                    [condoId, proveedorId, g.concepto, g.usd * 40, g.usd, g.tipo, g.zona, g.prop],
+                    [condoId, proveedorId, g.concepto, g.usd * 40, g.usd, totalCuotas, g.tipo, g.zona, g.prop, fechaGastoSeed],
                 );
 
-                await pool.query(
-                    `INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado, estado)
-                     VALUES ($1, 1, $2, $3, 'Pendiente')`,
-                    [gas.rows[0].id, g.usd, mesActual],
-                );
+                let restante = parseFloat(g.usd);
+                for (let i = 1; i <= totalCuotas; i += 1) {
+                    const cuota = i === totalCuotas ? restante : parseFloat((g.usd / totalCuotas).toFixed(2));
+                    restante = parseFloat((restante - cuota).toFixed(2));
+                    await pool.query(
+                        `INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado, estado)
+                         VALUES ($1, $2, $3, $4, 'Pendiente')`,
+                        [gas.rows[0].id, i, cuota, addMonthsSeed(mesActual, i - 1)],
+                    );
+                }
             }
 
             await pool.query('COMMIT');
             res.json({
                 status: 'success',
-                message: 'Simulacion lista: 20 inmuebles con propietarios, 8 proveedores, 2 cuentas (3 fondos) y 14 gastos.',
+                message: 'Simulacion lista: 20 inmuebles, 8 proveedores, 2 cuentas (3 fondos) y 14 gastos (incluye Extra y cuotas diferidas).',
             });
         } catch (err) {
             await pool.query('ROLLBACK');

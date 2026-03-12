@@ -90,7 +90,17 @@ const registerBancosRoutes = (app, { pool, verifyToken }) => {
             const entradas = await pool.query(`
                 SELECT 'ENTRADA' as tipo, p.fecha_pago as fecha, 
                        'Abono de Inmueble: ' || pr.identificador as concepto, 
-                       p.referencia, null as monto_bs, null as tasa_cambio, p.monto_usd as monto_usd,
+                       p.referencia,
+                       CASE
+                           WHEN p.moneda = 'BS' THEN p.monto_origen
+                           WHEN p.moneda = 'USD' AND p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0 THEN (p.monto_usd * p.tasa_cambio)
+                           ELSE null
+                       END as monto_bs,
+                       CASE
+                           WHEN p.moneda = 'BS' THEN p.tasa_cambio
+                           ELSE null
+                       END as tasa_cambio,
+                       p.monto_usd as monto_usd,
                        null::int as fondo_id, null::int as fondo_origen_id, null::int as fondo_destino_id
                 FROM pagos p 
                 JOIN propiedades pr ON p.propiedad_id = pr.id 

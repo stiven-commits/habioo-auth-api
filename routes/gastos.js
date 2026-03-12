@@ -142,7 +142,7 @@ const registerGastosRoutes = (app, { pool, verifyToken, parseLocaleNumber, addMo
             SELECT g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, p.nombre as proveedor, g.nota, g.monto_usd as monto_total_usd, gc.mes_asignado,
                 (g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_restante
             FROM gastos_cuotas gc JOIN gastos g ON gc.gasto_id = g.id JOIN proveedores p ON g.proveedor_id = p.id
-            WHERE g.condominio_id = $1 AND gc.mes_asignado >= $2 AND (gc.estado = 'Pendiente' OR gc.estado IS NULL) AND g.tipo = 'Comun' ORDER BY gc.mes_asignado ASC
+            WHERE g.condominio_id = $1 AND gc.mes_asignado >= $2 AND (gc.estado = 'Pendiente' OR gc.estado IS NULL) AND g.tipo IN ('Comun', 'Extra') ORDER BY gc.mes_asignado ASC
         `,
                 [condominio_id, mes_actual]
             );
@@ -201,7 +201,7 @@ const registerGastosRoutes = (app, { pool, verifyToken, parseLocaleNumber, addMo
                 const zonaIds = zonasApto.rows.map((z) => z.zona_id);
 
                 for (const c of cuotasRes.rows) {
-                    if (c.tipo === 'Comun') {
+                    if (c.tipo === 'Comun' || c.tipo === 'Extra') {
                         if (metodo_division === 'Partes Iguales') total_deuda += parseFloat(c.monto_cuota_usd) / propRes.rows.length;
                         else total_deuda += parseFloat(c.monto_cuota_usd) * (parseFloat(p.alicuota) / 100);
                     } else if ((c.tipo === 'No Comun' || c.tipo === 'Zona') && zonaIds.includes(c.zona_id)) {

@@ -1,4 +1,26 @@
 const registerPagosRoutes = (app, { pool, verifyToken, parseLocaleNumber, getPagosOptionalColumns }) => {
+    const resolveMovimientoFondoTipo = async () => {
+        try {
+            const r = await pool.query(`
+                SELECT pg_get_constraintdef(oid) AS def
+                FROM pg_constraint
+                WHERE conname = 'movimientos_fondos_tipo_check'
+                LIMIT 1
+            `);
+            const def = r.rows?.[0]?.def || '';
+            const matches = [...def.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+            const allowed = new Set(matches);
+
+            const preferred = ['ABONO', 'ENTRADA', 'INGRESO', 'AJUSTE_INICIAL'];
+            const selected = preferred.find((t) => allowed.has(t));
+            if (selected) return selected;
+            if (matches.length > 0) return matches[0];
+        } catch (_) {
+            // fallback below
+        }
+        return 'AJUSTE_INICIAL';
+    };
+
     const getPagosColumns = async () => {
         const optionalCols = await getPagosOptionalColumns();
         try {
@@ -130,10 +152,73 @@ const registerPagosRoutes = (app, { pool, verifyToken, parseLocaleNumber, getPag
             }
 
             const placeholders = insertValues.map((_, i) => `$${i + 1}`).join(', ');
-            await pool.query(
-                `INSERT INTO pagos (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+            const pagoInsertRes = await pool.query(
+                `INSERT INTO pagos (${insertColumns.join(', ')}) VALUES (${placeholders}) RETURNING id`,
                 insertValues
             );
+            const pagoId = pagoInsertRes.rows?.[0]?.id || null;
+
+            // 2.1. Distribucion del ingreso en fondos de la cuenta (porcentaje + remanente al principal)
+            const fondosRes = await pool.query(
+                `SELECT id, moneda, porcentaje_asignacion, es_operativo
+                 FROM fondos
+                 WHERE cuenta_bancaria_id = $1 AND activo = true
+                 ORDER BY es_operativo DESC, id ASC`,
+                [cuenta_id]
+            );
+            const fondosActivos = fondosRes.rows || [];
+            if (fondosActivos.length === 0) {
+                throw new Error('La cuenta seleccionada no tiene fondos activos para distribuir el abono.');
+            }
+
+            const noOperativos = fondosActivos.filter((f) => !f.es_operativo);
+            const fondoPrincipal = fondosActivos.find((f) => !!f.es_operativo) || null;
+            const totalPctNoOper = noOperativos.reduce((acc, f) => acc + parseFloat(f.porcentaje_asignacion || 0), 0);
+            if (totalPctNoOper > 100) {
+                throw new Error('La suma de porcentajes de fondos excede 100%. Ajuste la configuracion de fondos.');
+            }
+
+            const distUsd = [];
+            let acumuladoUsd = 0;
+            noOperativos.forEach((f) => {
+                const pct = parseFloat(f.porcentaje_asignacion || 0);
+                const parte = parseFloat(((montoUsd * pct) / 100).toFixed(2));
+                acumuladoUsd += parte;
+                distUsd.push({ ...f, montoUsdParte: parte });
+            });
+
+            const remanenteUsd = parseFloat((montoUsd - acumuladoUsd).toFixed(2));
+            if (fondoPrincipal) {
+                distUsd.push({ ...fondoPrincipal, montoUsdParte: remanenteUsd });
+            } else if (distUsd.length > 0) {
+                // Si no existe fondo principal, mandamos el remanente al ultimo fondo porcentual.
+                distUsd[distUsd.length - 1].montoUsdParte = parseFloat(
+                    (distUsd[distUsd.length - 1].montoUsdParte + remanenteUsd).toFixed(2)
+                );
+            } else {
+                // Cuenta con un solo fondo sin porcentaje.
+                distUsd.push({ ...fondosActivos[0], montoUsdParte: montoUsd });
+            }
+
+            for (const d of distUsd) {
+                const usdParte = parseFloat(d.montoUsdParte || 0);
+                if (usdParte <= 0) continue;
+
+                let montoFondo = usdParte;
+                if (d.moneda === 'BS') {
+                    if (!tasaNum || tasaNum <= 0) {
+                        throw new Error('No hay tasa de cambio valida para abonar un fondo en Bs.');
+                    }
+                    montoFondo = parseFloat((usdParte * tasaNum).toFixed(2));
+                }
+
+                const tipoMovimiento = await resolveMovimientoFondoTipo();
+                await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, d.id]);
+                await pool.query(
+                    'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
+                    [d.id, tipoMovimiento, montoFondo, `Abono de pago${pagoId ? ` #${pagoId}` : ''} (${referencia || 'sin referencia'})`]
+                );
+            }
 
             // 3. Restamos el dinero del saldo consolidado de la propiedad
             await pool.query('UPDATE propiedades SET saldo_actual = saldo_actual - $1 WHERE id = $2', [montoUsd, propiedad_id]);
