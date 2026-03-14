@@ -70,6 +70,8 @@ const asAuthUser = (value: unknown): AuthUser => {
     return value as AuthUser;
 };
 
+const isBcryptHash = (value: string): boolean => /^\$2[aby]\$\d{2}\$/.test(value);
+
 const registerAuthRoutes = (
     app: Application,
     { pool, verifyToken }: AuthDependencies
@@ -102,11 +104,32 @@ const registerAuthRoutes = (
 
             const cedulaLimpia = cedulaSafe.toUpperCase().replace(/[^A-Z0-9]/g, '');
             const result = await pool.query<IUserRow>('SELECT * FROM users WHERE cedula = $1', [cedulaLimpia]);
-            if (!result.rows[0] || !(await bcrypt.compare(passwordSafe, result.rows[0].password))) {
+            const user = result.rows[0];
+            if (!user) {
                 return res.status(401).json({ status: 'error', message: 'Credenciales invalidas' });
             }
 
-            const userId = result.rows[0].id;
+            const storedPassword = user.password;
+            let passwordValid = false;
+
+            if (isBcryptHash(storedPassword)) {
+                passwordValid = await bcrypt.compare(passwordSafe, storedPassword);
+            } else {
+                passwordValid = passwordSafe === storedPassword;
+                // Migra password legado en texto plano a bcrypt al primer login exitoso.
+                if (passwordValid) {
+                    const salt = await bcrypt.genSalt(10);
+                    const hashedPassword = await bcrypt.hash(passwordSafe, salt);
+                    await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, user.id]);
+                    user.password = hashedPassword;
+                }
+            }
+
+            if (!passwordValid) {
+                return res.status(401).json({ status: 'error', message: 'Credenciales invalidas' });
+            }
+
+            const userId = user.id;
             const adminRes = await pool.query<IAdminAccessRow>(
                 'SELECT 1 FROM condominios WHERE admin_user_id = $1 LIMIT 1',
                 [userId]
@@ -126,11 +149,11 @@ const registerAuthRoutes = (
             }
 
             const token = jwt.sign(
-                { id: result.rows[0].id, cedula: result.rows[0].cedula, nombre: result.rows[0].nombre },
+                { id: user.id, cedula: user.cedula, nombre: user.nombre },
                 process.env.JWT_SECRET as string,
                 { expiresIn: '24h' }
             );
-            res.json({ status: 'success', token, user: result.rows[0] });
+            res.json({ status: 'success', token, user });
         } catch (err: unknown) {
             const error = err as Error;
             res.status(500).json({ error: error.message });
