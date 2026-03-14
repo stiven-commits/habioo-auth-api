@@ -49,6 +49,13 @@ interface IUsageRow {
     total_usos: string;
 }
 
+interface IFondoUsageCountRow {
+    movimientos_fondos: string;
+    gastos_pagos_fondos: string;
+    pagos_proveedores: string;
+    transferencias: string;
+}
+
 interface FondosDeleteParams {
     id?: string;
 }
@@ -133,82 +140,51 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
         }
     });
 
-    // ðŸ’¡ NUEVO: Borrado inteligente (Hard Delete vs Soft Delete) y transferencia forzada
-    app.delete('/fondos/:id', verifyToken, async (req: Request<FondosDeleteParams, unknown, DeleteFondoBody>, res: Response, _next: NextFunction) => {
+    app.delete('/fondos/:id', verifyToken, async (req: Request<FondosDeleteParams>, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
             const fondoId = asString(req.params.id);
-            const { destino_id } = req.body || {};
 
             const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const condoId = condoRes.rows[0].id;
 
-            await pool.query('BEGIN');
-
-            const fondoRes = await pool.query<IFondoRow>('SELECT * FROM fondos WHERE id = $1 AND condominio_id = $2 AND activo = true', [fondoId, condoId]);
-            if (fondoRes.rows.length === 0) throw new Error('Fondo no encontrado o ya estÃ¡ inactivo.');
-
-            const fondo = fondoRes.rows[0];
-            const saldo = parseFloat(String(fondo.saldo_actual || 0));
-
-            // ðŸ” EL JUEZ: Verificamos si el fondo tiene historial de uso real
-            const usageRes = await pool.query<IUsageRow>(`
-                SELECT 
-                    (SELECT COUNT(*) FROM transferencias WHERE fondo_origen_id = $1 OR fondo_destino_id = $1) +
-                    (SELECT COUNT(*) FROM pagos_proveedores WHERE fondo_id = $1) AS total_usos
-            `, [fondoId]);
-            const tieneHistorial = parseInt(usageRes.rows[0].total_usos, 10) > 0;
-
-            // CASO 1: TIENE DINERO (Forzamos transferencia y Soft Delete)
-            if (saldo > 0) {
-                if (!destino_id) throw new Error('El fondo tiene saldo. Debe especificar un fondo de destino.');
-
-                const destRes = await pool.query<IFondoRow>('SELECT * FROM fondos WHERE id = $1 AND condominio_id = $2 AND activo = true', [destino_id, condoId]);
-                if (destRes.rows.length === 0) throw new Error('Fondo de destino no vÃ¡lido.');
-                const destino = destRes.rows[0];
-
-                if (fondo.moneda !== destino.moneda) {
-                    throw new Error(`Debe transferir a un fondo con la misma moneda (${fondo.moneda}).`);
-                }
-
-                // 1. Inyectamos la transferencia al Libro Mayor
-                await pool.query(
-                    `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
-                     VALUES ($1, $2, $3, $4, null, $5, $6, CURRENT_DATE, $7)`,
-                    [condoId, fondoId, destino_id, saldo, saldo, 'CIERRE', 'Transferencia de fondos por eliminaciÃ³n de fondo']
-                );
-
-                // 2. Sumamos el dinero al nuevo fondo destino
-                await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [saldo, destino_id]);
-
-                // 3. Soft Delete: Desactivamos el fondo original dejÃ¡ndolo en cero
-                await pool.query('UPDATE fondos SET activo = false, saldo_actual = 0 WHERE id = $1', [fondoId]);
-
-                await pool.query('COMMIT');
-                return res.json({ status: 'success', message: 'Fondo desactivado y saldo transferido con Ã©xito.' });
+            const fondoRes = await pool.query<IFondoRow>(
+                'SELECT id FROM fondos WHERE id = $1 AND condominio_id = $2',
+                [fondoId, condoId],
+            );
+            if (fondoRes.rows.length === 0) {
+                return res.status(404).json({ error: 'Fondo no encontrado.' });
             }
 
-            // CASO 2: ESTÃ EN CERO, PERO NUNCA SE HA USADO (HARD DELETE)
-            if (!tieneHistorial) {
-                // Borramos cualquier ajuste inicial (si lo hubo) para no romper las llaves forÃ¡neas
-                await pool.query('DELETE FROM movimientos_fondos WHERE fondo_id = $1', [fondoId]);
-                // Borramos el fondo de raÃ­z
-                await pool.query('DELETE FROM fondos WHERE id = $1', [fondoId]);
+            const usageRes = await pool.query<IFondoUsageCountRow>(
+                `
+                SELECT
+                    (SELECT COUNT(*)::text FROM movimientos_fondos WHERE fondo_id = $1) AS movimientos_fondos,
+                    (SELECT COUNT(*)::text FROM gastos_pagos_fondos WHERE fondo_id = $1) AS gastos_pagos_fondos,
+                    (SELECT COUNT(*)::text FROM pagos_proveedores WHERE fondo_id = $1) AS pagos_proveedores,
+                    (SELECT COUNT(*)::text FROM transferencias WHERE fondo_origen_id = $1 OR fondo_destino_id = $1) AS transferencias
+                `,
+                [fondoId],
+            );
 
-                await pool.query('COMMIT');
-                return res.json({ status: 'success', message: 'Fondo eliminado permanentemente (Sin uso previo).' });
+            const usage = usageRes.rows[0];
+            const totalAsociados =
+                parseInt(usage.movimientos_fondos, 10) +
+                parseInt(usage.gastos_pagos_fondos, 10) +
+                parseInt(usage.pagos_proveedores, 10) +
+                parseInt(usage.transferencias, 10);
+
+            if (totalAsociados > 0) {
+                return res.status(400).json({
+                    error: 'No se puede eliminar el fondo porque ya tiene movimientos asociados. Si ya no lo usará, considere ajustar su porcentaje a 0.',
+                });
             }
 
-            // CASO 3: ESTÃ EN CERO, PERO SÃ TIENE HISTORIA (SOFT DELETE)
-            else {
-                await pool.query('UPDATE fondos SET activo = false, saldo_actual = 0 WHERE id = $1', [fondoId]);
-                await pool.query('COMMIT');
-                return res.json({ status: 'success', message: 'Fondo desactivado correctamente (Se conservÃ³ su historial).' });
-            }
+            await pool.query('DELETE FROM fondos WHERE id = $1 AND condominio_id = $2', [fondoId, condoId]);
 
+            return res.status(200).json({ status: 'success', message: 'Fondo eliminado correctamente.' });
         } catch (err: unknown) {
             const error = asError(err);
-            await pool.query('ROLLBACK');
             res.status(500).json({ error: error.message });
         }
     });

@@ -121,6 +121,29 @@ interface PagoValidarParams {
     id?: string;
 }
 
+interface PagoProveedorOrigenBody {
+    cuenta_bancaria_id: number | string;
+    fondo_id?: number | string | null;
+    moneda: 'Bs' | 'USD';
+    monto_origen: number | string;
+    tasa_cambio: number | string;
+    monto_usd: number | string;
+}
+
+interface PagoProveedorBody {
+    gasto_id: number | string;
+    fecha: string;
+    referencia: string;
+    nota?: string | null;
+    origenes: PagoProveedorOrigenBody[];
+}
+
+interface GastoMontoRow {
+    id?: number;
+    monto_usd: number | string;
+    monto_pagado_usd: number | string;
+}
+
 const asAuthUser = (value: unknown): AuthUser => {
     if (
         typeof value !== 'object' ||
@@ -144,7 +167,7 @@ const asError = (value: unknown): Error => {
 };
 
 const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleNumber, getPagosOptionalColumns }: AuthDependencies): void => {
-    const resolveMovimientoFondoTipo = async (): Promise<string> => {
+    const resolveMovimientoFondoTipo = async (preferred: string[], fallback: string): Promise<string> => {
         try {
             const r = await pool.query<IConstraintDefRow>(`
                 SELECT pg_get_constraintdef(oid) AS def
@@ -156,14 +179,13 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const matches = [...def.matchAll(/'([^']+)'/g)].map((m) => m[1]);
             const allowed = new Set(matches);
 
-            const preferred = ['ABONO', 'ENTRADA', 'INGRESO', 'AJUSTE_INICIAL'];
             const selected = preferred.find((t) => allowed.has(t));
             if (selected) return selected;
             if (matches.length > 0) return matches[0];
         } catch (_err) {
             // fallback below
         }
-        return 'AJUSTE_INICIAL';
+        return fallback;
     };
 
     const round2 = (n: unknown): number => parseFloat((parseFloat(String(n || 0))).toFixed(2));
@@ -427,7 +449,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             distUsd.push({ ...fondosActivos[0], montoUsdParte: montoUsd });
         }
 
-        const tipoMovimiento = await resolveMovimientoFondoTipo();
+        const tipoMovimiento = await resolveMovimientoFondoTipo(['ABONO', 'ENTRADA', 'INGRESO', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
         for (const d of distUsd) {
             const usdParte = round2(d.montoUsdParte || 0);
             if (usdParte <= 0) continue;
@@ -630,7 +652,220 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             res.status(500).json({ error: error.message });
         }
     });
+
+    app.post('/pagos-proveedores', verifyToken, async (req: Request<{}, unknown, PagoProveedorBody>, res: Response) => {
+        const { gasto_id, fecha, nota, origenes } = req.body;
+        let txStarted = false;
+
+        try {
+            if (!gasto_id) {
+                return res.status(400).json({ status: 'error', message: 'gasto_id es requerido.' });
+            }
+            if (!fecha) {
+                return res.status(400).json({ status: 'error', message: 'fecha es requerida.' });
+            }
+            if (!Array.isArray(origenes) || origenes.length === 0) {
+                return res.status(400).json({ status: 'error', message: 'origenes debe contener al menos un registro.' });
+            }
+
+            const origenesNormalizados = origenes.map((origen: PagoProveedorOrigenBody & { referencia?: string | null }) => {
+                const cuentaId = parseInt(String(origen.cuenta_bancaria_id), 10);
+                const fondoId = origen.fondo_id === null || origen.fondo_id === undefined || String(origen.fondo_id) === ''
+                    ? null
+                    : parseInt(String(origen.fondo_id), 10);
+                const moneda = origen.moneda;
+                const montoOrigen = round2(parseLocaleNumber(origen.monto_origen));
+                const montoUsd = round2(parseLocaleNumber(origen.monto_usd));
+                const referenciaOrigen = typeof origen.referencia === 'string' ? origen.referencia.trim() : '';
+                const tasaCambio = moneda === 'USD' ? 1 : round2(parseLocaleNumber(origen.tasa_cambio));
+
+                if (!Number.isFinite(cuentaId) || cuentaId <= 0) {
+                    throw new Error('Cada origen debe incluir un cuenta_bancaria_id válido.');
+                }
+                if (moneda !== 'Bs' && moneda !== 'USD') {
+                    throw new Error("Cada origen debe incluir una moneda válida ('Bs' o 'USD').");
+                }
+                if (!Number.isFinite(montoOrigen) || montoOrigen <= 0) {
+                    throw new Error('Cada origen debe incluir monto_origen mayor a 0.');
+                }
+                if (!Number.isFinite(montoUsd) || montoUsd <= 0) {
+                    throw new Error('Cada origen debe incluir monto_usd mayor a 0.');
+                }
+                if (moneda === 'Bs' && (!Number.isFinite(tasaCambio) || tasaCambio <= 0)) {
+                    throw new Error('Cada origen debe incluir una tasa_cambio válida mayor a 0.');
+                }
+
+                return {
+                    cuentaId,
+                    fondoId,
+                    moneda,
+                    montoOrigen,
+                    tasaCambio,
+                    montoUsd,
+                    referencia: referenciaOrigen || 'N/A',
+                };
+            });
+
+            const montoTotalPagoUsd = round2(
+                origenesNormalizados.reduce((acc: number, origen) => acc + origen.montoUsd, 0)
+            );
+            if (montoTotalPagoUsd <= 0) {
+                return res.status(400).json({ status: 'error', message: 'El pago total en USD debe ser mayor a 0.' });
+            }
+
+            await pool.query('BEGIN');
+            txStarted = true;
+
+            const gastoUpdate = await pool.query<GastoMontoRow>(
+                `
+                UPDATE gastos
+                SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1
+                WHERE id = $2
+                RETURNING id, monto_usd, monto_pagado_usd
+                `,
+                [montoTotalPagoUsd, gasto_id]
+            );
+
+            if (gastoUpdate.rows.length === 0) {
+                throw new Error('Gasto no encontrado.');
+            }
+
+            const gastoActualizado = gastoUpdate.rows[0];
+            const montoTotalGastoUsd = round2(parseLocaleNumber(gastoActualizado.monto_usd));
+            const montoPagadoGastoUsd = round2(parseLocaleNumber(gastoActualizado.monto_pagado_usd));
+            if (montoPagadoGastoUsd - montoTotalGastoUsd > 0.009) {
+                throw new Error('El pago excede el monto total del gasto.');
+            }
+
+            const totalBs = round2(
+                origenesNormalizados.reduce((acc: number, origen) => acc + origen.montoOrigen, 0)
+            );
+
+            const pagoProveedorRes = await pool.query<IPagoInsertRow>(
+                `
+                INSERT INTO pagos_proveedores (gasto_id, fondo_id, monto_bs, tasa_cambio, monto_usd, referencia, fecha_pago, nota)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING id
+                `,
+                [gasto_id, null, totalBs > 0 ? totalBs : null, null, montoTotalPagoUsd, null, fecha, nota || null]
+            );
+            const pagoProveedorId = pagoProveedorRes.rows[0]?.id;
+            if (!pagoProveedorId) {
+                throw new Error('No se pudo crear el pago proveedor.');
+            }
+
+            const cuentaSaldoColRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'cuentas_bancarias'
+                  AND column_name IN ('saldo_actual', 'saldo')
+                LIMIT 1
+                `
+            );
+            const cuentaSaldoCol = cuentaSaldoColRes.rows[0]?.column_name || null;
+
+            for (const origen of origenesNormalizados) {
+                if (cuentaSaldoCol) {
+                    await pool.query(
+                        `UPDATE cuentas_bancarias SET ${cuentaSaldoCol} = COALESCE(${cuentaSaldoCol}, 0) - $1 WHERE id = $2`,
+                        [origen.montoOrigen, origen.cuentaId]
+                    );
+                }
+
+                if (origen.fondoId) {
+                    const fondoRes = await pool.query<{ id: number; saldo_actual: string | number; moneda: string }>(
+                        `
+                        SELECT id, saldo_actual, moneda
+                        FROM fondos
+                        WHERE id = $1
+                        FOR UPDATE
+                        `,
+                        [origen.fondoId]
+                    );
+                    if (fondoRes.rows.length === 0) {
+                        throw new Error(`Fondo ${origen.fondoId} no encontrado.`);
+                    }
+
+                    const fondo = fondoRes.rows[0];
+                    const monedaFondo = String(fondo.moneda || '').toUpperCase();
+                    const montoDebitarFondo = monedaFondo === 'USD' ? origen.montoUsd : origen.montoOrigen;
+                    const saldoActualFondo = round2(parseLocaleNumber(fondo.saldo_actual));
+
+                    if (saldoActualFondo + 0.0001 < montoDebitarFondo) {
+                        throw new Error(
+                            `Saldo insuficiente en el fondo ${origen.fondoId}. Disponible: ${saldoActualFondo}, requerido: ${montoDebitarFondo}.`
+                        );
+                    }
+
+                    const fondoUpdate = await pool.query(
+                        `
+                        UPDATE fondos
+                        SET saldo_actual = COALESCE(saldo_actual, 0) - $1
+                        WHERE id = $2
+                        RETURNING id
+                        `,
+                        [montoDebitarFondo, origen.fondoId]
+                    );
+                    if (fondoUpdate.rows.length === 0) {
+                        throw new Error(`Fondo ${origen.fondoId} no encontrado.`);
+                    }
+
+                    const tipoMovimientoEgreso = await resolveMovimientoFondoTipo(['EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO'], 'EGRESO');
+
+                    await pool.query(
+                        `
+                        INSERT INTO movimientos_fondos (fondo_id, tipo, monto, referencia_id, tasa_cambio, nota)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        `,
+                        [
+                            origen.fondoId,
+                            tipoMovimientoEgreso,
+                            montoDebitarFondo,
+                            pagoProveedorId,
+                            origen.tasaCambio,
+                            `Pago a proveedor - Ref: ${origen.referencia || 'N/A'}`,
+                        ]
+                    );
+                }
+
+                await pool.query(
+                    `
+                    INSERT INTO gastos_pagos_fondos (gasto_id, fondo_id, monto_pagado_usd, fecha_pago)
+                    VALUES ($1, $2, $3, $4)
+                    `,
+                    [gasto_id, origen.fondoId, origen.montoUsd, fecha]
+                );
+            }
+
+            await pool.query('COMMIT');
+
+            return res.status(200).json({
+                status: 'success',
+                pago_proveedor_id: pagoProveedorId,
+                gasto: {
+                    id: gasto_id,
+                    monto_usd: montoTotalGastoUsd,
+                    monto_pagado_usd: montoPagadoGastoUsd,
+                    saldo_pendiente_usd: round2(Math.max(0, montoTotalGastoUsd - montoPagadoGastoUsd)),
+                },
+            });
+        } catch (err: unknown) {
+            const error = asError(err);
+            if (txStarted) await pool.query('ROLLBACK');
+            const isBusinessError =
+                error.message.includes('monto_') ||
+                error.message.includes('tasa_cambio') ||
+                error.message.includes('cuenta_bancaria_id') ||
+                error.message.includes('Gasto no encontrado') ||
+                error.message.includes('excede el monto total') ||
+                error.message.includes('Saldo insuficiente') ||
+                error.message.includes('Fondo') ||
+                error.message.includes('moneda válida');
+            return res.status(isBusinessError ? 400 : 500).json({ status: 'error', message: error.message });
+        }
+    });
 };
 
 module.exports = { registerPagosRoutes };
-

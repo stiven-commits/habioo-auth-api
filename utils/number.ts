@@ -1,6 +1,30 @@
 const parseLocaleNumber = (value: unknown, fallback = 0): number => {
     if (value === null || value === undefined || value === '') return fallback;
-    const normalized = value.toString().replace(/\./g, '').replace(',', '.');
+    const raw = value.toString().trim().replace(/\s+/g, '');
+    if (!raw) return fallback;
+
+    const hasComma = raw.includes(',');
+    const hasDot = raw.includes('.');
+    let normalized = raw;
+
+    if (hasComma && hasDot) {
+        const lastComma = raw.lastIndexOf(',');
+        const lastDot = raw.lastIndexOf('.');
+        if (lastComma > lastDot) {
+            // Formato tipo 1.234,56
+            normalized = raw.replace(/\./g, '').replace(',', '.');
+        } else {
+            // Formato tipo 1,234.56
+            normalized = raw.replace(/,/g, '');
+        }
+    } else if (hasComma) {
+        // Formato tipo 1234,56
+        normalized = raw.replace(',', '.');
+    } else {
+        // Formato tipo 1234.56 o entero
+        normalized = raw;
+    }
+
     const parsed = parseFloat(normalized);
     return Number.isFinite(parsed) ? parsed : fallback;
 };

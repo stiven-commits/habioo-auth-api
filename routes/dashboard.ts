@@ -270,22 +270,75 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
             );
 
             // 2) Datos de prueba frescos
-            const nombresBancos = ['Banco de Venezuela', 'Banesco', 'Mercantil', 'Provincial', 'Bancamiga'];
-            const cuenta1 = await pool.query<IIdRow>(
+            // Seeder bancario: 4 cuentas (3 en BS y 1 en USD), cada una con su fondo y saldo acorde a su moneda.
+            const nombresBancosBs = ['Banco de Venezuela', 'Banesco', 'Mercantil', 'Provincial', 'Bancamiga'];
+            const nombreTitularSeed = faker.person.fullName();
+            const rifTitularSeed = `J${faker.string.numeric(9)}`;
+
+            const cuentaPrincipalBs = await pool.query<IIdRow>(
                 `INSERT INTO cuentas_bancarias
                     (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
                  VALUES
-                    ($1, $2, $3, $4, $5, $6, $7, $8, true)
+                    ($1, $2, $3, $4, 'Transferencia', $5, $6, $7, true)
                  RETURNING id`,
                 [
                     condoId,
                     faker.finance.accountNumber({ length: 20 }),
-                    faker.helpers.arrayElement(nombresBancos),
-                    '[TEST] Cuenta Principal',
-                    'Transferencia',
-                    faker.person.fullName(),
-                    `J${faker.string.numeric(9)}`,
+                    faker.helpers.arrayElement(nombresBancosBs),
+                    '[TEST] Cuenta Principal Bs',
+                    nombreTitularSeed,
+                    rifTitularSeed,
                     buildVzlaPhone(faker),
+                ],
+            );
+
+            const cuentaPagoMovilBs = await pool.query<IIdRow>(
+                `INSERT INTO cuentas_bancarias
+                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
+                 VALUES
+                    ($1, $2, $3, $4, 'Pago Movil', $5, $6, $7, false)
+                 RETURNING id`,
+                [
+                    condoId,
+                    faker.finance.accountNumber({ length: 20 }),
+                    faker.helpers.arrayElement(nombresBancosBs),
+                    '[TEST] Cuenta Pago Movil Bs',
+                    nombreTitularSeed,
+                    rifTitularSeed,
+                    buildVzlaPhone(faker),
+                ],
+            );
+
+            const cuentaSecundariaBs = await pool.query<IIdRow>(
+                `INSERT INTO cuentas_bancarias
+                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
+                 VALUES
+                    ($1, $2, $3, $4, 'Transferencia', $5, $6, $7, false)
+                 RETURNING id`,
+                [
+                    condoId,
+                    faker.finance.accountNumber({ length: 20 }),
+                    faker.helpers.arrayElement(nombresBancosBs),
+                    '[TEST] Cuenta Secundaria Bs',
+                    nombreTitularSeed,
+                    rifTitularSeed,
+                    buildVzlaPhone(faker),
+                ],
+            );
+
+            const cuentaUsd = await pool.query<IIdRow>(
+                `INSERT INTO cuentas_bancarias
+                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
+                 VALUES
+                    ($1, $2, $3, $4, 'Zelle', $5, $6, NULL, false)
+                 RETURNING id`,
+                [
+                    condoId,
+                    `seed.${Date.now()}@habioo.test`,
+                    'Bank of America',
+                    '[TEST] Cuenta USD',
+                    nombreTitularSeed,
+                    rifTitularSeed,
                 ],
             );
 
@@ -293,35 +346,17 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                 `INSERT INTO fondos
                     (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo)
                  VALUES
-                    ($1, $2, '[TEST] Fondo Operativo Principal', 'BS', 0, 8000, true)`,
-                [condoId, cuenta1.rows[0].id],
-            );
-
-            const cuenta2 = await pool.query<IIdRow>(
-                `INSERT INTO cuentas_bancarias
-                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
-                 VALUES
-                    ($1, $2, $3, $4, $5, $6, $7, $8, false)
-                 RETURNING id`,
+                    ($1, $2, '[TEST] Fondo Operativo Principal Bs', 'BS', 0, 8000, true),
+                    ($1, $3, '[TEST] Fondo Caja Chica Bs', 'BS', 0, 2500, false),
+                    ($1, $4, '[TEST] Fondo Reserva General Bs', 'BS', 0, 3200, false),
+                    ($1, $5, '[TEST] Fondo USD', 'USD', 0, 1500, false)`,
                 [
                     condoId,
-                    faker.finance.accountNumber({ length: 20 }),
-                    faker.helpers.arrayElement(nombresBancos),
-                    '[TEST] Cuenta Secundaria',
-                    'Transferencia',
-                    faker.person.fullName(),
-                    `J${faker.string.numeric(9)}`,
-                    buildVzlaPhone(faker),
+                    cuentaPrincipalBs.rows[0].id,
+                    cuentaPagoMovilBs.rows[0].id,
+                    cuentaSecundariaBs.rows[0].id,
+                    cuentaUsd.rows[0].id,
                 ],
-            );
-
-            await pool.query(
-                `INSERT INTO fondos
-                    (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo)
-                 VALUES
-                    ($1, $2, '[TEST] Fondo Reserva General', 'BS', 0, 3200, false),
-                    ($1, $2, '[TEST] Fondo Prestaciones Empleados', 'USD', 0, 1500, false)`,
-                [condoId, cuenta2.rows[0].id],
             );
 
             const zA = await pool.query<IIdRow>("INSERT INTO zonas (condominio_id, nombre) VALUES ($1, 'TEST-Torre A') RETURNING id", [condoId]);

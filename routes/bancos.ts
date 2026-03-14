@@ -355,41 +355,6 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         }
     });
 
-    // ðŸ’¸ REGISTRAR PAGO A PROVEEDOR
-    app.post('/pagos-proveedores', verifyToken, async (req: Request<{}, unknown, PagoProveedorBody>, res: Response, _next: NextFunction) => {
-        const { gasto_id, fondo_id, monto_bs, tasa_cambio, monto_usd, referencia, fecha_pago, nota } = req.body;
-
-        try {
-            const gastoIdSafe = asNumber(gasto_id);
-            const fondoIdSafe = asNumber(fondo_id);
-            const montoUsdSafe = asNumber(monto_usd);
-            const referenciaSafe = asOptionalStringOrNull(referencia);
-            const notaSafe = asOptionalStringOrNull(nota);
-
-            await pool.query('BEGIN'); // Iniciamos transacciÃ³n segura
-
-            // 1. Guardamos el registro del pago
-            await pool.query(
-                `INSERT INTO pagos_proveedores (gasto_id, fondo_id, monto_bs, tasa_cambio, monto_usd, referencia, fecha_pago, nota)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-                [gastoIdSafe, fondoIdSafe, monto_bs || null, tasa_cambio || null, montoUsdSafe, referenciaSafe, fecha_pago, notaSafe]
-            );
-
-            // 2. Restamos el dinero del Fondo (y por ende, de la cuenta bancaria)
-            await pool.query(`UPDATE fondos SET saldo_actual = saldo_actual - $1 WHERE id = $2`, [montoUsdSafe, fondoIdSafe]);
-
-            // 3. Le sumamos el dinero pagado a la deuda del Gasto (Para permitir pagos parciales)
-            await pool.query(`UPDATE gastos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1 WHERE id = $2`, [montoUsdSafe, gastoIdSafe]);
-
-            await pool.query('COMMIT'); // Guardamos todo
-            res.json({ status: 'success', message: 'Pago a proveedor registrado exitosamente.' });
-        } catch (err: unknown) {
-            const error = asError(err);
-            await pool.query('ROLLBACK'); // Si algo falla, revertimos
-            res.status(500).json({ error: error.message });
-        }
-    });
-
     // ðŸ”„ REGISTRAR TRANSFERENCIA ENTRE FONDOS/CUENTAS
     app.post('/transferencias', verifyToken, async (req: Request<{}, unknown, TransferenciaBody>, res: Response, _next: NextFunction) => {
         const { fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota } = req.body;
