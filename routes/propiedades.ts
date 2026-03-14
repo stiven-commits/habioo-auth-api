@@ -276,12 +276,21 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
             }
 
-            // Regla de negocio: si todas las alÃ­cuotas del lote vienen en 0, el condominio pasa a "Partes Iguales".
-            const allAlicuotasCero = inmuebles.every((item) => {
+            const alicuotasLote: number[] = inmuebles.map((item) => {
                 const alicuotaRaw = String(item?.alicuota ?? '0').replace(',', '.').trim();
                 const alicuotaNum = parseFloat(alicuotaRaw);
-                return !Number.isNaN(alicuotaNum) && alicuotaNum === 0;
+                return Number.isNaN(alicuotaNum) ? 0 : alicuotaNum;
             });
+
+            const allAlicuotasCero = alicuotasLote.every((alicuota: number) => alicuota === 0);
+            const allAlicuotasMayorCero = alicuotasLote.every((alicuota: number) => alicuota > 0);
+
+            if (!allAlicuotasCero && !allAlicuotasMayorCero) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    error: 'El archivo Excel contiene alícuotas mixtas. O todos los inmuebles tienen alícuota 0 (partes iguales), o todos deben tener una alícuota mayor a 0.'
+                });
+            }
 
             for (const item of inmuebles) {
                 const alicuotaNum = parseFloat((item.alicuota || '0').toString().replace(',', '.')) || 0;
