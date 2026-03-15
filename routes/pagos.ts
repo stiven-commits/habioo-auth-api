@@ -485,6 +485,13 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
             // 2. Insertamos el pago ya Validado (registro administrativo).
             const optionalCols = await getPagosColumns();
+            const bancoOrigenSafe = (banco_origen || '').trim();
+            const cedulaOrigenSafe = (cedula_origen || '').trim();
+            const notaBase = (nota || '').trim();
+            const notaOrigenPartes: string[] = [];
+            if (bancoOrigenSafe) notaOrigenPartes.push(`Banco origen: ${bancoOrigenSafe}`);
+            if (cedulaOrigenSafe) notaOrigenPartes.push(`Cedula origen: ${cedulaOrigenSafe}`);
+            const notaConOrigen = [notaBase, ...notaOrigenPartes].filter(Boolean).join(' | ');
             const insertColumns = [
                 'propiedad_id',
                 'recibo_id',
@@ -514,15 +521,15 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
             if (optionalCols.nota) {
                 insertColumns.push('nota');
-                insertValues.push(nota || null);
+                insertValues.push(notaConOrigen || null);
             }
             if (optionalCols.cedula_origen) {
                 insertColumns.push('cedula_origen');
-                insertValues.push(cedula_origen || null);
+                insertValues.push(cedulaOrigenSafe || null);
             }
             if (optionalCols.banco_origen) {
                 insertColumns.push('banco_origen');
-                insertValues.push(banco_origen || null);
+                insertValues.push(bancoOrigenSafe || null);
             }
 
             const placeholders = insertValues.map((_, i) => `$${i + 1}`).join(', ');
@@ -740,6 +747,11 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const totalBs = round2(
                 origenesNormalizados.reduce((acc: number, origen) => acc + origen.montoOrigen, 0)
             );
+            const referencias = origenesNormalizados
+                .map((origen) => origen.referencia?.trim())
+                .filter((ref): ref is string => Boolean(ref));
+            const referenciaPago = referencias.length > 0 ? referencias.join(' | ') : 'N/A';
+            const tasaEfectiva = montoTotalPagoUsd > 0 && totalBs > 0 ? round2(totalBs / montoTotalPagoUsd) : null;
 
             const pagoProveedorRes = await pool.query<IPagoInsertRow>(
                 `
@@ -747,7 +759,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING id
                 `,
-                [gasto_id, null, totalBs > 0 ? totalBs : null, null, montoTotalPagoUsd, null, fecha, nota || null]
+                [gasto_id, null, totalBs > 0 ? totalBs : null, tasaEfectiva, montoTotalPagoUsd, referenciaPago, fecha, nota || null]
             );
             const pagoProveedorId = pagoProveedorRes.rows[0]?.id;
             if (!pagoProveedorId) {
@@ -765,6 +777,16 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 `
             );
             const cuentaSaldoCol = cuentaSaldoColRes.rows[0]?.column_name || null;
+            const gpfColsRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'gastos_pagos_fondos'
+                  AND column_name IN ('cuenta_bancaria_id', 'monto_bs', 'tasa_cambio', 'referencia')
+                `
+            );
+            const gpfCols = new Set(gpfColsRes.rows.map((r) => r.column_name));
 
             for (const origen of origenesNormalizados) {
                 if (cuentaSaldoCol) {
@@ -831,11 +853,33 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 }
 
                 await pool.query(
-                    `
-                    INSERT INTO gastos_pagos_fondos (gasto_id, fondo_id, monto_pagado_usd, fecha_pago)
-                    VALUES ($1, $2, $3, $4)
-                    `,
-                    [gasto_id, origen.fondoId, origen.montoUsd, fecha]
+                    `INSERT INTO gastos_pagos_fondos (
+                        gasto_id,
+                        fondo_id,
+                        monto_pagado_usd,
+                        fecha_pago
+                        ${gpfCols.has('cuenta_bancaria_id') ? ', cuenta_bancaria_id' : ''}
+                        ${gpfCols.has('monto_bs') ? ', monto_bs' : ''}
+                        ${gpfCols.has('tasa_cambio') ? ', tasa_cambio' : ''}
+                        ${gpfCols.has('referencia') ? ', referencia' : ''}
+                    )
+                    VALUES (
+                        $1, $2, $3, $4
+                        ${gpfCols.has('cuenta_bancaria_id') ? ', $5' : ''}
+                        ${gpfCols.has('monto_bs') ? `, $${gpfCols.has('cuenta_bancaria_id') ? 6 : 5}` : ''}
+                        ${gpfCols.has('tasa_cambio') ? `, $${(gpfCols.has('cuenta_bancaria_id') ? 6 : 5) + (gpfCols.has('monto_bs') ? 1 : 0)}` : ''}
+                        ${gpfCols.has('referencia') ? `, $${(gpfCols.has('cuenta_bancaria_id') ? 6 : 5) + (gpfCols.has('monto_bs') ? 1 : 0) + (gpfCols.has('tasa_cambio') ? 1 : 0)}` : ''}
+                    )`,
+                    [
+                        gasto_id,
+                        origen.fondoId,
+                        origen.montoUsd,
+                        fecha,
+                        ...(gpfCols.has('cuenta_bancaria_id') ? [origen.cuentaId] : []),
+                        ...(gpfCols.has('monto_bs') ? [origen.montoOrigen] : []),
+                        ...(gpfCols.has('tasa_cambio') ? [origen.tasaCambio] : []),
+                        ...(gpfCols.has('referencia') ? [origen.referencia || referenciaPago] : []),
+                    ]
                 );
             }
 

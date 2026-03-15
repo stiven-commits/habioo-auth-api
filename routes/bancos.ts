@@ -33,6 +33,7 @@ interface ICountRow {
 }
 
 interface IMovimientoRow {
+    id: string;
     tipo: string;
     fecha: string | Date;
     concepto: string;
@@ -40,6 +41,8 @@ interface IMovimientoRow {
     monto_bs: number | null;
     tasa_cambio: number | null;
     monto_usd: number | null;
+    banco_origen?: string | null;
+    cedula_origen?: string | null;
     fondo_id: number | null;
     fondo_origen_id: number | null;
     fondo_destino_id: number | null;
@@ -53,6 +56,11 @@ interface IGastoPendienteRow {
     deuda_restante: number;
     proveedor: string;
     fecha_gasto: string | Date;
+}
+
+interface ITableColumnRow {
+    table_name: string;
+    column_name: string;
 }
 
 interface BancosParams {
@@ -81,11 +89,11 @@ interface PagoProveedorBody {
 }
 
 interface TransferenciaBody {
-    fondo_origen_id: number;
-    fondo_destino_id: number;
-    monto_origen: number;
-    tasa_cambio?: number | null;
-    monto_destino: number;
+    fondo_origen_id: unknown;
+    fondo_destino_id: unknown;
+    monto_origen: unknown;
+    tasa_cambio?: unknown;
+    monto_destino: unknown;
     referencia: string | null;
     fecha: string | Date;
     nota: string | null;
@@ -109,11 +117,24 @@ const asString = (value: unknown): string => {
     return value;
 };
 
-const asNumber = (value: unknown): number => {
-    if (typeof value !== 'number' || Number.isNaN(value)) {
-        throw new TypeError('Invalid number value');
+const asPositiveInt = (value: unknown, fieldName: string): number => {
+    const parsed = typeof value === 'number'
+        ? value
+        : parseInt(String(value ?? '').trim(), 10);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new TypeError(`Invalid ${fieldName} value`);
     }
-    return value;
+    return parsed;
+};
+
+const asDecimal = (value: unknown, fieldName: string): number => {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    const normalized = String(value ?? '').trim().replace(/\./g, '').replace(',', '.');
+    const parsed = parseFloat(normalized);
+    if (!Number.isFinite(parsed)) {
+        throw new TypeError(`Invalid ${fieldName} value`);
+    }
+    return parsed;
 };
 
 const asOptionalStringOrNull = (value: unknown): string | null | undefined => {
@@ -226,128 +247,235 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         }
     });
 
-    /// ðŸ¦ ESTADO DE CUENTA BANCARIO (Libro Mayor)
+    // ESTADO DE CUENTA BANCARIO (Libro Mayor unificado: ingresos y egresos)
     app.get('/bancos-admin/:id/estado-cuenta', verifyToken, async (req: Request<BancosParams>, res: Response, _next: NextFunction) => {
         try {
-            const cuentaId = parseInt(asString(req.params.id), 10); // ðŸ’¡ TRUCO: Forzamos a que sea un NÃºmero para que Postgres no falle
+            const user = asAuthUser(req.user);
+            const cuentaId = parseInt(asString(req.params.id), 10);
+            if (!Number.isFinite(cuentaId) || cuentaId <= 0) {
+                return res.status(400).json({ error: 'ID de cuenta inválido.' });
+            }
 
-            // 1. ENTRADAS
-            const entradas = await pool.query<IMovimientoRow>(`
-                SELECT 'ENTRADA' as tipo, p.fecha_pago as fecha,
-                       'Abono de Inmueble: ' || pr.identificador as concepto,
-                       p.referencia,
-                       CASE
-                           WHEN p.moneda = 'BS' THEN p.monto_origen
-                           WHEN p.moneda = 'USD' AND p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0 THEN (p.monto_usd * p.tasa_cambio)
-                           ELSE null
-                       END as monto_bs,
-                       CASE
-                           WHEN p.moneda = 'BS' THEN p.tasa_cambio
-                           ELSE null
-                       END as tasa_cambio,
-                       p.monto_usd as monto_usd,
-                       null::int as fondo_id, null::int as fondo_origen_id, null::int as fondo_destino_id
-                FROM pagos p
-                JOIN propiedades pr ON p.propiedad_id = pr.id
-                WHERE p.cuenta_bancaria_id = $1 AND p.estado = 'Validado'
-            `, [cuentaId]);
+            const condoRes = await pool.query<ICondominioIdRow>(
+                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                [user.id]
+            );
+            if (condoRes.rows.length === 0) {
+                return res.status(404).json({ error: 'Condominio no encontrado.' });
+            }
+            const condoId = condoRes.rows[0].id;
 
-            // 2. SALIDAS (Proveedores)
-            const salidas = await pool.query<IMovimientoRow>(`
-                SELECT 'SALIDA' as tipo, pp.fecha_pago as fecha,
-                       'Pago a Proveedor: ' || prov.nombre as concepto,
-                       pp.referencia, pp.monto_bs, pp.tasa_cambio, pp.monto_usd,
-                       pp.fondo_id as fondo_id, pp.fondo_id as fondo_origen_id, null::int as fondo_destino_id
-                FROM pagos_proveedores pp
-                JOIN gastos g ON pp.gasto_id = g.id
-                JOIN proveedores prov ON g.proveedor_id = prov.id
-                JOIN fondos f ON pp.fondo_id = f.id
-                WHERE f.cuenta_bancaria_id = $1
-            `, [cuentaId]);
+            const cuentaRes = await pool.query<ICuentaBancariaRow>(
+                'SELECT id FROM cuentas_bancarias WHERE id = $1 AND condominio_id = $2 LIMIT 1',
+                [cuentaId, condoId]
+            );
+            if (cuentaRes.rows.length === 0) {
+                return res.status(404).json({ error: 'Cuenta bancaria no encontrada.' });
+            }
 
-            // 3. TRANSFERENCIAS ENTRANTES
-            const transferenciasIn = await pool.query<IMovimientoRow>(`
-                SELECT 'TRANSFERENCIA_IN' as tipo, t.fecha,
-                       'Transferencia recibida desde: ' || f_orig.nombre as concepto,
-                       t.referencia,
-                       CASE
-                           WHEN f_dest.moneda = 'BS' THEN t.monto_destino
-                           WHEN f_orig.moneda = 'BS' THEN t.monto_origen
-                           ELSE null
-                       END as monto_bs,
-                       t.tasa_cambio,
-                       CASE
-                           WHEN f_dest.moneda = 'USD' THEN t.monto_destino
-                           WHEN f_orig.moneda = 'USD' THEN t.monto_origen
-                           WHEN t.tasa_cambio IS NOT NULL AND t.tasa_cambio > 0 THEN (t.monto_destino / t.tasa_cambio)
-                           ELSE 0
-                        END as monto_usd,
-                        t.fondo_destino_id as fondo_id, t.fondo_origen_id, t.fondo_destino_id
-                FROM transferencias t
-                JOIN fondos f_dest ON t.fondo_destino_id = f_dest.id
-                JOIN fondos f_orig ON t.fondo_origen_id = f_orig.id
-                WHERE f_dest.cuenta_bancaria_id = $1 AND f_orig.cuenta_bancaria_id != $1
-            `, [cuentaId]);
+            const colsRes = await pool.query<ITableColumnRow>(`
+                SELECT table_name, column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND (
+                    (table_name = 'gastos_pagos_fondos' AND column_name IN ('id', 'cuenta_bancaria_id', 'referencia', 'monto_bs', 'tasa_cambio'))
+                    OR
+                    (table_name = 'pagos_proveedores' AND column_name IN ('cuenta_bancaria_id'))
+                    OR
+                    (table_name = 'pagos' AND column_name IN ('banco_origen', 'cedula_origen', 'nota'))
+                  )
+            `);
 
-            // 4. TRANSFERENCIAS SALIENTES
-            const transferenciasOut = await pool.query<IMovimientoRow>(`
-                SELECT 'TRANSFERENCIA_OUT' as tipo, t.fecha,
-                       'Transferencia enviada a: ' || f_dest.nombre as concepto,
-                       t.referencia,
-                       CASE
-                           WHEN f_orig.moneda = 'BS' THEN t.monto_origen
-                           WHEN f_dest.moneda = 'BS' THEN t.monto_destino
-                           ELSE null
-                       END as monto_bs,
-                       t.tasa_cambio,
-                       CASE
-                           WHEN f_orig.moneda = 'USD' THEN t.monto_origen
-                           WHEN f_dest.moneda = 'USD' THEN t.monto_destino
-                           WHEN t.tasa_cambio IS NOT NULL AND t.tasa_cambio > 0 THEN (t.monto_origen / t.tasa_cambio)
-                           ELSE 0
-                        END as monto_usd,
-                        t.fondo_origen_id as fondo_id, t.fondo_origen_id, t.fondo_destino_id
-                FROM transferencias t
-                JOIN fondos f_orig ON t.fondo_origen_id = f_orig.id
-                JOIN fondos f_dest ON t.fondo_destino_id = f_dest.id
-                WHERE f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id != $1
-            `, [cuentaId]);
+            const hasCol = (table: string, column: string): boolean =>
+                colsRes.rows.some((r) => r.table_name === table && r.column_name === column);
 
-            // 5. ðŸ’¡ TRANSFERENCIAS INTERNAS (El dinero cambia de fondo, pero NO sale de esta cuenta bancaria)
-            const transferenciasInternas = await pool.query<IMovimientoRow>(`
-                SELECT 'INTERNA' as tipo, t.fecha,
-                       'Traspaso interno: ' || f_orig.nombre || ' âž” ' || f_dest.nombre as concepto,
-                       t.referencia,
-                       CASE
-                           WHEN f_orig.moneda = 'BS' THEN t.monto_origen
-                           WHEN f_dest.moneda = 'BS' THEN t.monto_destino
-                           ELSE null
-                       END as monto_bs,
-                       t.tasa_cambio,
-                       CASE
-                           WHEN f_orig.moneda = 'USD' THEN t.monto_origen
-                           WHEN f_dest.moneda = 'USD' THEN t.monto_destino
-                           WHEN t.tasa_cambio IS NOT NULL AND t.tasa_cambio > 0 THEN (t.monto_origen / t.tasa_cambio)
-                           ELSE 0
-                        END as monto_usd,
-                        null::int as fondo_id, t.fondo_origen_id, t.fondo_destino_id
-                FROM transferencias t
-                JOIN fondos f_orig ON t.fondo_origen_id = f_orig.id
-                JOIN fondos f_dest ON t.fondo_destino_id = f_dest.id
-                WHERE f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id = $1
-            `, [cuentaId]);
+            const gpfIdExpr = hasCol('gastos_pagos_fondos', 'id') ? 'gpf.id::text' : "('GPF-' || gpf.gasto_id::text || '-' || to_char(gpf.fecha_pago, 'YYYYMMDD') || '-' || COALESCE(gpf.fondo_id::text, 'EXTRA'))";
+            const gpfCuentaFilter = hasCol('gastos_pagos_fondos', 'cuenta_bancaria_id')
+                ? ' OR (gpf.fondo_id IS NULL AND gpf.cuenta_bancaria_id = $1)'
+                : '';
+            const gpfReferenciaExpr = hasCol('gastos_pagos_fondos', 'referencia')
+                ? 'COALESCE(gpf.referencia, pp_ref.referencia)'
+                : 'pp_ref.referencia';
+            const hasGpfTasaCambio = hasCol('gastos_pagos_fondos', 'tasa_cambio');
+            const gpfMontoBsExpr = hasCol('gastos_pagos_fondos', 'monto_bs')
+                ? 'gpf.monto_bs'
+                : (hasGpfTasaCambio
+                    ? 'CASE WHEN gpf.tasa_cambio IS NOT NULL AND gpf.tasa_cambio > 0 THEN (gpf.monto_pagado_usd * gpf.tasa_cambio) ELSE NULL END'
+                    : 'CASE WHEN pp_ref.tasa_cambio IS NOT NULL AND pp_ref.tasa_cambio > 0 THEN (gpf.monto_pagado_usd * pp_ref.tasa_cambio) ELSE NULL END');
+            const gpfTasaExpr = hasGpfTasaCambio
+                ? 'gpf.tasa_cambio'
+                : 'pp_ref.tasa_cambio';
 
-            const movimientos: IMovimientoRow[] = [
-                ...entradas.rows,
-                ...salidas.rows,
-                ...transferenciasIn.rows,
-                ...transferenciasOut.rows,
-                ...transferenciasInternas.rows
-            ];
+            const ppCuentaFilter = hasCol('pagos_proveedores', 'cuenta_bancaria_id')
+                ? ' OR (pp.fondo_id IS NULL AND pp.cuenta_bancaria_id = $1)'
+                : '';
+            const pagoNotaExpr = hasCol('pagos', 'nota')
+                ? "COALESCE(p.nota, '')"
+                : "''";
+            const pagoBancoDesdeNotaExpr = `NULLIF(BTRIM(COALESCE((regexp_match(${pagoNotaExpr}, '(?i)Banco origen:\\s*([^|]+)'))[1], '')), '')`;
+            const pagoCedulaDesdeNotaExpr = `NULLIF(BTRIM(COALESCE((regexp_match(${pagoNotaExpr}, '(?i)Cedula origen:\\s*([^|]+)'))[1], '')), '')`;
+            const pagoBancoOrigenExpr = hasCol('pagos', 'banco_origen')
+                ? `COALESCE(NULLIF(BTRIM(p.banco_origen), ''), ${pagoBancoDesdeNotaExpr})`
+                : pagoBancoDesdeNotaExpr;
+            const pagoCedulaOrigenExpr = hasCol('pagos', 'cedula_origen')
+                ? `COALESCE(NULLIF(BTRIM(p.cedula_origen), ''), ${pagoCedulaDesdeNotaExpr})`
+                : pagoCedulaDesdeNotaExpr;
 
-            movimientos.sort((a, b) => new Date(a.fecha).getTime() - new Date(b.fecha).getTime());
+            const query = `
+                WITH ingresos AS (
+                    SELECT
+                        ('ING-' || p.id::text) AS id,
+                        p.fecha_pago::date AS fecha,
+                        p.referencia,
+                        ('Pago de Recibo #' || p.id::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A')) AS concepto,
+                        'INGRESO'::text AS tipo,
+                        CASE
+                            WHEN UPPER(COALESCE(p.moneda, '')) = 'BS' THEN p.monto_origen
+                            WHEN UPPER(COALESCE(p.moneda, '')) = 'USD' AND p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0 THEN (p.monto_usd * p.tasa_cambio)
+                            ELSE NULL
+                        END AS monto_bs,
+                        p.tasa_cambio,
+                        p.monto_usd,
+                        ${pagoBancoOrigenExpr} AS banco_origen,
+                        ${pagoCedulaOrigenExpr} AS cedula_origen
+                    FROM pagos p
+                    LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
+                    WHERE p.cuenta_bancaria_id = $1
+                      AND p.estado = 'Validado'
+                ),
+                egresos_gpf AS (
+                    SELECT
+                        ('EGR-' || ${gpfIdExpr}) AS id,
+                        gpf.fecha_pago::date AS fecha,
+                        ${gpfReferenciaExpr} AS referencia,
+                        ('Pago a Proveedor - Gasto: ' || COALESCE(g.concepto, prov.nombre, 'Sin concepto')) AS concepto,
+                        'EGRESO'::text AS tipo,
+                        ${gpfMontoBsExpr} AS monto_bs,
+                        ${gpfTasaExpr} AS tasa_cambio,
+                        gpf.monto_pagado_usd AS monto_usd,
+                        NULL::text AS banco_origen,
+                        NULL::text AS cedula_origen
+                    FROM gastos_pagos_fondos gpf
+                    JOIN gastos g ON g.id = gpf.gasto_id
+                    LEFT JOIN proveedores prov ON prov.id = g.proveedor_id
+                    LEFT JOIN fondos f ON f.id = gpf.fondo_id
+                    LEFT JOIN LATERAL (
+                        SELECT pp.referencia, pp.tasa_cambio
+                        FROM pagos_proveedores pp
+                        WHERE pp.gasto_id = gpf.gasto_id
+                          AND pp.fecha_pago::date = gpf.fecha_pago::date
+                        ORDER BY pp.id DESC
+                        LIMIT 1
+                    ) pp_ref ON true
+                    WHERE (f.cuenta_bancaria_id = $1${gpfCuentaFilter})
+                ),
+                egresos_pp AS (
+                    SELECT
+                        ('EGR-PP-' || pp.id::text) AS id,
+                        pp.fecha_pago::date AS fecha,
+                        pp.referencia,
+                        ('Pago a Proveedor - Gasto: ' || COALESCE(g.concepto, prov.nombre, 'Sin concepto')) AS concepto,
+                        'EGRESO'::text AS tipo,
+                        pp.monto_bs,
+                        pp.tasa_cambio,
+                        pp.monto_usd,
+                        NULL::text AS banco_origen,
+                        NULL::text AS cedula_origen
+                    FROM pagos_proveedores pp
+                    JOIN gastos g ON g.id = pp.gasto_id
+                    LEFT JOIN proveedores prov ON prov.id = g.proveedor_id
+                    LEFT JOIN fondos f ON f.id = pp.fondo_id
+                    WHERE (f.cuenta_bancaria_id = $1${ppCuentaFilter})
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM gastos_pagos_fondos gpf2
+                        WHERE gpf2.gasto_id = pp.gasto_id
+                          AND gpf2.fecha_pago = pp.fecha_pago
+                      )
+                ),
+                transferencias_cuentas AS (
+                    SELECT
+                        ('TRF-' || t.id::text || '-' ||
+                            CASE
+                                WHEN f_dest.cuenta_bancaria_id = $1 AND f_orig.cuenta_bancaria_id <> $1 THEN 'IN'
+                                WHEN f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1 THEN 'OUT'
+                                ELSE 'NA'
+                            END
+                        ) AS id,
+                        t.fecha::date AS fecha,
+                        t.referencia,
+                        CASE
+                            WHEN f_dest.cuenta_bancaria_id = $1 AND f_orig.cuenta_bancaria_id <> $1
+                                THEN ('Transferencia recibida desde ' || COALESCE(cb_orig.nombre_banco, 'Cuenta origen') || ' - Fondo: ' || COALESCE(f_orig.nombre, 'N/A'))
+                            WHEN f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1
+                                THEN ('Transferencia enviada a ' || COALESCE(cb_dest.nombre_banco, 'Cuenta destino') || ' - Fondo: ' || COALESCE(f_dest.nombre, 'N/A'))
+                            ELSE 'Transferencia interna'
+                        END AS concepto,
+                        CASE
+                            WHEN f_dest.cuenta_bancaria_id = $1 AND f_orig.cuenta_bancaria_id <> $1 THEN 'INGRESO'
+                            WHEN f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1 THEN 'EGRESO'
+                            ELSE 'INGRESO'
+                        END::text AS tipo,
+                        CASE
+                            WHEN f_dest.cuenta_bancaria_id = $1 AND f_orig.cuenta_bancaria_id <> $1 THEN
+                                CASE
+                                    WHEN UPPER(COALESCE(f_dest.moneda, '')) = 'BS' THEN t.monto_destino
+                                    WHEN UPPER(COALESCE(f_dest.moneda, '')) = 'USD' AND t.tasa_cambio IS NOT NULL AND t.tasa_cambio > 0 THEN (t.monto_destino * t.tasa_cambio)
+                                    ELSE NULL
+                                END
+                            WHEN f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1 THEN
+                                CASE
+                                    WHEN UPPER(COALESCE(f_orig.moneda, '')) = 'BS' THEN t.monto_origen
+                                    WHEN UPPER(COALESCE(f_orig.moneda, '')) = 'USD' AND t.tasa_cambio IS NOT NULL AND t.tasa_cambio > 0 THEN (t.monto_origen * t.tasa_cambio)
+                                    ELSE NULL
+                                END
+                            ELSE NULL
+                        END AS monto_bs,
+                        t.tasa_cambio,
+                        CASE
+                            WHEN f_dest.cuenta_bancaria_id = $1 AND f_orig.cuenta_bancaria_id <> $1 THEN
+                                CASE
+                                    WHEN UPPER(COALESCE(f_dest.moneda, '')) = 'USD' THEN t.monto_destino
+                                    WHEN UPPER(COALESCE(f_dest.moneda, '')) = 'BS' AND t.tasa_cambio IS NOT NULL AND t.tasa_cambio > 0 THEN (t.monto_destino / t.tasa_cambio)
+                                    ELSE NULL
+                                END
+                            WHEN f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1 THEN
+                                CASE
+                                    WHEN UPPER(COALESCE(f_orig.moneda, '')) = 'USD' THEN t.monto_origen
+                                    WHEN UPPER(COALESCE(f_orig.moneda, '')) = 'BS' AND t.tasa_cambio IS NOT NULL AND t.tasa_cambio > 0 THEN (t.monto_origen / t.tasa_cambio)
+                                    ELSE NULL
+                                END
+                            ELSE NULL
+                        END AS monto_usd,
+                        NULL::text AS banco_origen,
+                        NULL::text AS cedula_origen
+                    FROM transferencias t
+                    JOIN fondos f_orig ON f_orig.id = t.fondo_origen_id
+                    JOIN fondos f_dest ON f_dest.id = t.fondo_destino_id
+                    LEFT JOIN cuentas_bancarias cb_orig ON cb_orig.id = f_orig.cuenta_bancaria_id
+                    LEFT JOIN cuentas_bancarias cb_dest ON cb_dest.id = f_dest.cuenta_bancaria_id
+                    WHERE (
+                        (f_dest.cuenta_bancaria_id = $1 AND f_orig.cuenta_bancaria_id <> $1)
+                        OR
+                        (f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1)
+                    )
+                )
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, banco_origen, cedula_origen
+                FROM ingresos
+                UNION ALL
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, banco_origen, cedula_origen
+                FROM egresos_gpf
+                UNION ALL
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, banco_origen, cedula_origen
+                FROM egresos_pp
+                UNION ALL
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, banco_origen, cedula_origen
+                FROM transferencias_cuentas
+                ORDER BY fecha DESC, id DESC
+            `;
 
-            res.json({ status: 'success', movimientos });
+            const movimientos = await pool.query<IMovimientoRow>(query, [cuentaId]);
+            res.json({ status: 'success', movimientos: movimientos.rows });
         } catch (error: unknown) {
             const typedError = asError(error);
             console.error('Error en estado de cuenta:', error);
@@ -361,10 +489,13 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 
         try {
             const user = asAuthUser(req.user);
-            const fondoOrigenIdSafe = asNumber(fondo_origen_id);
-            const fondoDestinoIdSafe = asNumber(fondo_destino_id);
-            const montoOrigenSafe = asNumber(monto_origen);
-            const montoDestinoSafe = asNumber(monto_destino);
+            const fondoOrigenIdSafe = asPositiveInt(fondo_origen_id, 'fondo_origen_id');
+            const fondoDestinoIdSafe = asPositiveInt(fondo_destino_id, 'fondo_destino_id');
+            const montoOrigenSafe = asDecimal(monto_origen, 'monto_origen');
+            const montoDestinoSafe = asDecimal(monto_destino, 'monto_destino');
+            const tasaCambioSafe = (tasa_cambio === null || tasa_cambio === undefined || String(tasa_cambio).trim() === '')
+                ? null
+                : asDecimal(tasa_cambio, 'tasa_cambio');
             const referenciaSafe = asOptionalStringOrNull(referencia);
             const notaSafe = asOptionalStringOrNull(nota);
             const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
@@ -376,7 +507,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             await pool.query(
                 `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-                [condoId, fondoOrigenIdSafe, fondoDestinoIdSafe, montoOrigenSafe, tasa_cambio || null, montoDestinoSafe, referenciaSafe, fecha, notaSafe]
+                [condoId, fondoOrigenIdSafe, fondoDestinoIdSafe, montoOrigenSafe, tasaCambioSafe, montoDestinoSafe, referenciaSafe, fecha, notaSafe]
             );
 
             // 2. Restamos el dinero del fondo de Origen
