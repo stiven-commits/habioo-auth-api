@@ -88,6 +88,8 @@ interface IPagoPendienteRow {
 interface AbonoFondosInput {
     cuentaId: string | number;
     montoDistribuibleUsd: number;
+    montoDistribuibleOrigen: number;
+    monedaPago: string;
     tasaNum: number;
     pagoId: number | null;
     referencia: string | null;
@@ -449,9 +451,12 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
     };
 
     // Distribuye SOLO el monto no-Extra en fondos + movimientos_fondos.
-    const distribuirAbonoEnFondos = async (client: QueryClient, { cuentaId, montoDistribuibleUsd, tasaNum, pagoId, referencia }: AbonoFondosInput): Promise<void> => {
-        const montoUsd = round2(montoDistribuibleUsd);
-        if (montoUsd <= 0) return;
+    const distribuirAbonoEnFondos = async (client: QueryClient, { cuentaId, montoDistribuibleUsd, montoDistribuibleOrigen, monedaPago, tasaNum, pagoId, referencia }: AbonoFondosInput): Promise<void> => {
+        const monedaBase = String(monedaPago || '').toUpperCase() === 'USD' ? 'USD' : 'BS';
+        const montoBase = monedaBase === 'BS'
+            ? round2(montoDistribuibleOrigen)
+            : round2(montoDistribuibleUsd);
+        if (montoBase <= 0) return;
 
         const fondosRes = await client.query<IFondoActivoRow>(
             `
@@ -474,41 +479,46 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             throw new Error('La suma de porcentajes de fondos excede 100%. Ajuste la configuracion de fondos.');
         }
 
-        const distUsd: Array<IFondoActivoRow & { montoUsdParte: number }> = [];
-        let acumuladoUsd = 0;
+        const distBase: Array<IFondoActivoRow & { montoBaseParte: number }> = [];
+        let acumuladoBase = 0;
         noOperativos.forEach((f) => {
             const pct = parseFloat(String(f.porcentaje_asignacion || 0));
-            const parte = round2((montoUsd * pct) / 100);
-            acumuladoUsd = round2(acumuladoUsd + parte);
-            distUsd.push({ ...f, montoUsdParte: parte });
+            const parte = round2((montoBase * pct) / 100);
+            acumuladoBase = round2(acumuladoBase + parte);
+            distBase.push({ ...f, montoBaseParte: parte });
         });
 
-        const remanenteUsd = round2(montoUsd - acumuladoUsd);
+        const remanenteBase = round2(montoBase - acumuladoBase);
         if (fondoPrincipal) {
-            distUsd.push({ ...fondoPrincipal, montoUsdParte: remanenteUsd });
-        } else if (distUsd.length > 0) {
-            distUsd[distUsd.length - 1].montoUsdParte = round2(distUsd[distUsd.length - 1].montoUsdParte + remanenteUsd);
+            distBase.push({ ...fondoPrincipal, montoBaseParte: remanenteBase });
+        } else if (distBase.length > 0) {
+            distBase[distBase.length - 1].montoBaseParte = round2(distBase[distBase.length - 1].montoBaseParte + remanenteBase);
         } else {
-            distUsd.push({ ...fondosActivos[0], montoUsdParte: montoUsd });
+            distBase.push({ ...fondosActivos[0], montoBaseParte: montoBase });
         }
 
         const tipoMovimiento = await resolveMovimientoFondoTipo(['ABONO', 'ENTRADA', 'INGRESO', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
-        for (const d of distUsd) {
-            const usdParte = round2(d.montoUsdParte || 0);
-            if (usdParte <= 0) continue;
+        for (const d of distBase) {
+            const parteBase = round2(d.montoBaseParte || 0);
+            if (parteBase <= 0) continue;
 
-            let montoFondo = usdParte;
-            if (d.moneda === 'BS') {
+            const monedaFondo = String(d.moneda || '').toUpperCase();
+            let montoFondo = parteBase;
+            if (monedaFondo !== monedaBase) {
                 if (!tasaNum || tasaNum <= 0) {
-                    throw new Error('No hay tasa de cambio valida para abonar un fondo en Bs.');
+                    throw new Error('No hay tasa de cambio valida para convertir entre monedas en la distribucion de fondos.');
                 }
-                montoFondo = round2(usdParte * tasaNum);
+                if (monedaBase === 'BS' && monedaFondo === 'USD') {
+                    montoFondo = round2(parteBase / tasaNum);
+                } else if (monedaBase === 'USD' && monedaFondo === 'BS') {
+                    montoFondo = round2(parteBase * tasaNum);
+                }
             }
 
             await client.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, d.id]);
             await client.query(
-                'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
-                [d.id, tipoMovimiento, montoFondo, `Abono distribuible de pago${pagoId ? ` #${pagoId}` : ''} (${referencia || 'sin referencia'})`]
+                'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, referencia_id, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5, $6)',
+                [d.id, tipoMovimiento, montoFondo, pagoId, tasaNum || null, `Abono distribuible de pago${pagoId ? ` #${pagoId}` : ''} (${referencia || 'sin referencia'})`]
             );
         }
     };
@@ -589,6 +599,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             // 4. Cascada FIFO por recibos + imputacion por tipo de gasto.
             let dineroRestante = montoUsd;
             let montoDistribuibleFondos = 0;
+            let montoExtraTotalUsd = 0;
 
             const recibosPendientes = await pool.query<IReciboRow>(
                 "SELECT * FROM recibos WHERE propiedad_id = $1 AND estado != 'Pagado' ORDER BY fecha_emision ASC, id ASC",
@@ -618,8 +629,9 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 }
 
                 // SQL + JS: separar porcion Extra y actualizar monto_pagado_usd en gastos.
-                const { montoDistribuibleUsd } = await imputarReciboEnGastos(pool, rec, montoAplicadoRecibo);
+                const { montoDistribuibleUsd, montoExtraUsd } = await imputarReciboEnGastos(pool, rec, montoAplicadoRecibo);
                 montoDistribuibleFondos = round2(montoDistribuibleFondos + montoDistribuibleUsd);
+                montoExtraTotalUsd = round2(montoExtraTotalUsd + montoExtraUsd);
             }
 
             // Si sobro dinero, queda como saldo a favor y es distribuible en fondos (no proviene de gasto Extra).
@@ -627,11 +639,17 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 montoDistribuibleFondos = round2(montoDistribuibleFondos + dineroRestante);
             }
 
+            const montoDistribuibleOrigen = monedaFinal === 'BS'
+                ? round2(Math.max(0, montoOrigenNum - round2(montoExtraTotalUsd * tasaNum)))
+                : montoDistribuibleFondos;
+
             // 5. Distribucion en fondos: solo monto no-Extra.
             // Regla requerida: el componente Extra no genera movimientos_fondos.
             await distribuirAbonoEnFondos(pool, {
                 cuentaId: cuenta_id,
                 montoDistribuibleUsd: montoDistribuibleFondos,
+                montoDistribuibleOrigen,
+                monedaPago: monedaFinal,
                 tasaNum,
                 pagoId,
                 referencia: referencia || null,

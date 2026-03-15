@@ -41,11 +41,13 @@ interface IMovimientoRow {
     monto_bs: number | null;
     tasa_cambio: number | null;
     monto_usd: number | null;
+    monto_origen_pago?: number | null;
     banco_origen?: string | null;
     cedula_origen?: string | null;
     fondo_id: number | null;
     fondo_origen_id: number | null;
     fondo_destino_id: number | null;
+    fondo_nombre: string | null;
 }
 
 interface IGastoPendienteRow {
@@ -366,7 +368,86 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         ) AS rn_pp
                     FROM pagos_proveedores pp
                 ),
-                ingresos AS (
+                ingresos_fondos AS (
+                    SELECT
+                        ('ING-MF-' || mf.id::text) AS id,
+                        COALESCE(p.fecha_pago::date, mf.fecha::date) AS fecha,
+                        COALESCE(
+                            p.referencia,
+                            NULLIF(BTRIM(COALESCE((regexp_match(COALESCE(mf.nota, ''), '\\(([^)]*)\\)'))[1], '')), '')
+                        ) AS referencia,
+                        CASE
+                            WHEN p.id IS NOT NULL
+                                THEN ('Pago de Recibo #' || p.id::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A') || ' - Fondo: ' || COALESCE(f.nombre, 'N/A'))
+                            ELSE ('Ingreso distribuido en fondo: ' || COALESCE(f.nombre, 'N/A'))
+                        END AS concepto,
+                        'INGRESO'::text AS tipo,
+                        CASE
+                            WHEN UPPER(COALESCE(f.moneda, '')) = 'BS' THEN mf.monto
+                            WHEN UPPER(COALESCE(f.moneda, '')) = 'USD' AND COALESCE(p.tasa_cambio, mf.tasa_cambio) IS NOT NULL AND COALESCE(p.tasa_cambio, mf.tasa_cambio) > 0
+                                THEN (mf.monto * COALESCE(p.tasa_cambio, mf.tasa_cambio))
+                            ELSE NULL
+                        END AS monto_bs,
+                        COALESCE(p.tasa_cambio, mf.tasa_cambio) AS tasa_cambio,
+                        CASE
+                            WHEN UPPER(COALESCE(f.moneda, '')) = 'USD' THEN mf.monto
+                            WHEN UPPER(COALESCE(f.moneda, '')) = 'BS' AND COALESCE(p.tasa_cambio, mf.tasa_cambio) IS NOT NULL AND COALESCE(p.tasa_cambio, mf.tasa_cambio) > 0
+                                THEN (mf.monto / COALESCE(p.tasa_cambio, mf.tasa_cambio))
+                            ELSE NULL
+                        END AS monto_usd,
+                        p.monto_origen AS monto_origen_pago,
+                        ${pagoBancoOrigenExpr} AS banco_origen,
+                        ${pagoCedulaOrigenExpr} AS cedula_origen,
+                        f.id::int AS fondo_id,
+                        NULL::int AS fondo_origen_id,
+                        NULL::int AS fondo_destino_id,
+                        f.nombre::text AS fondo_nombre
+                    FROM movimientos_fondos mf
+                    JOIN fondos f ON f.id = mf.fondo_id
+                    LEFT JOIN pagos p ON p.id = COALESCE(
+                        mf.referencia_id,
+                        NULLIF((regexp_match(COALESCE(mf.nota, ''), '(?i)pago\\s*#\\s*([0-9]+)'))[1], '')::int
+                    )
+                    LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
+                    WHERE f.cuenta_bancaria_id = $1
+                      AND (
+                        mf.tipo IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
+                        OR (mf.tipo = 'AJUSTE_INICIAL' AND COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%')
+                      )
+                ),
+                ingresos_distribuidos_por_pago AS (
+                    SELECT
+                        p.id AS pago_id,
+                        ROUND(
+                            COALESCE(
+                                SUM(
+                                    CASE
+                                        WHEN UPPER(COALESCE(f.moneda, '')) = 'USD' THEN mf.monto
+                                        WHEN UPPER(COALESCE(f.moneda, '')) = 'BS' AND COALESCE(p.tasa_cambio, mf.tasa_cambio) IS NOT NULL AND COALESCE(p.tasa_cambio, mf.tasa_cambio) > 0
+                                            THEN (mf.monto / COALESCE(p.tasa_cambio, mf.tasa_cambio))
+                                        ELSE 0
+                                    END
+                                ),
+                                0
+                            )::numeric,
+                            2
+                        ) AS monto_distribuido_usd
+                    FROM pagos p
+                    LEFT JOIN movimientos_fondos mf ON p.id = COALESCE(
+                        mf.referencia_id,
+                        NULLIF((regexp_match(COALESCE(mf.nota, ''), '(?i)pago\\s*#\\s*([0-9]+)'))[1], '')::int
+                    )
+                    LEFT JOIN fondos f ON f.id = mf.fondo_id AND f.cuenta_bancaria_id = $1
+                    WHERE p.cuenta_bancaria_id = $1
+                      AND p.estado = 'Validado'
+                      AND (
+                        mf.id IS NULL
+                        OR mf.tipo IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
+                        OR (mf.tipo = 'AJUSTE_INICIAL' AND COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%')
+                      )
+                    GROUP BY p.id
+                ),
+                ingresos_transito AS (
                     SELECT
                         ('ING-' || p.id::text) AS id,
                         p.fecha_pago::date AS fecha,
@@ -374,18 +455,27 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         ('Pago de Recibo #' || p.id::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A')) AS concepto,
                         'INGRESO'::text AS tipo,
                         CASE
-                            WHEN UPPER(COALESCE(p.moneda, '')) = 'BS' THEN p.monto_origen
-                            WHEN UPPER(COALESCE(p.moneda, '')) = 'USD' AND p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0 THEN (p.monto_usd * p.tasa_cambio)
+                            WHEN UPPER(COALESCE(p.moneda, '')) = 'BS'
+                                THEN (GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2)) * COALESCE(NULLIF(p.tasa_cambio, 0), 1))
+                            WHEN UPPER(COALESCE(p.moneda, '')) = 'USD' AND p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0
+                                THEN (GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2)) * p.tasa_cambio)
                             ELSE NULL
                         END AS monto_bs,
                         p.tasa_cambio,
-                        p.monto_usd,
+                        GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2)) AS monto_usd,
+                        p.monto_origen AS monto_origen_pago,
                         ${pagoBancoOrigenExpr} AS banco_origen,
-                        ${pagoCedulaOrigenExpr} AS cedula_origen
+                        ${pagoCedulaOrigenExpr} AS cedula_origen,
+                        NULL::int AS fondo_id,
+                        NULL::int AS fondo_origen_id,
+                        NULL::int AS fondo_destino_id,
+                        NULL::text AS fondo_nombre
                     FROM pagos p
                     LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
+                    LEFT JOIN ingresos_distribuidos_por_pago idp ON idp.pago_id = p.id
                     WHERE p.cuenta_bancaria_id = $1
                       AND p.estado = 'Validado'
+                      AND GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2)) > 0
                 ),
                 egresos_gpf AS (
                     SELECT
@@ -397,8 +487,13 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         ${gpfMontoBsExpr} AS monto_bs,
                         ${gpfTasaExpr} AS tasa_cambio,
                         gpf.monto_pagado_usd AS monto_usd,
+                        NULL::numeric AS monto_origen_pago,
                         NULL::text AS banco_origen,
-                        NULL::text AS cedula_origen
+                        NULL::text AS cedula_origen,
+                        gpf.fondo_id::int AS fondo_id,
+                        NULL::int AS fondo_origen_id,
+                        NULL::int AS fondo_destino_id,
+                        f.nombre::text AS fondo_nombre
                     FROM (
                         SELECT
                             gpf.*,
@@ -427,8 +522,13 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         pp.monto_bs,
                         pp.tasa_cambio,
                         pp.monto_usd,
+                        NULL::numeric AS monto_origen_pago,
                         NULL::text AS banco_origen,
-                        NULL::text AS cedula_origen
+                        NULL::text AS cedula_origen,
+                        pp.fondo_id::int AS fondo_id,
+                        NULL::int AS fondo_origen_id,
+                        NULL::int AS fondo_destino_id,
+                        f.nombre::text AS fondo_nombre
                     FROM pagos_proveedores pp
                     JOIN gastos g ON g.id = pp.gasto_id
                     LEFT JOIN proveedores prov ON prov.id = g.proveedor_id
@@ -495,8 +595,17 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                 END
                             ELSE NULL
                         END AS monto_usd,
+                        NULL::numeric AS monto_origen_pago,
                         NULL::text AS banco_origen,
-                        NULL::text AS cedula_origen
+                        NULL::text AS cedula_origen,
+                        NULL::int AS fondo_id,
+                        t.fondo_origen_id::int AS fondo_origen_id,
+                        t.fondo_destino_id::int AS fondo_destino_id,
+                        CASE
+                            WHEN f_dest.cuenta_bancaria_id = $1 AND f_orig.cuenta_bancaria_id <> $1 THEN f_dest.nombre::text
+                            WHEN f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1 THEN f_orig.nombre::text
+                            ELSE NULL::text
+                        END AS fondo_nombre
                     FROM transferencias t
                     JOIN fondos f_orig ON f_orig.id = t.fondo_origen_id
                     JOIN fondos f_dest ON f_dest.id = t.fondo_destino_id
@@ -508,16 +617,19 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         (f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1)
                     )
                 )
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, banco_origen, cedula_origen
-                FROM ingresos
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
+                FROM ingresos_fondos
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, banco_origen, cedula_origen
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
+                FROM ingresos_transito
+                UNION ALL
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
                 FROM egresos_gpf
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, banco_origen, cedula_origen
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
                 FROM egresos_pp
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, banco_origen, cedula_origen
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
                 FROM transferencias_cuentas
                 ORDER BY fecha DESC, id DESC
             `;
