@@ -138,6 +138,24 @@ interface PagoProveedorBody {
     origenes: PagoProveedorOrigenBody[];
 }
 
+interface PagoProveedorDetalleParams {
+    gasto_id?: string;
+}
+
+interface PagoProveedorDetalleRow {
+    id: string;
+    fondo_id: number | null;
+    fondo_nombre: string | null;
+    banco_nombre: string | null;
+    monto_bs: number | null;
+    tasa_cambio: number | null;
+    monto_usd: number | null;
+    referencia: string | null;
+    fecha_pago: string | Date | null;
+    fecha_registro: string | Date | null;
+    nota: string | null;
+}
+
 interface GastoMontoRow {
     id?: number;
     monto_usd: number | string;
@@ -164,6 +182,31 @@ const asString = (value: unknown): string => {
 
 const asError = (value: unknown): Error => {
     return value instanceof Error ? value : new Error(String(value));
+};
+
+const toIsoDate = (value: unknown, fieldName: string): string => {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return value.toISOString().slice(0, 10);
+    }
+
+    const raw = String(value ?? '').trim();
+    if (!raw) throw new Error(`${fieldName} es requerida.`);
+
+    const ymd = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (ymd) {
+        const [_, y, m, d] = ymd;
+        const dt = new Date(`${y}-${m}-${d}T00:00:00`);
+        if (!Number.isNaN(dt.getTime())) return `${y}-${m}-${d}`;
+    }
+
+    const dmy = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (dmy) {
+        const [_, d, m, y] = dmy;
+        const dt = new Date(`${y}-${m}-${d}T00:00:00`);
+        if (!Number.isNaN(dt.getTime())) return `${y}-${m}-${d}`;
+    }
+
+    throw new Error(`${fieldName} inválida. Use dd/mm/yyyy o yyyy-mm-dd.`);
 };
 
 const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleNumber, getPagosOptionalColumns }: AuthDependencies): void => {
@@ -482,6 +525,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const montoOrigenNum = parseLocaleNumber(monto_origen);
             const tasaNum = monedaFinal === 'BS' ? (parseLocaleNumber(tasa_cambio) || 1) : 1;
             const montoUsd = monedaFinal === 'BS' ? round2(montoOrigenNum / tasaNum) : round2(montoOrigenNum);
+            const fechaPagoSafe = toIsoDate(fecha_pago || new Date(), 'fecha_pago');
 
             // 2. Insertamos el pago ya Validado (registro administrativo).
             const optionalCols = await getPagosColumns();
@@ -514,7 +558,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 montoUsd,
                 monedaFinal,
                 referencia || null,
-                fecha_pago || new Date(),
+                fechaPagoSafe,
                 'Transferencia',
                 'Validado',
             ];
@@ -660,6 +704,209 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         }
     });
 
+    app.get('/pagos-proveedores/gasto/:gasto_id/detalles', verifyToken, async (req: Request<PagoProveedorDetalleParams>, res: Response) => {
+        try {
+            const user = asAuthUser(req.user);
+            const gastoId = parseInt(asString(req.params.gasto_id), 10);
+            if (!Number.isFinite(gastoId) || gastoId <= 0) {
+                return res.status(400).json({ status: 'error', message: 'gasto_id invalido.' });
+            }
+
+            const condoRes = await pool.query<{ id: number }>(
+                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                [user.id]
+            );
+            const condoId = condoRes.rows[0]?.id;
+            if (!condoId) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            }
+
+            const gastoRes = await pool.query<{ id: number }>(
+                'SELECT id FROM gastos WHERE id = $1 AND condominio_id = $2 LIMIT 1',
+                [gastoId, condoId]
+            );
+            if (gastoRes.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'Gasto no encontrado.' });
+            }
+
+            const colsRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'gastos_pagos_fondos'
+                  AND column_name IN ('id', 'cuenta_bancaria_id', 'monto_bs', 'tasa_cambio', 'referencia', 'created_at', 'nota', 'pago_proveedor_id')
+                `
+            );
+            const cols = new Set(colsRes.rows.map((r) => r.column_name));
+            const gpfIdExpr = cols.has('id')
+                ? 'gpf.id::text'
+                : "('GPF-' || gpf.gasto_id::text || '-' || to_char(gpf.fecha_pago, 'YYYYMMDD') || '-' || COALESCE(gpf.fondo_id::text, 'EXTRA'))";
+            const gpfCuentaExpr = cols.has('cuenta_bancaria_id')
+                ? 'gpf.cuenta_bancaria_id'
+                : 'f.cuenta_bancaria_id';
+            const gpfMontoBsExpr = cols.has('monto_bs')
+                ? 'gpf.monto_bs'
+                : `
+                    CASE
+                        WHEN COALESCE(pp.monto_bs, 0) > 0 AND COALESCE(pp.monto_usd, 0) > 0
+                            THEN (pp.monto_bs * (gpf.monto_pagado_usd / NULLIF(pp.monto_usd, 0)))
+                        WHEN COALESCE(pp.tasa_cambio, 0) > 0
+                            THEN (gpf.monto_pagado_usd * pp.tasa_cambio)
+                        ELSE NULL
+                    END
+                `;
+            const gpfTasaExpr = cols.has('tasa_cambio')
+                ? `
+                    CASE
+                        WHEN COALESCE(gpf.tasa_cambio, 0) > 0 THEN gpf.tasa_cambio
+                        ${cols.has('monto_bs') ? 'WHEN COALESCE(gpf.monto_bs, 0) > 0 AND COALESCE(gpf.monto_pagado_usd, 0) > 0 THEN (gpf.monto_bs / NULLIF(gpf.monto_pagado_usd, 0))' : ''}
+                        WHEN COALESCE(pp.tasa_cambio, 0) > 0 THEN pp.tasa_cambio
+                        ELSE NULL
+                    END
+                `
+                : `
+                    CASE
+                        ${cols.has('monto_bs') ? 'WHEN COALESCE(gpf.monto_bs, 0) > 0 AND COALESCE(gpf.monto_pagado_usd, 0) > 0 THEN (gpf.monto_bs / NULLIF(gpf.monto_pagado_usd, 0))' : ''}
+                        WHEN COALESCE(pp.tasa_cambio, 0) > 0 THEN pp.tasa_cambio
+                        ELSE NULL
+                    END
+                `;
+            const gpfOrderExpr = cols.has('id') ? 'gpf.id ASC' : 'gpf.fondo_id NULLS LAST, gpf.monto_pagado_usd ASC';
+            const gpfRefExpr = cols.has('referencia')
+                ? "COALESCE(NULLIF(TRIM(gpf.referencia), ''), pp.referencia)"
+                : 'pp.referencia';
+            const gpfFechaRegistroExpr = cols.has('created_at') ? 'gpf.created_at' : 'pp.created_at';
+            const gpfNotaExpr = cols.has('nota') ? 'COALESCE(NULLIF(TRIM(gpf.nota), \'\'), pp.nota)' : 'pp.nota';
+            const gpfJoinPagoIdExpr = cols.has('pago_proveedor_id') ? 'gpf.pago_proveedor_id' : 'NULL';
+            const bancoColsRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'cuentas_bancarias'
+                  AND column_name IN ('nombre_banco', 'nombre', 'banco', 'apodo')
+                `
+            );
+            const bancoCols = new Set(bancoColsRes.rows.map((r) => r.column_name));
+            const buildBancoNombreExpr = (alias: string): string => {
+                const candidates: string[] = [];
+                if (bancoCols.has('nombre_banco')) candidates.push(`${alias}.nombre_banco`);
+                if (bancoCols.has('nombre')) candidates.push(`${alias}.nombre`);
+                if (bancoCols.has('banco')) candidates.push(`${alias}.banco`);
+                if (bancoCols.has('apodo')) candidates.push(`${alias}.apodo`);
+                if (candidates.length === 0) return "'Banco N/A'";
+                return `COALESCE(${candidates.join(', ')}, 'Banco N/A')`;
+            };
+            const bancoNombreExprCb = buildBancoNombreExpr('cb');
+
+            const query = `
+                WITH pp_rank AS (
+                    SELECT
+                        pp.id,
+                        pp.gasto_id,
+                        pp.fecha_pago::date AS fecha_pago,
+                        pp.referencia,
+                        pp.monto_bs,
+                        pp.monto_usd,
+                        pp.tasa_cambio,
+                        pp.nota,
+                        pp.created_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY pp.gasto_id, pp.fecha_pago::date
+                            ORDER BY pp.id ASC
+                        ) AS rn_pp
+                    FROM pagos_proveedores pp
+                    WHERE pp.gasto_id = $1
+                ),
+                gpf_rank AS (
+                    SELECT
+                        gpf.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY gpf.gasto_id, gpf.fecha_pago::date
+                            ORDER BY ${gpfOrderExpr}
+                        ) AS rn_gpf
+                    FROM gastos_pagos_fondos gpf
+                    WHERE gpf.gasto_id = $1
+                ),
+                detalles_gpf AS (
+                    SELECT
+                        ${gpfIdExpr} AS id,
+                        gpf.fondo_id,
+                        f.nombre AS fondo_nombre,
+                        ${bancoNombreExprCb} AS banco_nombre,
+                        ${gpfMontoBsExpr} AS monto_bs,
+                        ${gpfTasaExpr} AS tasa_cambio,
+                        gpf.monto_pagado_usd AS monto_usd,
+                        ${gpfRefExpr} AS referencia,
+                        gpf.fecha_pago AS fecha_pago,
+                        ${gpfFechaRegistroExpr} AS fecha_registro,
+                        ${gpfNotaExpr} AS nota
+                    FROM gpf_rank gpf
+                    LEFT JOIN fondos f ON f.id = gpf.fondo_id
+                    LEFT JOIN cuentas_bancarias cb ON cb.id = ${gpfCuentaExpr}
+                    LEFT JOIN pp_rank pp
+                        ON pp.gasto_id = gpf.gasto_id
+                       AND pp.fecha_pago = gpf.fecha_pago::date
+                       AND (
+                            (${gpfJoinPagoIdExpr} IS NOT NULL AND pp.id = ${gpfJoinPagoIdExpr})
+                            OR (${gpfJoinPagoIdExpr} IS NULL AND pp.rn_pp = gpf.rn_gpf)
+                       )
+                ),
+                detalles_pp_fallback AS (
+                    SELECT
+                        ('PP-' || pp.id::text) AS id,
+                        pp.fondo_id,
+                        f.nombre AS fondo_nombre,
+                        ${bancoNombreExprCb} AS banco_nombre,
+                        pp.monto_bs,
+                        pp.tasa_cambio,
+                        pp.monto_usd,
+                        pp.referencia,
+                        pp.fecha_pago,
+                        pp.created_at AS fecha_registro,
+                        pp.nota
+                    FROM pagos_proveedores pp
+                    LEFT JOIN fondos f ON f.id = pp.fondo_id
+                    LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+                    WHERE pp.gasto_id = $1
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gastos_pagos_fondos gpf2
+                          WHERE gpf2.gasto_id = pp.gasto_id
+                            AND gpf2.fecha_pago::date = pp.fecha_pago::date
+                      )
+                )
+                SELECT
+                    u.id,
+                    u.fondo_id,
+                    u.fondo_nombre,
+                    u.banco_nombre,
+                    u.monto_bs,
+                    u.tasa_cambio,
+                    u.monto_usd,
+                    u.referencia,
+                    u.fecha_pago,
+                    u.fecha_registro,
+                    u.nota
+                FROM (
+                    SELECT id, fondo_id, fondo_nombre, banco_nombre, monto_bs, tasa_cambio, monto_usd, referencia, fecha_pago, fecha_registro, nota
+                    FROM detalles_gpf
+                    UNION ALL
+                    SELECT id, fondo_id, fondo_nombre, banco_nombre, monto_bs, tasa_cambio, monto_usd, referencia, fecha_pago, fecha_registro, nota
+                    FROM detalles_pp_fallback
+                ) u
+                ORDER BY COALESCE(u.fecha_registro, u.fecha_pago) DESC, u.id DESC
+            `;
+
+            const detalles = await pool.query<PagoProveedorDetalleRow>(query, [gastoId]);
+            return res.json({ status: 'success', pagos: detalles.rows });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ status: 'error', message: error.message });
+        }
+    });
+
     app.post('/pagos-proveedores', verifyToken, async (req: Request<{}, unknown, PagoProveedorBody>, res: Response) => {
         const { gasto_id, fecha, nota, origenes } = req.body;
         let txStarted = false;
@@ -671,6 +918,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             if (!fecha) {
                 return res.status(400).json({ status: 'error', message: 'fecha es requerida.' });
             }
+            const fechaPagoSafe = toIsoDate(fecha, 'fecha');
             if (!Array.isArray(origenes) || origenes.length === 0) {
                 return res.status(400).json({ status: 'error', message: 'origenes debe contener al menos un registro.' });
             }
@@ -709,12 +957,19 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                     montoOrigen,
                     tasaCambio,
                     montoUsd,
+                    montoUsdExact: moneda === 'USD'
+                        ? parseFloat(String(montoOrigen))
+                        : (tasaCambio > 0 ? (montoOrigen / tasaCambio) : 0),
                     referencia: referenciaOrigen || 'N/A',
                 };
             });
 
             const montoTotalPagoUsd = round2(
                 origenesNormalizados.reduce((acc: number, origen) => acc + origen.montoUsd, 0)
+            );
+            const montoTotalPagoUsdExact = origenesNormalizados.reduce(
+                (acc: number, origen) => acc + (Number.isFinite(origen.montoUsdExact) ? origen.montoUsdExact : 0),
+                0
             );
             if (montoTotalPagoUsd <= 0) {
                 return res.status(400).json({ status: 'error', message: 'El pago total en USD debe ser mayor a 0.' });
@@ -751,7 +1006,9 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 .map((origen) => origen.referencia?.trim())
                 .filter((ref): ref is string => Boolean(ref));
             const referenciaPago = referencias.length > 0 ? referencias.join(' | ') : 'N/A';
-            const tasaEfectiva = montoTotalPagoUsd > 0 && totalBs > 0 ? round2(totalBs / montoTotalPagoUsd) : null;
+            const tasaEfectiva = montoTotalPagoUsdExact > 0 && totalBs > 0
+                ? round2(totalBs / montoTotalPagoUsdExact)
+                : (montoTotalPagoUsd > 0 && totalBs > 0 ? round2(totalBs / montoTotalPagoUsd) : null);
 
             const pagoProveedorRes = await pool.query<IPagoInsertRow>(
                 `
@@ -759,7 +1016,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING id
                 `,
-                [gasto_id, null, totalBs > 0 ? totalBs : null, tasaEfectiva, montoTotalPagoUsd, referenciaPago, fecha, nota || null]
+                [gasto_id, null, totalBs > 0 ? totalBs : null, tasaEfectiva, montoTotalPagoUsd, referenciaPago, fechaPagoSafe, nota || null]
             );
             const pagoProveedorId = pagoProveedorRes.rows[0]?.id;
             if (!pagoProveedorId) {
@@ -783,7 +1040,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND table_name = 'gastos_pagos_fondos'
-                  AND column_name IN ('cuenta_bancaria_id', 'monto_bs', 'tasa_cambio', 'referencia')
+                  AND column_name IN ('cuenta_bancaria_id', 'monto_bs', 'tasa_cambio', 'referencia', 'nota', 'pago_proveedor_id')
                 `
             );
             const gpfCols = new Set(gpfColsRes.rows.map((r) => r.column_name));
@@ -852,34 +1109,37 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                     );
                 }
 
+                const gpfInsertCols: string[] = ['gasto_id', 'fondo_id', 'monto_pagado_usd', 'fecha_pago'];
+                const gpfInsertVals: Array<number | string | null> = [gasto_id, origen.fondoId, origen.montoUsd, fechaPagoSafe];
+                if (gpfCols.has('cuenta_bancaria_id')) {
+                    gpfInsertCols.push('cuenta_bancaria_id');
+                    gpfInsertVals.push(origen.cuentaId);
+                }
+                if (gpfCols.has('monto_bs')) {
+                    gpfInsertCols.push('monto_bs');
+                    gpfInsertVals.push(origen.montoOrigen);
+                }
+                if (gpfCols.has('tasa_cambio')) {
+                    gpfInsertCols.push('tasa_cambio');
+                    gpfInsertVals.push(origen.tasaCambio);
+                }
+                if (gpfCols.has('referencia')) {
+                    gpfInsertCols.push('referencia');
+                    gpfInsertVals.push(origen.referencia || referenciaPago);
+                }
+                if (gpfCols.has('nota')) {
+                    gpfInsertCols.push('nota');
+                    gpfInsertVals.push((nota || '').trim() || null);
+                }
+                if (gpfCols.has('pago_proveedor_id')) {
+                    gpfInsertCols.push('pago_proveedor_id');
+                    gpfInsertVals.push(pagoProveedorId);
+                }
+
+                const gpfPlaceholders = gpfInsertVals.map((_, idx) => `$${idx + 1}`).join(', ');
                 await pool.query(
-                    `INSERT INTO gastos_pagos_fondos (
-                        gasto_id,
-                        fondo_id,
-                        monto_pagado_usd,
-                        fecha_pago
-                        ${gpfCols.has('cuenta_bancaria_id') ? ', cuenta_bancaria_id' : ''}
-                        ${gpfCols.has('monto_bs') ? ', monto_bs' : ''}
-                        ${gpfCols.has('tasa_cambio') ? ', tasa_cambio' : ''}
-                        ${gpfCols.has('referencia') ? ', referencia' : ''}
-                    )
-                    VALUES (
-                        $1, $2, $3, $4
-                        ${gpfCols.has('cuenta_bancaria_id') ? ', $5' : ''}
-                        ${gpfCols.has('monto_bs') ? `, $${gpfCols.has('cuenta_bancaria_id') ? 6 : 5}` : ''}
-                        ${gpfCols.has('tasa_cambio') ? `, $${(gpfCols.has('cuenta_bancaria_id') ? 6 : 5) + (gpfCols.has('monto_bs') ? 1 : 0)}` : ''}
-                        ${gpfCols.has('referencia') ? `, $${(gpfCols.has('cuenta_bancaria_id') ? 6 : 5) + (gpfCols.has('monto_bs') ? 1 : 0) + (gpfCols.has('tasa_cambio') ? 1 : 0)}` : ''}
-                    )`,
-                    [
-                        gasto_id,
-                        origen.fondoId,
-                        origen.montoUsd,
-                        fecha,
-                        ...(gpfCols.has('cuenta_bancaria_id') ? [origen.cuentaId] : []),
-                        ...(gpfCols.has('monto_bs') ? [origen.montoOrigen] : []),
-                        ...(gpfCols.has('tasa_cambio') ? [origen.tasaCambio] : []),
-                        ...(gpfCols.has('referencia') ? [origen.referencia || referenciaPago] : []),
-                    ]
+                    `INSERT INTO gastos_pagos_fondos (${gpfInsertCols.join(', ')}) VALUES (${gpfPlaceholders})`,
+                    gpfInsertVals
                 );
             }
 

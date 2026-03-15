@@ -162,6 +162,20 @@ const asError = (value: unknown): Error => {
     return value instanceof Error ? value : new Error(String(value));
 };
 
+const toIsoDateOrNull = (value: unknown): string | null => {
+    if (value === null || value === undefined) return null;
+    const raw = String(value).trim();
+    if (!raw) return null;
+
+    const ymd = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (ymd) return `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+
+    const dmy = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (dmy) return `${dmy[3]}-${dmy[2]}-${dmy[1]}`;
+
+    throw new Error('fecha_gasto invalida. Use dd/mm/yyyy o yyyy-mm-dd.');
+};
+
 const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocaleNumber, addMonths, formatMonthText }: AuthDependencies): void => {
     const uploadsDir = path.join(__dirname, '..', 'uploads', 'gastos');
     if (!fs.existsSync(uploadsDir)) {
@@ -202,6 +216,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
             const m_bs = parseLocaleNumber(monto_bs);
             const t_c = parseLocaleNumber(tasa_cambio);
+            const fechaGastoSafe = toIsoDateOrNull(fecha_gasto);
 
             const condoRes = await pool.query<ICondominioMesRow>('SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const condominio_id = condoRes.rows[0].id;
@@ -210,7 +225,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const monto_usd = (m_bs / t_c).toFixed(2);
             const monto_cuota_usd = (parseFloat(monto_usd) / parseInt(String(total_cuotas), 10)).toFixed(2);
 
-            const mes_factura = fecha_gasto ? fecha_gasto.substring(0, 7) : mes_actual;
+            const mes_factura = fechaGastoSafe ? fechaGastoSafe.substring(0, 7) : mes_actual;
             const mes_inicio_cobro = mes_factura > mes_actual ? mes_factura : mes_actual;
 
             const dbTipo = tipo || 'Comun';
@@ -222,7 +237,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, tipo, zona_id, propiedad_id, fecha_gasto, factura_img, imagenes)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id
         `,
-                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, dbTipo, zId, pId, fecha_gasto || null, facturaGuardada, soportesGuardados]
+                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados]
             );
 
             for (let i = 1; i <= Number(total_cuotas); i += 1) {

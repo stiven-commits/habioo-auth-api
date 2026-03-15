@@ -148,6 +148,23 @@ const asError = (value: unknown): Error => {
     return value instanceof Error ? value : new Error(String(value));
 };
 
+const toIsoDate = (value: unknown, fieldName: string): string => {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return value.toISOString().slice(0, 10);
+    }
+
+    const raw = String(value ?? '').trim();
+    if (!raw) throw new Error(`${fieldName} es requerida.`);
+
+    const ymd = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (ymd) return `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+
+    const dmy = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (dmy) return `${dmy[3]}-${dmy[2]}-${dmy[1]}`;
+
+    throw new Error(`${fieldName} inválida. Use dd/mm/yyyy o yyyy-mm-dd.`);
+};
+
 const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
     app.get('/bancos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
@@ -294,17 +311,29 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 ? ' OR (gpf.fondo_id IS NULL AND gpf.cuenta_bancaria_id = $1)'
                 : '';
             const gpfReferenciaExpr = hasCol('gastos_pagos_fondos', 'referencia')
-                ? 'COALESCE(gpf.referencia, pp_ref.referencia)'
-                : 'pp_ref.referencia';
+                ? 'COALESCE(gpf.referencia, pp_match.referencia)'
+                : 'pp_match.referencia';
             const hasGpfTasaCambio = hasCol('gastos_pagos_fondos', 'tasa_cambio');
+            const gpfOrderExpr = hasCol('gastos_pagos_fondos', 'id')
+                ? 'gpf.id ASC'
+                : 'gpf.fondo_id NULLS LAST, gpf.monto_pagado_usd ASC';
             const gpfMontoBsExpr = hasCol('gastos_pagos_fondos', 'monto_bs')
                 ? 'gpf.monto_bs'
                 : (hasGpfTasaCambio
                     ? 'CASE WHEN gpf.tasa_cambio IS NOT NULL AND gpf.tasa_cambio > 0 THEN (gpf.monto_pagado_usd * gpf.tasa_cambio) ELSE NULL END'
-                    : 'CASE WHEN pp_ref.tasa_cambio IS NOT NULL AND pp_ref.tasa_cambio > 0 THEN (gpf.monto_pagado_usd * pp_ref.tasa_cambio) ELSE NULL END');
+                    : `
+                        CASE
+                            WHEN pp_match.monto_bs IS NOT NULL AND pp_match.monto_bs > 0
+                                 AND pp_match.monto_usd IS NOT NULL AND pp_match.monto_usd > 0
+                                THEN (pp_match.monto_bs * (gpf.monto_pagado_usd / NULLIF(pp_match.monto_usd, 0)))
+                            WHEN pp_match.tasa_cambio IS NOT NULL AND pp_match.tasa_cambio > 0
+                                THEN (gpf.monto_pagado_usd * pp_match.tasa_cambio)
+                            ELSE NULL
+                        END
+                    `);
             const gpfTasaExpr = hasGpfTasaCambio
                 ? 'gpf.tasa_cambio'
-                : 'pp_ref.tasa_cambio';
+                : 'pp_match.tasa_cambio';
 
             const ppCuentaFilter = hasCol('pagos_proveedores', 'cuenta_bancaria_id')
                 ? ' OR (pp.fondo_id IS NULL AND pp.cuenta_bancaria_id = $1)'
@@ -322,7 +351,22 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 : pagoCedulaDesdeNotaExpr;
 
             const query = `
-                WITH ingresos AS (
+                WITH pp_gasto_rank AS (
+                    SELECT
+                        pp.id,
+                        pp.gasto_id,
+                        pp.fecha_pago::date AS fecha_pago,
+                        pp.referencia,
+                        pp.monto_bs,
+                        pp.monto_usd,
+                        pp.tasa_cambio,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY pp.gasto_id, pp.fecha_pago::date
+                            ORDER BY pp.id ASC
+                        ) AS rn_pp
+                    FROM pagos_proveedores pp
+                ),
+                ingresos AS (
                     SELECT
                         ('ING-' || p.id::text) AS id,
                         p.fecha_pago::date AS fecha,
@@ -355,18 +399,22 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         gpf.monto_pagado_usd AS monto_usd,
                         NULL::text AS banco_origen,
                         NULL::text AS cedula_origen
-                    FROM gastos_pagos_fondos gpf
+                    FROM (
+                        SELECT
+                            gpf.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY gpf.gasto_id, gpf.fecha_pago::date
+                                ORDER BY ${gpfOrderExpr}
+                            ) AS rn_gpf
+                        FROM gastos_pagos_fondos gpf
+                    ) gpf
                     JOIN gastos g ON g.id = gpf.gasto_id
                     LEFT JOIN proveedores prov ON prov.id = g.proveedor_id
                     LEFT JOIN fondos f ON f.id = gpf.fondo_id
-                    LEFT JOIN LATERAL (
-                        SELECT pp.referencia, pp.tasa_cambio
-                        FROM pagos_proveedores pp
-                        WHERE pp.gasto_id = gpf.gasto_id
-                          AND pp.fecha_pago::date = gpf.fecha_pago::date
-                        ORDER BY pp.id DESC
-                        LIMIT 1
-                    ) pp_ref ON true
+                    LEFT JOIN pp_gasto_rank pp_match
+                        ON pp_match.gasto_id = gpf.gasto_id
+                       AND pp_match.fecha_pago = gpf.fecha_pago::date
+                       AND pp_match.rn_pp = gpf.rn_gpf
                     WHERE (f.cuenta_bancaria_id = $1${gpfCuentaFilter})
                 ),
                 egresos_pp AS (
@@ -498,6 +546,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 : asDecimal(tasa_cambio, 'tasa_cambio');
             const referenciaSafe = asOptionalStringOrNull(referencia);
             const notaSafe = asOptionalStringOrNull(nota);
+            const fechaSafe = toIsoDate(fecha, 'fecha');
             const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const condoId = condoRes.rows[0].id;
 
@@ -507,7 +556,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             await pool.query(
                 `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-                [condoId, fondoOrigenIdSafe, fondoDestinoIdSafe, montoOrigenSafe, tasaCambioSafe, montoDestinoSafe, referenciaSafe, fecha, notaSafe]
+                [condoId, fondoOrigenIdSafe, fondoDestinoIdSafe, montoOrigenSafe, tasaCambioSafe, montoDestinoSafe, referenciaSafe, fechaSafe, notaSafe]
             );
 
             // 2. Restamos el dinero del fondo de Origen
