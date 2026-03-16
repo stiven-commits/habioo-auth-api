@@ -27,6 +27,17 @@ interface ICondominioConfigRow {
     id: number;
     mes_actual: string;
     metodo_division: 'Alicuota' | 'Partes Iguales' | string;
+    nombre?: string | null;
+    nombre_legal?: string | null;
+    rif?: string | null;
+    admin_nombre?: string | null;
+    admin_rif?: string | null;
+    admin_correo?: string | null;
+    logo_url?: string | null;
+    aviso_msg_1?: string | null;
+    aviso_msg_2?: string | null;
+    aviso_msg_3?: string | null;
+    aviso_msg_4?: string | null;
 }
 
 interface ICondominioMesRow {
@@ -90,19 +101,43 @@ interface IAlicuotaRow {
 
 interface IPropiedadCierreRow {
     id: number;
+    identificador: string;
     alicuota: string | number;
     saldo_actual: string | number;
 }
 
 interface ICuotaCierreRow {
+    gasto_id: number;
+    concepto: string;
+    monto_total_bs: string | number;
+    monto_total_usd: string | number;
+    tasa_cambio: string | number;
     monto_cuota_usd: string | number;
+    nota: string | null;
     tipo: string;
     zona_id: number | null;
     propiedad_id: number | null;
+    zona_nombre: string | null;
+    propiedad_identificador: string | null;
+}
+
+interface IFondoSnapshotRow {
+    id: number;
+    nombre: string;
+    moneda: string | null;
+    porcentaje_asignacion: string | number | null;
+    saldo_actual: string | number;
+    banco: string | null;
+    apodo: string | null;
 }
 
 interface IPropiedadZonaRow {
     zona_id: number;
+}
+
+interface IPropiedadParticipanteRow {
+    rol: string;
+    nombre: string;
 }
 
 interface ICountRow {
@@ -161,6 +196,8 @@ const asString = (value: unknown): string => {
 const asError = (value: unknown): Error => {
     return value instanceof Error ? value : new Error(String(value));
 };
+
+const toNumber = (value: string | number | null | undefined): number => parseFloat(String(value ?? 0)) || 0;
 
 const toIsoDateOrNull = (value: unknown): string | null => {
     if (value === null || value === undefined) return null;
@@ -367,40 +404,140 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const user = asAuthUser(req.user);
             await pool.query('BEGIN');
 
-            const condoRes = await pool.query<ICondominioConfigRow>('SELECT id, mes_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            const condoRes = await pool.query<ICondominioConfigRow>(
+                `SELECT
+                    id, mes_actual, metodo_division, nombre, nombre_legal, rif,
+                    admin_nombre, admin_rif, admin_correo, logo_url,
+                    aviso_msg_1, aviso_msg_2, aviso_msg_3, aviso_msg_4
+                 FROM condominios
+                 WHERE admin_user_id = $1
+                 LIMIT 1`,
+                [user.id]
+            );
             const { id: condo_id, mes_actual, metodo_division } = condoRes.rows[0];
 
             // ðŸ’¡ 1. Agregamos "saldo_actual" a la bÃºsqueda de propiedades
-            const propRes = await pool.query<IPropiedadCierreRow>('SELECT id, alicuota, saldo_actual FROM propiedades WHERE condominio_id = $1', [condo_id]);
+            const propRes = await pool.query<IPropiedadCierreRow>(
+                'SELECT id, identificador, alicuota, saldo_actual FROM propiedades WHERE condominio_id = $1',
+                [condo_id]
+            );
 
             const cuotasRes = await pool.query<ICuotaCierreRow>(
-                `SELECT gc.monto_cuota_usd, g.tipo, g.zona_id, g.propiedad_id FROM gastos_cuotas gc JOIN gastos g ON gc.gasto_id = g.id WHERE g.condominio_id = $1 AND gc.mes_asignado = $2 AND gc.estado = 'Pendiente'`,
+                `SELECT
+                    g.id AS gasto_id,
+                    g.concepto,
+                    g.monto_bs AS monto_total_bs,
+                    g.monto_usd AS monto_total_usd,
+                    g.tasa_cambio,
+                    gc.monto_cuota_usd,
+                    g.nota,
+                    g.tipo,
+                    g.zona_id,
+                    g.propiedad_id,
+                    z.nombre AS zona_nombre,
+                    gp.identificador AS propiedad_identificador
+                 FROM gastos_cuotas gc
+                 JOIN gastos g ON gc.gasto_id = g.id
+                 LEFT JOIN zonas z ON z.id = g.zona_id
+                 LEFT JOIN propiedades gp ON gp.id = g.propiedad_id
+                 WHERE g.condominio_id = $1
+                   AND gc.mes_asignado = $2
+                   AND gc.estado = 'Pendiente'`,
                 [condo_id, mes_actual]
             );
+
+            const fondosRes = await pool.query<IFondoSnapshotRow>(
+                `SELECT
+                    f.id,
+                    f.nombre,
+                    f.moneda,
+                    f.porcentaje_asignacion,
+                    f.saldo_actual,
+                    cb.nombre_banco AS banco,
+                    cb.apodo
+                 FROM fondos f
+                 LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+                 WHERE f.condominio_id = $1
+                   AND COALESCE(f.activo, true) = true
+                 ORDER BY f.id ASC`,
+                [condo_id]
+            );
+
+            const perfilCondo = condoRes.rows[0];
+            const mensajesSnapshot = [
+                perfilCondo.aviso_msg_1,
+                perfilCondo.aviso_msg_2,
+                perfilCondo.aviso_msg_3,
+                perfilCondo.aviso_msg_4,
+            ].map((m) => String(m ?? '').trim()).filter((m) => m.length > 0);
 
             for (const p of propRes.rows) {
                 let total_deuda = 0;
                 const viejoSaldo = parseFloat(String(p.saldo_actual || 0)); // ðŸ’¡ Capturamos la plata que tenÃ­a a favor
+                const gastosSnapshotRows: {
+                    id: number;
+                    concepto: string;
+                    nota: string;
+                    tipo: string;
+                    zona_nombre: string;
+                    propiedad_identificador: string;
+                    total_bs: number;
+                    total_usd: number;
+                    cuota_bs: number;
+                    cuota_usd: number;
+                }[] = [];
+
+                const participantesRes = await pool.query<IPropiedadParticipanteRow>(
+                    `SELECT up.rol, u.nombre
+                     FROM usuarios_propiedades up
+                     JOIN users u ON u.id = up.user_id
+                     WHERE up.propiedad_id = $1
+                       AND up.rol IN ('Propietario', 'Inquilino')
+                     ORDER BY CASE WHEN up.rol = 'Propietario' THEN 0 ELSE 1 END, up.id ASC`,
+                    [p.id]
+                );
+                const propietario = participantesRes.rows.find((r) => String(r.rol) === 'Propietario')?.nombre || 'Sin propietario';
+                const inquilino = participantesRes.rows.find((r) => String(r.rol) === 'Inquilino')?.nombre || '';
+                const titularMostrado = inquilino ? `${propietario} / Inquilino: ${inquilino}` : propietario;
 
                 const zonasApto = await pool.query<IPropiedadZonaRow>('SELECT zona_id FROM propiedades_zonas WHERE propiedad_id = $1', [p.id]);
                 const zonaIds = zonasApto.rows.map((z) => z.zona_id);
 
                 for (const c of cuotasRes.rows) {
+                    let cuotaPropiedadUsd = 0;
+
                     if (c.tipo === 'Comun' || c.tipo === 'Extra') {
-                        if (metodo_division === 'Partes Iguales') total_deuda += parseFloat(String(c.monto_cuota_usd)) / propRes.rows.length;
-                        else total_deuda += parseFloat(String(c.monto_cuota_usd)) * (parseFloat(String(p.alicuota)) / 100);
+                        if (metodo_division === 'Partes Iguales') cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd)) / propRes.rows.length;
+                        else cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd)) * (parseFloat(String(p.alicuota)) / 100);
                     } else if ((c.tipo === 'No Comun' || c.tipo === 'Zona') && c.zona_id !== null && zonaIds.includes(c.zona_id)) {
                         const propsZona = await pool.query<ICountRow>('SELECT COUNT(*) FROM propiedades_zonas WHERE zona_id = $1', [c.zona_id]);
-                        if (metodo_division === 'Partes Iguales') total_deuda += parseFloat(String(c.monto_cuota_usd)) / parseInt(propsZona.rows[0].count, 10);
+                        if (metodo_division === 'Partes Iguales') cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd)) / parseInt(propsZona.rows[0].count, 10);
                         else {
                             const sumAl = await pool.query<ISumTotalRow>(
                                 'SELECT SUM(p.alicuota) as total FROM propiedades p JOIN propiedades_zonas pz ON p.id = pz.propiedad_id WHERE pz.zona_id = $1',
                                 [c.zona_id]
                             );
-                            total_deuda += parseFloat(String(c.monto_cuota_usd)) * (parseFloat(String(p.alicuota)) / parseFloat(String(sumAl.rows[0].total)));
+                            cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd)) * (parseFloat(String(p.alicuota)) / parseFloat(String(sumAl.rows[0].total)));
                         }
                     } else if (c.tipo === 'Individual' && c.propiedad_id === p.id) {
-                        total_deuda += parseFloat(String(c.monto_cuota_usd));
+                        cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd));
+                    }
+
+                    if (cuotaPropiedadUsd > 0) {
+                        total_deuda += cuotaPropiedadUsd;
+                        const tasa = toNumber(c.tasa_cambio);
+                        gastosSnapshotRows.push({
+                            id: c.gasto_id,
+                            concepto: c.concepto,
+                            nota: String(c.nota || ''),
+                            tipo: String(c.tipo || ''),
+                            zona_nombre: String(c.zona_nombre || ''),
+                            propiedad_identificador: String(c.propiedad_identificador || ''),
+                            total_bs: toNumber(c.monto_total_bs),
+                            total_usd: toNumber(c.monto_total_usd),
+                            cuota_bs: cuotaPropiedadUsd * (tasa > 0 ? tasa : 1),
+                            cuota_usd: cuotaPropiedadUsd,
+                        });
                     }
                 }
 
@@ -413,6 +550,84 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                         [p.id, formatMonthText(mes_actual), deudaFinal]
                     );
                     const nuevoReciboId = recRes.rows[0].id;
+
+                    const tasaRef = gastosSnapshotRows.length > 0
+                        ? toNumber(gastosSnapshotRows[0].cuota_bs) / Math.max(toNumber(gastosSnapshotRows[0].cuota_usd), 0.0001)
+                        : 1;
+                    const totalCuotaUsd = toNumber(deudaFinal);
+                    const saldoAntesUsd = viejoSaldo;
+                    const saldoConAvisoUsd = viejoSaldo + totalCuotaUsd;
+                    const saldoAntesBs = saldoAntesUsd * (tasaRef > 0 ? tasaRef : 1);
+                    const saldoConAvisoBs = saldoConAvisoUsd * (tasaRef > 0 ? tasaRef : 1);
+
+                    const fondosSnapshotRows = fondosRes.rows.map((f) => {
+                        const pct = Math.max(0, toNumber(f.porcentaje_asignacion));
+                        const incomingUsd = totalCuotaUsd * (pct / 100);
+                        const incomingBs = incomingUsd * (tasaRef > 0 ? tasaRef : 1);
+                        const saldo = toNumber(f.saldo_actual);
+                        const isBs = String(f.moneda || '').toUpperCase() === 'BS';
+                        const saldoActualBs = isBs ? saldo : saldo * (tasaRef > 0 ? tasaRef : 1);
+                        const saldoActualUsd = isBs ? saldo / (tasaRef > 0 ? tasaRef : 1) : saldo;
+                        const proyeccionBs = isBs ? saldo + incomingBs : (saldo + incomingUsd) * (tasaRef > 0 ? tasaRef : 1);
+                        const proyeccionUsd = isBs ? (saldo + incomingBs) / (tasaRef > 0 ? tasaRef : 1) : saldo + incomingUsd;
+
+                        return {
+                            id: f.id,
+                            banco_fondo: `${f.banco || 'Cuenta'} - ${f.apodo || f.nombre}`,
+                            saldo_actual_bs: saldoActualBs,
+                            saldo_actual_usd: saldoActualUsd,
+                            proyeccion_bs: proyeccionBs,
+                            proyeccion_usd: proyeccionUsd,
+                        };
+                    });
+
+                    const snapshotAviso = {
+                        mes_correspondiente: formatMonthText(mes_actual),
+                        estado_recibo: 'Pendiente',
+                        administradora: {
+                            nombre: perfilCondo.admin_nombre || perfilCondo.nombre_legal || perfilCondo.nombre || '',
+                            rif: perfilCondo.admin_rif || perfilCondo.rif || '',
+                            correo: perfilCondo.admin_correo || '',
+                            logo_url: perfilCondo.logo_url || null,
+                        },
+                        condominio: {
+                            nombre: perfilCondo.nombre_legal || perfilCondo.nombre || '',
+                            rif: perfilCondo.rif || '',
+                            correo: perfilCondo.admin_correo || '',
+                        },
+                        inmueble: {
+                            identificador: p.identificador,
+                            propietario,
+                            inquilino: inquilino || null,
+                            titular_mostrado: titularMostrado,
+                        },
+                        saldo_cuenta: {
+                            antes_aviso_bs: Number(saldoAntesBs.toFixed(2)),
+                            antes_aviso_usd: Number(saldoAntesUsd.toFixed(2)),
+                            con_aviso_bs: Number(saldoConAvisoBs.toFixed(2)),
+                            con_aviso_usd: Number(saldoConAvisoUsd.toFixed(2)),
+                        },
+                        gastos: gastosSnapshotRows.map((g) => ({
+                            ...g,
+                            total_bs: Number(g.total_bs.toFixed(2)),
+                            total_usd: Number(g.total_usd.toFixed(2)),
+                            cuota_bs: Number(g.cuota_bs.toFixed(2)),
+                            cuota_usd: Number(g.cuota_usd.toFixed(2)),
+                        })),
+                        fondos: fondosSnapshotRows.map((f) => ({
+                            ...f,
+                            saldo_actual_bs: Number(f.saldo_actual_bs.toFixed(2)),
+                            saldo_actual_usd: Number(f.saldo_actual_usd.toFixed(2)),
+                            proyeccion_bs: Number(f.proyeccion_bs.toFixed(2)),
+                            proyeccion_usd: Number(f.proyeccion_usd.toFixed(2)),
+                        })),
+                        mensajes: mensajesSnapshot,
+                    };
+
+                    await pool.query(
+                        'UPDATE recibos SET snapshot_jsonb = $1, snapshot_version = 1 WHERE id = $2',
+                        [JSON.stringify(snapshotAviso), nuevoReciboId]
+                    );
 
                     // 2. Aumentar la deuda global
                     await pool.query(
@@ -427,9 +642,31 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                         if (saldoAFavor >= total_deuda) {
                             // TenÃ­a suficiente dinero a favor para pagar el recibo entero
                             await pool.query("UPDATE recibos SET monto_pagado_usd = monto_usd, estado = 'Pagado' WHERE id = $1", [nuevoReciboId]);
+                            await pool.query(
+                                `UPDATE recibos
+                                 SET snapshot_jsonb = jsonb_set(
+                                   COALESCE(snapshot_jsonb, '{}'::jsonb),
+                                   '{estado_recibo}',
+                                   to_jsonb('Pagado'::text),
+                                   true
+                                 )
+                                 WHERE id = $1`,
+                                [nuevoReciboId]
+                            );
                         } else {
                             // Su saldo a favor no alcanzÃ³ para todo, se abona lo que tenÃ­a
                             await pool.query("UPDATE recibos SET monto_pagado_usd = $1, estado = 'Abonado' WHERE id = $2", [saldoAFavor, nuevoReciboId]);
+                            await pool.query(
+                                `UPDATE recibos
+                                 SET snapshot_jsonb = jsonb_set(
+                                   COALESCE(snapshot_jsonb, '{}'::jsonb),
+                                   '{estado_recibo}',
+                                   to_jsonb('Abonado'::text),
+                                   true
+                                 )
+                                 WHERE id = $1`,
+                                [nuevoReciboId]
+                            );
                         }
                     }
                 }

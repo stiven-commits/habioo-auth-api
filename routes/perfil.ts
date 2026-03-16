@@ -45,6 +45,10 @@ interface PerfilCondominioRow {
   admin_correo: string | null;
   logo_url: string | null;
   firma_url: string | null;
+  aviso_msg_1: string | null;
+  aviso_msg_2: string | null;
+  aviso_msg_3: string | null;
+  aviso_msg_4: string | null;
   tipo: string | null;
   junta_general_id: number | null;
   tasa_interes: string | number | null;
@@ -117,6 +121,10 @@ router.get('/', verifyToken, async (req: Request, res: Response<ApiRes<PerfilCon
           admin_correo,
           logo_url,
           firma_url,
+          aviso_msg_1,
+          aviso_msg_2,
+          aviso_msg_3,
+          aviso_msg_4,
           tipo,
           junta_general_id,
           tasa_interes,
@@ -164,6 +172,10 @@ router.put('/', verifyToken, async (req: Request, res: Response<ApiRes>): Promis
       admin_representante,
       admin_telefono,
       admin_correo,
+      aviso_msg_1,
+      aviso_msg_2,
+      aviso_msg_3,
+      aviso_msg_4,
       tipo,
       junta_general_id,
       tasa_interes,
@@ -186,14 +198,18 @@ router.put('/', verifyToken, async (req: Request, res: Response<ApiRes>): Promis
             admin_representante = $8,
             admin_telefono = $9,
             admin_correo = $10,
-            tipo = $11,
-            junta_general_id = $12,
-            tasa_interes = $13,
-            metodo_division = $14,
-            cuota_participacion = $15,
-            estado_venezuela = $16,
-            mes_actual = $17
-        WHERE id = $18
+            aviso_msg_1 = $11,
+            aviso_msg_2 = $12,
+            aviso_msg_3 = $13,
+            aviso_msg_4 = $14,
+            tipo = $15,
+            junta_general_id = $16,
+            tasa_interes = $17,
+            metodo_division = $18,
+            cuota_participacion = $19,
+            estado_venezuela = $20,
+            mes_actual = $21
+        WHERE id = $22
       `,
       [
         nombre ?? nombre_legal ?? null,
@@ -206,6 +222,10 @@ router.put('/', verifyToken, async (req: Request, res: Response<ApiRes>): Promis
         admin_representante ?? null,
         admin_telefono ?? null,
         admin_correo ?? null,
+        aviso_msg_1 ?? null,
+        aviso_msg_2 ?? null,
+        aviso_msg_3 ?? null,
+        aviso_msg_4 ?? null,
         tipo ?? null,
         junta_general_id ?? null,
         tasa_interes ?? null,

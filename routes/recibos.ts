@@ -22,6 +22,15 @@ interface IReciboHistorialRow {
     propietario: string | null;
 }
 
+interface IReciboAvisoRow {
+    id: number;
+    estado: string;
+    inmueble_identificador: string;
+    propietario_nombre: string | null;
+    inquilino_nombre: string | null;
+    snapshot_jsonb: Record<string, unknown> | null;
+}
+
 const asAuthUser = (value: unknown): AuthUser => {
     if (
         typeof value !== 'object' ||
@@ -65,6 +74,91 @@ const registerRecibosRoutes = (app: Application, { pool, verifyToken }: AuthDepe
         } catch (err: unknown) {
             const error = asError(err);
             res.status(500).json({ error: error.message });
+        }
+    });
+
+    app.get('/recibos/:id/aviso', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const reciboId = parseInt(String(req.params.id || ''), 10);
+            if (!Number.isFinite(reciboId) || reciboId <= 0) {
+                return res.status(400).json({ status: 'error', message: 'ID de recibo invalido.' });
+            }
+
+            const result = await pool.query<IReciboAvisoRow>(
+                `SELECT
+                    r.id,
+                    r.estado,
+                    p.identificador AS inmueble_identificador,
+                    upo.nombre AS propietario_nombre,
+                    upi.nombre AS inquilino_nombre,
+                    r.snapshot_jsonb
+                 FROM recibos r
+                 JOIN propiedades p ON p.id = r.propiedad_id
+                 LEFT JOIN LATERAL (
+                    SELECT u.nombre
+                    FROM usuarios_propiedades up
+                    JOIN users u ON u.id = up.user_id
+                    WHERE up.propiedad_id = p.id
+                      AND up.rol = 'Propietario'
+                    ORDER BY up.id ASC
+                    LIMIT 1
+                 ) upo ON true
+                 LEFT JOIN LATERAL (
+                    SELECT u.nombre
+                    FROM usuarios_propiedades up
+                    JOIN users u ON u.id = up.user_id
+                    WHERE up.propiedad_id = p.id
+                      AND up.rol = 'Inquilino'
+                    ORDER BY up.id ASC
+                    LIMIT 1
+                 ) upi ON true
+                 JOIN condominios c ON c.id = p.condominio_id
+                 WHERE r.id = $1
+                   AND c.admin_user_id = $2
+                 LIMIT 1`,
+                [reciboId, user.id]
+            );
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'Recibo no encontrado.' });
+            }
+
+            const recibo = result.rows[0];
+            if (!recibo.snapshot_jsonb) {
+                return res.status(404).json({ status: 'error', message: 'Este recibo no tiene snapshot guardado.' });
+            }
+
+            const estadoRaw = String(recibo.estado || '').trim();
+            const estadoRecibo =
+                ['Pagado', 'Solvente', 'Recibo', 'Validado'].includes(estadoRaw)
+                    ? 'Pagado'
+                    : ['Abonado', 'Abonado Parcial', 'Parcial'].includes(estadoRaw)
+                        ? 'Abonado'
+                        : 'Pendiente';
+
+            const propietario = recibo.propietario_nombre || 'Sin propietario';
+            const inquilino = recibo.inquilino_nombre || null;
+            const titularMostrado = inquilino ? `${propietario} / Inquilino: ${inquilino}` : propietario;
+
+            const snapshotInmueble = (recibo.snapshot_jsonb as Record<string, unknown>).inmueble as Record<string, unknown> | undefined;
+
+            const aviso = {
+                ...recibo.snapshot_jsonb,
+                estado_recibo: estadoRecibo,
+                inmueble: {
+                    ...(snapshotInmueble || {}),
+                    identificador: String(snapshotInmueble?.identificador || recibo.inmueble_identificador || ''),
+                    propietario: String(snapshotInmueble?.propietario || propietario),
+                    inquilino: snapshotInmueble?.inquilino ?? inquilino,
+                    titular_mostrado: String(snapshotInmueble?.titular_mostrado || titularMostrado),
+                },
+            };
+
+            res.json({ status: 'success', aviso });
+        } catch (err: unknown) {
+            const error = asError(err);
+            res.status(500).json({ status: 'error', message: error.message });
         }
     });
 };

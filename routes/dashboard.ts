@@ -4,6 +4,7 @@ import type { Faker } from '@faker-js/faker';
 
 interface AuthUser {
     id: number;
+    cedula?: string;
 }
 
 interface AuthDependencies {
@@ -73,6 +74,9 @@ const getFaker = async (): Promise<Faker> => {
 };
 
 const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
+    const seederEnabled = ['1', 'true', 'yes', 'on'].includes(
+        String(process.env.ENABLE_TEST_SEEDER || '').trim().toLowerCase(),
+    );
     const buildCedula = (_faker: Faker, seedNum: number): string => `V${String(10000000 + seedNum).slice(-8)}`;
     const buildRif = (seedNum: number): string => `J${String(100000000 + seedNum).slice(-9)}`;
     const buildVzlaPhone = (faker: Faker): string => `04${faker.helpers.arrayElement(['12', '14', '16', '24', '26'])}${faker.string.numeric(7)}`;
@@ -161,7 +165,20 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
 
     app.post('/dashboard-admin/seed-prueba', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
+            if (!seederEnabled) {
+                return res.status(403).json({
+                    status: 'error',
+                    message: 'Seeder de prueba deshabilitado por configuracion (ENABLE_TEST_SEEDER).',
+                });
+            }
             const user = asAuthUser(req.user);
+            const cedulaAuth = String(user.cedula || '').trim().toUpperCase();
+            if (cedulaAuth !== 'J123456789') {
+                return res.status(403).json({
+                    status: 'error',
+                    message: 'Seeder de prueba habilitado solo para el usuario J123456789.',
+                });
+            }
             const faker = await getFaker();
 
             await pool.query('BEGIN');
@@ -176,6 +193,16 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
             }
 
             const condoId = condoRes.rows[0].id;
+            const seedUsersRes = await pool.query<IIdRow>(
+                `SELECT DISTINCT u.id
+                 FROM users u
+                 JOIN usuarios_propiedades up ON up.user_id = u.id
+                 JOIN propiedades p ON p.id = up.propiedad_id
+                 WHERE p.condominio_id = $1
+                   AND u.email ILIKE '%@seed.habioo.test'`,
+                [condoId],
+            );
+            const seedUserIdsToDelete = seedUsersRes.rows.map((row) => row.id);
             const now = new Date();
             const mesAnteriorDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
             const mesActual = `${mesAnteriorDate.getUTCFullYear()}-${String(mesAnteriorDate.getUTCMonth() + 1).padStart(2, '0')}`;
@@ -261,13 +288,14 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
             await pool.query('DELETE FROM propiedades WHERE condominio_id = $1', [condoId]);
             await pool.query('DELETE FROM zonas WHERE condominio_id = $1', [condoId]);
 
-            await pool.query(
-                `DELETE FROM users u
-                 WHERE u.email ILIKE '%@seed.habioo.test'
-                   AND NOT EXISTS (SELECT 1 FROM usuarios_propiedades up WHERE up.user_id = u.id)
-                   AND u.id <> $1`,
-                [user.id],
-            );
+            if (seedUserIdsToDelete.length > 0) {
+                await pool.query(
+                    `DELETE FROM users
+                     WHERE id = ANY($1::int[])
+                       AND id <> $2`,
+                    [seedUserIdsToDelete, user.id],
+                );
+            }
 
             // 2) Datos de prueba frescos
             // Seeder bancario: 4 cuentas (3 en BS y 1 en USD), cada una con su fondo y saldo acorde a su moneda.
