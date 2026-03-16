@@ -115,6 +115,7 @@ interface ICuotaCierreRow {
     tasa_cambio: string | number;
     monto_cuota_usd: string | number;
     nota: string | null;
+    clasificacion: string | null;
     tipo: string;
     zona_id: number | null;
     propiedad_id: number | null;
@@ -434,6 +435,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     g.tasa_cambio,
                     gc.monto_cuota_usd,
                     g.nota,
+                    g.clasificacion,
                     g.tipo,
                     g.zona_id,
                     g.propiedad_id,
@@ -481,6 +483,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     id: number;
                     concepto: string;
                     nota: string;
+                    clasificacion: string;
                     tipo: string;
                     zona_nombre: string;
                     propiedad_identificador: string;
@@ -533,6 +536,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                             id: c.gasto_id,
                             concepto: c.concepto,
                             nota: String(c.nota || ''),
+                            clasificacion: String(c.clasificacion || 'Variable'),
                             tipo: String(c.tipo || ''),
                             zona_nombre: String(c.zona_nombre || ''),
                             propiedad_identificador: String(c.propiedad_identificador || ''),

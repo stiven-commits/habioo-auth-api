@@ -176,6 +176,24 @@ const asPgError = (value: unknown): PGError => {
     return { message: String(value) };
 };
 
+const normalizeWhitespace = (value: unknown): string =>
+    String(value ?? '').trim().replace(/\s+/g, ' ');
+
+const toTitleCase = (value: unknown): string =>
+    normalizeWhitespace(value)
+        .toLowerCase()
+        .split(' ')
+        .map((word) =>
+            word
+                .split('-')
+                .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+                .join('-')
+        )
+        .join(' ');
+
+const normalizeIdentifier = (value: unknown): string => normalizeWhitespace(value).toUpperCase();
+const normalizeDoc = (value: unknown): string => normalizeWhitespace(value).toUpperCase();
+
 const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
 
     const getCondominioIdByAdmin = async (adminUserId: number): Promise<number | null> => {
@@ -410,7 +428,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             const propPlaceholders: string[] = [];
             propiedades.forEach((item: InmuebleLote, idx: number) => {
                 const offset = idx * 4;
-                const identificador = String(item.identificador || '').trim();
+                const identificador = normalizeIdentifier(item.identificador);
                 const alicuotaNum = parseFloat(String(item.alicuota ?? '0').replace(',', '.')) || 0;
                 const saldoBase = parseFloat(String(item.saldo_inicial ?? '0').replace(',', '.')) || 0;
                 propValues.push(condoId, identificador, alicuotaNum, saldoBase);
@@ -429,7 +447,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             // 3) Mapa identificador -> propiedad_id.
             const propiedadIdByIdentificador = new Map<string, number>();
             insertPropsRes.rows.forEach((row) => {
-                const key = String(row.identificador || '').trim().toLowerCase();
+                const key = normalizeIdentifier(row.identificador);
                 propiedadIdByIdentificador.set(key, row.id);
             });
 
@@ -437,7 +455,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             for (const item of propiedades) {
                 const saldoBase = parseFloat(String(item.saldo_inicial ?? '0').replace(',', '.')) || 0;
                 if (saldoBase === 0) continue;
-                const key = String(item.identificador || '').trim().toLowerCase();
+                const key = normalizeIdentifier(item.identificador);
                 const propiedadId = propiedadIdByIdentificador.get(key);
                 if (!propiedadId) continue;
                 const tipoSaldo = saldoBase > 0 ? 'DEUDA' : 'FAVOR';
@@ -449,12 +467,12 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 
             // Vincular propietario (nombre + cedula) por cada inmueble cargado.
             for (const item of propiedades) {
-                const key = String(item.identificador || '').trim().toLowerCase();
+                const key = normalizeIdentifier(item.identificador);
                 const propiedadId = propiedadIdByIdentificador.get(key);
                 if (!propiedadId) continue;
 
-                const cedula = String(item.cedula || '').trim();
-                const nombre = String(item.nombre || '').trim();
+                const cedula = normalizeDoc(item.cedula);
+                const nombre = toTitleCase(item.nombre);
                 if (!cedula || !nombre) continue;
 
                 const correoRaw = String(item.correo || '').trim().toLowerCase();
@@ -493,7 +511,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             // 4) Aplicar saldo importado por inmueble (deuda/favor/al dia) desde la hoja saldos_bases.
             const saldoPorPropiedad = new Map<number, number>();
             for (const deuda of deudas) {
-                const key = String(deuda.identificador || '').trim().toLowerCase();
+                const key = normalizeIdentifier(deuda.identificador);
                 const propiedadId = propiedadIdByIdentificador.get(key);
                 if (!propiedadId) continue;
 
@@ -567,6 +585,11 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         } = req.body;
         const ownerEmail = (prop_email || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
+        const identificadorNormalized = normalizeIdentifier(identificador);
+        const propCedulaNormalized = normalizeDoc(prop_cedula);
+        const propNombreNormalized = toTitleCase(prop_nombre);
+        const inqCedulaNormalized = normalizeDoc(inq_cedula);
+        const inqNombreNormalized = toTitleCase(inq_nombre);
         const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
         const parseMoney = (value: string | number | undefined | null): number => {
             const parsed = parseFloat(String(value ?? '0').replace(',', '.'));
@@ -601,18 +624,18 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             }
 
             let userId: number | null = null;
-            if (prop_cedula && prop_nombre) {
-                let userRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [prop_cedula]);
+            if (propCedulaNormalized && propNombreNormalized) {
+                let userRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [propCedulaNormalized]);
                 if (userRes.rows.length === 0) {
-                    userRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [prop_cedula, prop_nombre, ownerEmail, prop_telefono || null, prop_password || prop_cedula]);
+                    userRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_telefono || null, prop_password || propCedulaNormalized]);
                 } else {
-                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [prop_nombre, ownerEmail, prop_telefono || null, prop_cedula]);
-                    if (prop_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [prop_password, prop_cedula]);
+                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [propNombreNormalized, ownerEmail, prop_telefono || null, propCedulaNormalized]);
+                    if (prop_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [prop_password, propCedulaNormalized]);
                 }
                 userId = userRes.rows[0].id;
             }
 
-            const propRes = await pool.query<IPropiedadIdRow>('INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual) VALUES ($1, $2, $3, $4, $5) RETURNING id', [condominioId, identificador, alicuotaNum, zona_id || null, saldoBase]);
+            const propRes = await pool.query<IPropiedadIdRow>('INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual) VALUES ($1, $2, $3, $4, $5) RETURNING id', [condominioId, identificadorNormalized, alicuotaNum, zona_id || null, saldoBase]);
             const nuevaPropId = propRes.rows[0].id;
 
             if (usarDeudaInicial) {
@@ -631,14 +654,14 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             }
             if (userId) await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, nuevaPropId, 'Propietario']);
 
-            if (tiene_inquilino && inq_cedula && inq_nombre) {
+            if (tiene_inquilino && inqCedulaNormalized && inqNombreNormalized) {
                 const inqPermitirAcceso = inq_permitir_acceso !== false;
-                let tenantRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [inq_cedula]);
+                let tenantRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [inqCedulaNormalized]);
                 if (tenantRes.rows.length === 0) {
-                    tenantRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inq_cedula, inq_nombre, tenantEmail, inq_telefono || null, inq_password || inq_cedula]);
+                    tenantRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inqCedulaNormalized, inqNombreNormalized, tenantEmail, inq_telefono || null, inq_password || inqCedulaNormalized]);
                 } else {
-                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [inq_nombre, tenantEmail, inq_telefono || null, inq_cedula]);
-                    if (inq_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inq_cedula]);
+                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [inqNombreNormalized, tenantEmail, inq_telefono || null, inqCedulaNormalized]);
+                    if (inq_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inqCedulaNormalized]);
                 }
                 await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol, acceso_portal) VALUES ($1, $2, $3, $4)', [tenantRes.rows[0].id, nuevaPropId, 'Inquilino', inqPermitirAcceso]);
             }
@@ -659,22 +682,27 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 
         const ownerEmail = (prop_email || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
+        const identificadorNormalized = normalizeIdentifier(identificador);
+        const propCedulaNormalized = normalizeDoc(prop_cedula);
+        const propNombreNormalized = toTitleCase(prop_nombre);
+        const inqCedulaNormalized = normalizeDoc(inq_cedula);
+        const inqNombreNormalized = toTitleCase(inq_nombre);
         const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
         if (!isValidEmail(ownerEmail)) return res.status(400).json({ error: 'Email del propietario invÃ¡lido.' });
         if (!isValidEmail(tenantEmail)) return res.status(400).json({ error: 'Email del inquilino invÃ¡lido.' });
 
         try {
             await pool.query('BEGIN');
-            await pool.query('UPDATE propiedades SET identificador = $1, alicuota = $2, zona_id = $3 WHERE id = $4', [identificador, alicuotaNum, zona_id || null, propiedadId]);
+            await pool.query('UPDATE propiedades SET identificador = $1, alicuota = $2, zona_id = $3 WHERE id = $4', [identificadorNormalized, alicuotaNum, zona_id || null, propiedadId]);
 
-            if (prop_cedula && prop_nombre) {
-                let userRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [prop_cedula]);
+            if (propCedulaNormalized && propNombreNormalized) {
+                let userRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [propCedulaNormalized]);
                 let userId: number | null = null;
                 if (userRes.rows.length === 0) {
-                    userRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [prop_cedula, prop_nombre, ownerEmail, prop_telefono || null, prop_password || prop_cedula]);
+                    userRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_telefono || null, prop_password || propCedulaNormalized]);
                 } else {
-                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [prop_nombre, ownerEmail, prop_telefono || null, prop_cedula]);
-                    if (prop_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [prop_password, prop_cedula]);
+                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [propNombreNormalized, ownerEmail, prop_telefono || null, propCedulaNormalized]);
+                    if (prop_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [prop_password, propCedulaNormalized]);
                 }
                 userId = userRes.rows[0].id;
                 const linkRes = await pool.query<ILinkIdRow>('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Propietario']);
@@ -682,14 +710,14 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 else { await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, propiedadId, 'Propietario']); }
             }
 
-            if (tiene_inquilino && inq_cedula && inq_nombre) {
+            if (tiene_inquilino && inqCedulaNormalized && inqNombreNormalized) {
                 const inqPermitirAcceso = inq_permitir_acceso !== false;
-                let tenantRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [inq_cedula]);
+                let tenantRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [inqCedulaNormalized]);
                 if (tenantRes.rows.length === 0) {
-                    tenantRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inq_cedula, inq_nombre, tenantEmail, inq_telefono || null, inq_password || inq_cedula]);
+                    tenantRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inqCedulaNormalized, inqNombreNormalized, tenantEmail, inq_telefono || null, inq_password || inqCedulaNormalized]);
                 } else {
-                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [inq_nombre, tenantEmail, inq_telefono || null, inq_cedula]);
-                    if (inq_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inq_cedula]);
+                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [inqNombreNormalized, tenantEmail, inq_telefono || null, inqCedulaNormalized]);
+                    if (inq_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inqCedulaNormalized]);
                 }
                 const tenantId = tenantRes.rows[0].id;
                 const tenantLink = await pool.query<ILinkIdRow>('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
