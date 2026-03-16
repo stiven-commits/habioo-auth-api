@@ -3,6 +3,10 @@ const jwt: typeof import('jsonwebtoken') = require('jsonwebtoken');
 
 interface AuthUserPayload {
     id: number;
+    cedula: string;
+    nombre: string;
+    condominio_id?: number;
+    is_admin?: boolean;
 }
 
 declare global {

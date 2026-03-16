@@ -130,11 +130,13 @@ const registerAuthRoutes = (
             }
 
             const userId = user.id;
-            const adminRes = await pool.query<IAdminAccessRow>(
-                'SELECT 1 FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+            const adminRes = await pool.query<{ id: number }>(
+                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
                 [userId]
             );
             const hasAdminAccess = adminRes.rows.length > 0;
+
+            let condominioId: number | null = adminRes.rows[0]?.id ?? null;
 
             if (!hasAdminAccess) {
                 const upRes = await pool.query<IUsuarioPropiedadRow>(
@@ -146,10 +148,33 @@ const registerAuthRoutes = (
                 if (hasLinks && !hasPortalAccess) {
                     return res.status(403).json({ status: 'error', message: 'Acceso al portal deshabilitado para este usuario.' });
                 }
+
+                if (hasPortalAccess) {
+                    const condoRes = await pool.query<{ condominio_id: number }>(
+                        `
+                            SELECT p.condominio_id
+                            FROM usuarios_propiedades up
+                            INNER JOIN propiedades p ON p.id = up.propiedad_id
+                            WHERE up.user_id = $1
+                              AND COALESCE(up.acceso_portal, true) = true
+                              AND p.condominio_id IS NOT NULL
+                            ORDER BY p.id ASC
+                            LIMIT 1
+                        `,
+                        [userId]
+                    );
+                    condominioId = condoRes.rows[0]?.condominio_id ?? null;
+                }
             }
 
             const token = jwt.sign(
-                { id: user.id, cedula: user.cedula, nombre: user.nombre },
+                {
+                    id: user.id,
+                    cedula: user.cedula,
+                    nombre: user.nombre,
+                    condominio_id: condominioId,
+                    is_admin: hasAdminAccess,
+                },
                 process.env.JWT_SECRET as string,
                 { expiresIn: '24h' }
             );
