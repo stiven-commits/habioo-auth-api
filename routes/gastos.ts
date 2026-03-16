@@ -604,6 +604,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                         },
                         inmueble: {
                             identificador: p.identificador,
+                            alicuota: Number(parseFloat(String(p.alicuota || 0)).toFixed(3)),
                             propietario,
                             inquilino: inquilino || null,
                             titular_mostrado: titularMostrado,

@@ -26,6 +26,7 @@ interface IReciboAvisoRow {
     id: number;
     estado: string;
     inmueble_identificador: string;
+    inmueble_alicuota: string | number;
     propietario_nombre: string | null;
     inquilino_nombre: string | null;
     snapshot_jsonb: Record<string, unknown> | null;
@@ -90,6 +91,7 @@ const registerRecibosRoutes = (app: Application, { pool, verifyToken }: AuthDepe
                     r.id,
                     r.estado,
                     p.identificador AS inmueble_identificador,
+                    p.alicuota AS inmueble_alicuota,
                     upo.nombre AS propietario_nombre,
                     upi.nombre AS inquilino_nombre,
                     r.snapshot_jsonb
@@ -149,6 +151,7 @@ const registerRecibosRoutes = (app: Application, { pool, verifyToken }: AuthDepe
                 inmueble: {
                     ...(snapshotInmueble || {}),
                     identificador: String(snapshotInmueble?.identificador || recibo.inmueble_identificador || ''),
+                    alicuota: Number(snapshotInmueble?.alicuota ?? recibo.inmueble_alicuota ?? 0),
                     propietario: String(snapshotInmueble?.propietario || propietario),
                     inquilino: snapshotInmueble?.inquilino ?? inquilino,
                     titular_mostrado: String(snapshotInmueble?.titular_mostrado || titularMostrado),
