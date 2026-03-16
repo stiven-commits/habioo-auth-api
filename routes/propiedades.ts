@@ -30,6 +30,7 @@ interface IPropiedadAdminRow extends Record<string, unknown> {
     inq_email: string | null;
     inq_telefono: string | null;
     inq_acceso_portal: boolean;
+    can_delete: boolean;
 }
 
 interface IMovimientoEstadoCuentaRow {
@@ -219,7 +220,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     COALESCE(p.saldo_actual, 0) AS saldo_actual,
                     u1.id as prop_id, u1.nombre as prop_nombre, u1.cedula as prop_cedula, u1.email as prop_email, u1.telefono as prop_telefono,
                     u2.id as inq_id, u2.nombre as inq_nombre, u2.cedula as inq_cedula, u2.email as inq_email, u2.telefono as inq_telefono,
-                    COALESCE(up2.acceso_portal, true) as inq_acceso_portal
+                    COALESCE(up2.acceso_portal, true) as inq_acceso_portal,
+                    NOT EXISTS (SELECT 1 FROM recibos r WHERE r.propiedad_id = p.id) as can_delete
                 FROM propiedades p
                 LEFT JOIN usuarios_propiedades up1 ON p.id = up1.propiedad_id AND up1.rol = 'Propietario' LEFT JOIN users u1 ON up1.user_id = u1.id 
                 LEFT JOIN usuarios_propiedades up2 ON p.id = up2.propiedad_id AND up2.rol = 'Inquilino' LEFT JOIN users u2 ON up2.user_id = u2.id
@@ -736,7 +738,55 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         }
     });
 
-    // 6. AJUSTAR SALDO MANUALMENTE
+    // 6. ELIMINAR PROPIEDAD INDIVIDUAL (solo si no tiene avisos/recibos)
+    app.delete('/propiedades-admin/:id', verifyToken, async (req: Request<PropiedadEstadoCuentaParams>, res: Response, _next: NextFunction) => {
+        const propiedadIdRaw = asString(req.params.id);
+        const propiedadId = parseInt(propiedadIdRaw, 10);
+        if (!Number.isFinite(propiedadId) || propiedadId <= 0) {
+            return res.status(400).json({ error: 'ID de inmueble inválido.' });
+        }
+
+        try {
+            const user = asAuthUser(req.user);
+            const condominioId = await getCondominioIdByAdmin(user.id);
+            if (!condominioId) {
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
+
+            const propRes = await pool.query<IPropiedadIdRow>(
+                'SELECT id FROM propiedades WHERE id = $1 AND condominio_id = $2 LIMIT 1',
+                [propiedadId, condominioId]
+            );
+            if (propRes.rows.length === 0) {
+                return res.status(404).json({ error: 'Inmueble no encontrado.' });
+            }
+
+            const recibosRes = await pool.query<ICountRow>(
+                'SELECT COUNT(*)::text AS count FROM recibos WHERE propiedad_id = $1',
+                [propiedadId]
+            );
+            const totalRecibos = parseInt(recibosRes.rows[0]?.count || '0', 10) || 0;
+            if (totalRecibos > 0) {
+                return res.status(400).json({ error: 'No se puede eliminar este inmueble porque ya tiene avisos/recibos generados.' });
+            }
+
+            await pool.query('BEGIN');
+            await pool.query('DELETE FROM pagos WHERE propiedad_id = $1', [propiedadId]);
+            await pool.query('DELETE FROM historial_saldos_inmuebles WHERE propiedad_id = $1', [propiedadId]);
+            await pool.query('DELETE FROM usuarios_propiedades WHERE propiedad_id = $1', [propiedadId]);
+            await pool.query('DELETE FROM propiedades_zonas WHERE propiedad_id = $1', [propiedadId]);
+            await pool.query('DELETE FROM propiedades WHERE id = $1 AND condominio_id = $2', [propiedadId, condominioId]);
+            await pool.query('COMMIT');
+
+            res.json({ status: 'success', message: 'Inmueble eliminado correctamente.' });
+        } catch (err: unknown) {
+            const error = asError(err);
+            await pool.query('ROLLBACK');
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    // 7. AJUSTAR SALDO MANUALMENTE
     app.post('/propiedades-admin/:id/ajustar-saldo', verifyToken, async (req: Request<PropiedadEstadoCuentaParams, unknown, AjustarSaldoBody>, res: Response, _next: NextFunction) => {
         const propiedadId = asString(req.params.id);
         const { monto, tipo_ajuste, nota } = req.body;
