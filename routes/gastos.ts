@@ -67,6 +67,7 @@ interface IGastoListRow extends Record<string, unknown> {
     monto_total_usd: string | number;
     monto_pagado_usd: string | number | null;
     nota: string | null;
+    clasificacion: string | null;
     proveedor: string;
     numero_cuota: number;
     total_cuotas: number;
@@ -155,6 +156,7 @@ interface CreateGastoBody {
     tasa_cambio: unknown;
     total_cuotas: string | number;
     nota?: string | null;
+    clasificacion?: string;
     tipo?: string;
     zona_id?: string | number | null;
     propiedad_id?: string | number | null;
@@ -228,7 +230,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         const user = asAuthUser(req.user);
         if (!user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
 
-        const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota, tipo, zona_id, propiedad_id, fecha_gasto } = req.body;
+        const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto } = req.body;
 
         try {
             let facturaGuardada: string | null = null;
@@ -266,15 +268,16 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const mes_inicio_cobro = mes_factura > mes_actual ? mes_factura : mes_actual;
 
             const dbTipo = tipo || 'Comun';
+            const dbClasificacion = String(clasificacion || '').trim().toLowerCase() === 'fijo' ? 'Fijo' : 'Variable';
             const zId = dbTipo === 'Zona' || dbTipo === 'No Comun' ? (zona_id || null) : null;
             const pId = dbTipo === 'Individual' ? (propiedad_id || null) : null;
 
             const result = await pool.query<IInsertedIdRow>(
                 `
-            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, tipo, zona_id, propiedad_id, fecha_gasto, factura_img, imagenes)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id
+            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, factura_img, imagenes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id
         `,
-                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados]
+                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados]
             );
 
             for (let i = 1; i <= Number(total_cuotas); i += 1) {
@@ -295,7 +298,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const result = await pool.query<IGastoListRow>(
                 `
             SELECT g.id as gasto_id, gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio,
-                   g.monto_usd as monto_total_usd, g.monto_pagado_usd, g.nota, p.nombre as proveedor,
+                   g.monto_usd as monto_total_usd, g.monto_pagado_usd, g.nota, g.clasificacion, p.nombre as proveedor,
                    gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.mes_asignado, gc.estado,
                    TO_CHAR(g.created_at, 'DD/MM/YYYY') as fecha_registro,
                    TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha_factura,

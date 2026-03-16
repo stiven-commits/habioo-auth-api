@@ -48,6 +48,12 @@ interface IGastoConfig {
     cuotas: number;
 }
 
+const buildSeedGastoNota = (concepto: string): string => {
+    const base = `Gasto de prueba para "${concepto}" registrado por el seeder con detalle operativo y justificacion administrativa para pruebas integrales del flujo contable.`;
+    if (base.length >= 80) return base;
+    return `${base} Incluye contexto adicional para cumplir longitud minima requerida.`;
+};
+
 const asAuthUser = (value: unknown): AuthUser => {
     if (
         typeof value !== 'object' ||
@@ -494,13 +500,15 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                 const proveedorId = faker.helpers.arrayElement(proveedorIds);
                 const totalCuotas = Math.max(1, parseInt(String(g.cuotas || 1), 10));
                 const fechaGastoSeed = `${mesActual}-05`;
+                const clasificacionSeed = faker.helpers.arrayElement(['Fijo', 'Variable']);
+                const notaSeed = buildSeedGastoNota(g.concepto);
                 const gas = await pool.query<IIdRow>(
                     `INSERT INTO gastos
-                        (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, tipo, zona_id, propiedad_id, fecha_gasto)
+                        (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto)
                      VALUES
-                        ($1, $2, $3, $4, 40, $5, $6, $7, $8, $9, $10::date)
+                        ($1, $2, $3, $4, 40, $5, $6, $7, $8, $9, $10, $11, $12::date)
                      RETURNING id`,
-                    [condoId, proveedorId, g.concepto, g.usd * 40, g.usd, totalCuotas, g.tipo, g.zona, g.prop, fechaGastoSeed],
+                    [condoId, proveedorId, g.concepto, g.usd * 40, g.usd, totalCuotas, notaSeed, clasificacionSeed, g.tipo, g.zona, g.prop, fechaGastoSeed],
                 );
 
                 let restante = parseFloat(String(g.usd));
