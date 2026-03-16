@@ -53,8 +53,17 @@ interface IPropiedadIdRow {
     id: number;
 }
 
+interface IPropiedadInsertedRow {
+    id: number;
+    identificador: string;
+}
+
 interface ILinkIdRow {
     id: number;
+}
+
+interface ICountRow {
+    count: string;
 }
 
 interface PGError {
@@ -66,10 +75,6 @@ interface PropiedadEstadoCuentaParams {
     id?: string;
 }
 
-interface PropiedadesLoteBody {
-    inmuebles: InmuebleLote[];
-}
-
 interface InmuebleLote {
     identificador: string;
     alicuota?: string | number;
@@ -78,6 +83,19 @@ interface InmuebleLote {
     nombre?: string;
     correo?: string;
     telefono?: string;
+}
+
+interface DeudaLote {
+    identificador: string;
+    concepto?: string;
+    monto_total?: string | number;
+    monto_abonado?: string | number;
+    saldo?: string | number;
+}
+
+interface PropiedadesLoteBody {
+    propiedades: InmuebleLote[];
+    deudas?: DeudaLote[];
 }
 
 interface PropiedadAdminBody {
@@ -97,6 +115,12 @@ interface PropiedadAdminBody {
     inq_password?: string;
     inq_permitir_acceso?: boolean;
     monto_saldo_inicial?: string | number;
+    tiene_deuda_inicial?: boolean;
+    deudas_iniciales?: Array<{
+        concepto?: string;
+        monto_deuda?: string | number;
+        monto_abono?: string | number;
+    }>;
 }
 
 interface PropiedadEditBody {
@@ -173,17 +197,104 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
             }
             const r = await pool.query<IPropiedadAdminRow>(`
-                SELECT p.id, p.identificador, p.alicuota, p.saldo_actual,
+                SELECT p.id, p.identificador, p.alicuota,
+                    COALESCE(p.saldo_actual, 0) AS saldo_actual,
                     u1.id as prop_id, u1.nombre as prop_nombre, u1.cedula as prop_cedula, u1.email as prop_email, u1.telefono as prop_telefono,
                     u2.id as inq_id, u2.nombre as inq_nombre, u2.cedula as inq_cedula, u2.email as inq_email, u2.telefono as inq_telefono,
                     COALESCE(up2.acceso_portal, true) as inq_acceso_portal
-                FROM propiedades p 
+                FROM propiedades p
                 LEFT JOIN usuarios_propiedades up1 ON p.id = up1.propiedad_id AND up1.rol = 'Propietario' LEFT JOIN users u1 ON up1.user_id = u1.id 
                 LEFT JOIN usuarios_propiedades up2 ON p.id = up2.propiedad_id AND up2.rol = 'Inquilino' LEFT JOIN users u2 ON up2.user_id = u2.id
                 WHERE p.condominio_id = $1 ORDER BY p.identificador ASC
             `, [condominioId]);
-            res.json({ status: 'success', propiedades: r.rows });
+            const gastosRes = await pool.query<ICountRow>('SELECT COUNT(*)::text AS count FROM gastos WHERE condominio_id = $1', [condominioId]);
+            const totalGastos = parseInt(gastosRes.rows[0]?.count || '0', 10) || 0;
+            res.json({
+                status: 'success',
+                propiedades: r.rows,
+                can_delete_all: totalGastos === 0
+            });
         } catch (err: unknown) { const error = asError(err); res.status(500).json({ error: error.message }); }
+    });
+
+    app.delete('/propiedades-admin/eliminar-todos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const condominioId = await getCondominioIdByAdmin(user.id);
+            if (!condominioId) {
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
+
+            const gastosRes = await pool.query<ICountRow>('SELECT COUNT(*)::text AS count FROM gastos WHERE condominio_id = $1', [condominioId]);
+            const totalGastos = parseInt(gastosRes.rows[0]?.count || '0', 10) || 0;
+            if (totalGastos > 0) {
+                return res.status(400).json({ error: 'No se puede eliminar inmuebles porque ya existen gastos cargados en el sistema.' });
+            }
+
+            await pool.query('BEGIN');
+
+            await pool.query(
+                `DELETE FROM pagos p
+                 USING recibos r, propiedades pr
+                 WHERE p.recibo_id = r.id
+                   AND r.propiedad_id = pr.id
+                   AND pr.condominio_id = $1`,
+                [condominioId]
+            );
+
+            await pool.query(
+                `DELETE FROM pagos p
+                 USING propiedades pr
+                 WHERE p.propiedad_id = pr.id
+                   AND pr.condominio_id = $1`,
+                [condominioId]
+            );
+
+            await pool.query(
+                `DELETE FROM recibos r
+                 USING propiedades pr
+                 WHERE r.propiedad_id = pr.id
+                   AND pr.condominio_id = $1`,
+                [condominioId]
+            );
+
+            await pool.query(
+                `DELETE FROM historial_saldos_inmuebles
+                 WHERE propiedad_id IN (SELECT id FROM propiedades WHERE condominio_id = $1)`,
+                [condominioId]
+            );
+
+            await pool.query(
+                `DELETE FROM usuarios_propiedades
+                 WHERE propiedad_id IN (SELECT id FROM propiedades WHERE condominio_id = $1)`,
+                [condominioId]
+            );
+
+            await pool.query(
+                `DELETE FROM propiedades_zonas
+                 WHERE propiedad_id IN (SELECT id FROM propiedades WHERE condominio_id = $1)`,
+                [condominioId]
+            );
+
+            const deletedRes = await pool.query<ICountRow>(
+                `WITH deleted AS (
+                    DELETE FROM propiedades
+                    WHERE condominio_id = $1
+                    RETURNING id
+                 )
+                 SELECT COUNT(*)::text AS count FROM deleted`,
+                [condominioId]
+            );
+
+            await pool.query('COMMIT');
+
+            const totalEliminados = parseInt(deletedRes.rows[0]?.count || '0', 10) || 0;
+            res.json({ status: 'success', message: `Se eliminaron ${totalEliminados} inmuebles.` });
+        } catch (err: unknown) {
+            const error = asError(err);
+            await pool.query('ROLLBACK');
+            res.status(500).json({ error: error.message });
+        }
     });
 
     // 2. ESTADO DE CUENTA
@@ -196,6 +307,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     'RECIBO' as tipo,
                     id as ref_id,
                     CASE
+                      WHEN COALESCE(n8n_pdf_url, '') LIKE 'IMPORTACION_SILENCIOSA:%'
+                        THEN regexp_replace(COALESCE(n8n_pdf_url, ''), '^IMPORTACION_SILENCIOSA:\\s*', '')
                       WHEN estado = 'Pagado' THEN 'Recibo: ' || mes_cobro
                       ELSE 'Aviso de Cobro: ' || mes_cobro
                     END as concepto,
@@ -259,104 +372,222 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         }
     });
 
-    // ðŸ’¡ 3. NUEVA RUTA: CARGA MASIVA DE INMUEBLES POR LOTE (EXCEL)
+    // 3. CARGA MASIVA BIMODAL (PROPIEDADES + DEUDAS) CON IMPORTACION SILENCIOSA
     app.post('/propiedades-admin/lote', verifyToken, async (req: Request<{}, unknown, PropiedadesLoteBody>, res: Response, _next: NextFunction) => {
-        const { inmuebles } = req.body;
+        const propiedades = Array.isArray(req.body?.propiedades) ? req.body.propiedades : [];
+        const deudas = Array.isArray(req.body?.deudas) ? req.body.deudas : [];
 
-        if (!inmuebles || !Array.isArray(inmuebles) || inmuebles.length === 0) {
-            return res.status(400).json({ error: 'No se enviaron datos vÃ¡lidos.' });
+        if (propiedades.length === 0) {
+            return res.status(400).json({ error: 'No se enviaron propiedades válidas.' });
         }
 
         try {
             const user = asAuthUser(req.user);
             await pool.query('BEGIN');
+
             const condoId = await getCondominioIdByAdmin(user.id);
             if (!condoId) {
-                await pool.query('ROLLBACK');
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+                throw new Error('No existe un condominio asociado a este usuario administrador.');
             }
-
-            const alicuotasLote: number[] = inmuebles.map((item) => {
+            // 1) Regla de alícuotas no-mixtas.
+            const alicuotasLote: number[] = propiedades.map((item) => {
                 const alicuotaRaw = String(item?.alicuota ?? '0').replace(',', '.').trim();
                 const alicuotaNum = parseFloat(alicuotaRaw);
                 return Number.isNaN(alicuotaNum) ? 0 : alicuotaNum;
             });
-
             const allAlicuotasCero = alicuotasLote.every((alicuota: number) => alicuota === 0);
             const allAlicuotasMayorCero = alicuotasLote.every((alicuota: number) => alicuota > 0);
-
             if (!allAlicuotasCero && !allAlicuotasMayorCero) {
-                await pool.query('ROLLBACK');
-                return res.status(400).json({
-                    error: 'El archivo Excel contiene alícuotas mixtas. O todos los inmuebles tienen alícuota 0 (partes iguales), o todos deben tener una alícuota mayor a 0.'
-                });
+                throw new Error('El archivo Excel contiene alícuotas mixtas. O todos los inmuebles tienen alícuota 0 (partes iguales), o todos deben tener una alícuota mayor a 0.');
             }
 
-            for (const item of inmuebles) {
-                const alicuotaNum = parseFloat((item.alicuota || '0').toString().replace(',', '.')) || 0;
-                const saldoBase = parseFloat((item.saldo_inicial || '0').toString().replace(',', '.')) || 0;
-                const cedulaFmt = (item.cedula || '').toUpperCase().replace(/[^VEJPG0-9]/g, '');
+            if (allAlicuotasCero) {
+                await pool.query("UPDATE condominios SET metodo_division = 'Partes Iguales' WHERE id = $1", [condoId]);
+            }
 
-                let userId: number | null = null;
-                if (cedulaFmt && item.nombre) {
-                    let userRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [cedulaFmt]);
-                    if (userRes.rows.length === 0) {
-                        userRes = await pool.query<IUserIdRow>(
-                            'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-                            [cedulaFmt, item.nombre, item.correo || null, item.telefono || null, cedulaFmt]
-                        );
-                    } else {
-                        await pool.query('UPDATE users SET nombre = $1 WHERE cedula = $2', [item.nombre, cedulaFmt]);
-                    }
-                    userId = userRes.rows[0].id;
-                }
+            // 2) Bulk INSERT de propiedades + RETURNING id, identificador.
+            const propValues: unknown[] = [];
+            const propPlaceholders: string[] = [];
+            propiedades.forEach((item: InmuebleLote, idx: number) => {
+                const offset = idx * 4;
+                const identificador = String(item.identificador || '').trim();
+                const alicuotaNum = parseFloat(String(item.alicuota ?? '0').replace(',', '.')) || 0;
+                const saldoBase = parseFloat(String(item.saldo_inicial ?? '0').replace(',', '.')) || 0;
+                propValues.push(condoId, identificador, alicuotaNum, saldoBase);
+                propPlaceholders.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4})`);
+            });
 
-                const propRes = await pool.query<IPropiedadIdRow>(
-                    'INSERT INTO propiedades (condominio_id, identificador, alicuota, saldo_actual) VALUES ($1, $2, $3, $4) RETURNING id',
-                    [condoId, item.identificador, alicuotaNum, saldoBase]
+            const insertPropsRes = await pool.query<IPropiedadInsertedRow>(
+                `
+                INSERT INTO propiedades (condominio_id, identificador, alicuota, saldo_actual)
+                VALUES ${propPlaceholders.join(', ')}
+                RETURNING id, identificador
+                `,
+                propValues
+            );
+
+            // 3) Mapa identificador -> propiedad_id.
+            const propiedadIdByIdentificador = new Map<string, number>();
+            insertPropsRes.rows.forEach((row) => {
+                const key = String(row.identificador || '').trim().toLowerCase();
+                propiedadIdByIdentificador.set(key, row.id);
+            });
+
+            // Mantener traza de saldo inicial del inmueble.
+            for (const item of propiedades) {
+                const saldoBase = parseFloat(String(item.saldo_inicial ?? '0').replace(',', '.')) || 0;
+                if (saldoBase === 0) continue;
+                const key = String(item.identificador || '').trim().toLowerCase();
+                const propiedadId = propiedadIdByIdentificador.get(key);
+                if (!propiedadId) continue;
+                const tipoSaldo = saldoBase > 0 ? 'DEUDA' : 'FAVOR';
+                await pool.query(
+                    'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
+                    [propiedadId, 'SALDO_INICIAL', Math.abs(saldoBase), `Carga masiva Excel (${tipoSaldo})`]
                 );
-                const nuevaPropId = propRes.rows[0].id;
+            }
 
-                if (saldoBase !== 0) {
-                    const tipoSaldo = saldoBase > 0 ? 'DEUDA' : 'FAVOR';
+            // Vincular propietario (nombre + cedula) por cada inmueble cargado.
+            for (const item of propiedades) {
+                const key = String(item.identificador || '').trim().toLowerCase();
+                const propiedadId = propiedadIdByIdentificador.get(key);
+                if (!propiedadId) continue;
+
+                const cedula = String(item.cedula || '').trim();
+                const nombre = String(item.nombre || '').trim();
+                if (!cedula || !nombre) continue;
+
+                const correoRaw = String(item.correo || '').trim().toLowerCase();
+                const telefono = String(item.telefono || '').trim();
+                const correo = isValidEmail(correoRaw) && correoRaw ? correoRaw : null;
+                const telefonoFinal = telefono || null;
+
+                let userId: number;
+                const userRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1 LIMIT 1', [cedula]);
+                if (userRes.rows.length === 0) {
+                    const insertUser = await pool.query<IUserIdRow>(
+                        'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+                        [cedula, nombre, correo, telefonoFinal, cedula]
+                    );
+                    userId = insertUser.rows[0].id;
+                } else {
+                    userId = userRes.rows[0].id;
                     await pool.query(
-                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
-                        [nuevaPropId, 'SALDO_INICIAL', Math.abs(saldoBase), `Carga masiva Excel (${tipoSaldo})`]
+                        'UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE id = $4',
+                        [nombre, correo, telefonoFinal, userId]
                     );
                 }
 
-                if (userId) {
-                    await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, nuevaPropId, 'Propietario']);
+                const linkUpdate = await pool.query(
+                    'UPDATE usuarios_propiedades SET user_id = $1 WHERE propiedad_id = $2 AND rol = $3',
+                    [userId, propiedadId, 'Propietario']
+                );
+                if (linkUpdate.rowCount === 0) {
+                    await pool.query(
+                        'INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)',
+                        [userId, propiedadId, 'Propietario']
+                    );
                 }
             }
 
-            // Aplicamos el cambio de mÃ©todo de divisiÃ³n dentro de la misma transacciÃ³n del lote.
-            if (allAlicuotasCero) {
-                await pool.query(
-                    "UPDATE condominios SET metodo_division = 'Partes Iguales' WHERE id = $1",
-                    [condoId]
-                );
+            // 4) Aplicar saldo importado por inmueble (deuda/favor/al dia) desde la hoja saldos_bases.
+            const saldoPorPropiedad = new Map<number, number>();
+            for (const deuda of deudas) {
+                const key = String(deuda.identificador || '').trim().toLowerCase();
+                const propiedadId = propiedadIdByIdentificador.get(key);
+                if (!propiedadId) continue;
+
+                const saldoRaw = String(deuda.saldo ?? '').trim();
+                if (saldoRaw !== '') {
+                    const saldoNum = parseFloat(saldoRaw.replace(',', '.'));
+                    if (!Number.isNaN(saldoNum) && saldoNum !== 0) {
+                        saldoPorPropiedad.set(propiedadId, saldoNum);
+                    }
+                }
             }
 
+            for (const [propiedadId, saldo] of saldoPorPropiedad.entries()) {
+                await pool.query('UPDATE propiedades SET saldo_actual = $1 WHERE id = $2', [saldo, propiedadId]);
+                if (saldo !== 0) {
+                    const tipoSaldo = saldo > 0 ? 'DEUDA' : 'FAVOR';
+                    await pool.query(
+                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
+                        [propiedadId, 'SALDO_INICIAL', Math.abs(saldo), `Importacion Estado_Cuenta (${tipoSaldo})`]
+                    );
+                }
+            }
+
+            // 5) Importacion silenciosa:
+            // no se generan recibos historicos ni avisos de cobro, solo se ajusta saldo inicial/importado.
+
             await pool.query('COMMIT');
-            res.json({ status: 'success', message: `${inmuebles.length} inmuebles cargados correctamente.` });
+            res.json({
+                status: 'success',
+                message: `${propiedades.length} inmuebles cargados correctamente (sin generar avisos de cobro).`,
+                propiedades_insertadas: propiedades.length,
+                deudas_procesadas: 0
+            });
         } catch (err: unknown) {
             const error = asPgError(err);
             await pool.query('ROLLBACK');
-            if (error.code === '23505' && error.message.includes('identificador')) return res.status(400).json({ error: 'Uno de los inmuebles (Apto/Casa) del archivo ya existe en el sistema.' });
-            if (error.code === '23505' && error.message.includes('email')) return res.status(400).json({ error: 'Uno de los correos en el archivo ya estÃ¡ en uso.' });
+            if (error.code === '23505' && error.message.includes('identificador')) {
+                return res.status(400).json({ error: 'Uno de los inmuebles (Apto/Casa) del archivo ya existe en el sistema.' });
+            }
+            if (error.code === '23505' && error.message.includes('email')) {
+                return res.status(400).json({ error: 'Uno de los correos en el archivo ya está en uso.' });
+            }
+            if (error.message.includes('alícuotas mixtas')) {
+                return res.status(400).json({ error: error.message });
+            }
             res.status(500).json({ error: error.message });
         }
     });
 
     // 4. CREAR PROPIEDAD INDIVIDUAL
     app.post('/propiedades-admin', verifyToken, async (req: Request<{}, unknown, PropiedadAdminBody>, res: Response, _next: NextFunction) => {
-        const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password, inq_permitir_acceso, monto_saldo_inicial } = req.body;
+        const {
+            identificador,
+            alicuota,
+            zona_id,
+            prop_nombre,
+            prop_cedula,
+            prop_email,
+            prop_telefono,
+            prop_password,
+            tiene_inquilino,
+            inq_nombre,
+            inq_cedula,
+            inq_email,
+            inq_telefono,
+            inq_password,
+            inq_permitir_acceso,
+            monto_saldo_inicial,
+            tiene_deuda_inicial,
+            deudas_iniciales
+        } = req.body;
         const ownerEmail = (prop_email || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
         const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
-
-        const saldoBase = parseFloat((monto_saldo_inicial || '0').toString().replace(',', '.')) || 0;
+        const parseMoney = (value: string | number | undefined | null): number => {
+            const parsed = parseFloat(String(value ?? '0').replace(',', '.'));
+            return Number.isFinite(parsed) ? parsed : 0;
+        };
+        const deudaItems = Array.isArray(deudas_iniciales) ? deudas_iniciales : [];
+        const deudaItemsNormalizados = deudaItems.map((item) => {
+            const montoDeuda = Math.max(parseMoney(item?.monto_deuda), 0);
+            const montoAbono = Math.max(parseMoney(item?.monto_abono), 0);
+            const montoNeto = Math.max(montoDeuda - montoAbono, 0);
+            return {
+                concepto: String(item?.concepto || '').trim(),
+                montoDeuda,
+                montoAbono,
+                montoNeto
+            };
+        }).filter((item) => item.montoDeuda > 0 || item.montoAbono > 0 || item.concepto);
+        const usarDeudaInicial = Boolean(tiene_deuda_inicial) && deudaItemsNormalizados.length > 0;
+        const saldoBase = usarDeudaInicial
+            ? deudaItemsNormalizados.reduce((acc, item) => acc + item.montoNeto, 0)
+            : parseMoney(monto_saldo_inicial);
         if (!isValidEmail(ownerEmail)) return res.status(400).json({ error: 'Email del propietario invÃ¡lido.' });
         if (!isValidEmail(tenantEmail)) return res.status(400).json({ error: 'Email del inquilino invÃ¡lido.' });
 
@@ -384,7 +615,17 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             const propRes = await pool.query<IPropiedadIdRow>('INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual) VALUES ($1, $2, $3, $4, $5) RETURNING id', [condominioId, identificador, alicuotaNum, zona_id || null, saldoBase]);
             const nuevaPropId = propRes.rows[0].id;
 
-            if (saldoBase !== 0) {
+            if (usarDeudaInicial) {
+                for (const item of deudaItemsNormalizados) {
+                    if (item.montoNeto <= 0) continue;
+                    const concepto = item.concepto || 'Deuda anterior importada';
+                    const nota = `Saldo inicial cargado al crear el inmueble (DEUDA) - ${concepto} | Monto deuda: ${item.montoDeuda.toFixed(2)} | Abono: ${item.montoAbono.toFixed(2)}`;
+                    await pool.query(
+                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
+                        [nuevaPropId, 'SALDO_INICIAL', item.montoNeto, nota]
+                    );
+                }
+            } else if (saldoBase !== 0) {
                 const tipoSaldo = saldoBase > 0 ? 'DEUDA' : 'FAVOR';
                 await pool.query('INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)', [nuevaPropId, 'SALDO_INICIAL', Math.abs(saldoBase), `Saldo inicial cargado al crear el inmueble (${tipoSaldo})`]);
             }
@@ -490,4 +731,3 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 };
 
 module.exports = { registerPropiedadesRoutes };
-
