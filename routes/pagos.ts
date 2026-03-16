@@ -85,6 +85,37 @@ interface IPagoPendienteRow {
     estado: string;
 }
 
+interface IPagoFullRow {
+    id: number;
+    monto_usd: string | number;
+    monto_origen: string | number | null;
+    tasa_cambio: string | number | null;
+    propiedad_id: number;
+    estado: string;
+    cuenta_bancaria_id: number | null;
+    moneda: string | null;
+    referencia: string | null;
+}
+
+interface IPagoPendienteAdminRow {
+    id: number;
+    propiedad_id: number;
+    recibo_id: number | null;
+    identificador: string;
+    propietario: string | null;
+    monto_origen: string | number | null;
+    monto_usd: string | number | null;
+    moneda: string | null;
+    referencia: string | null;
+    fecha_pago: string | Date | null;
+    estado: string;
+    nota: string | null;
+}
+
+interface IRechazarPagoBody {
+    nota?: string | null;
+}
+
 interface AbonoFondosInput {
     cuentaId: string | number;
     montoDistribuibleUsd: number;
@@ -249,6 +280,38 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         } catch (_err) {
             return { ...optionalCols, propiedad_id: false };
         }
+    };
+
+    const isAdminUser = (user: AuthUser): boolean => ['J', 'G'].includes(String(user.cedula || '').charAt(0).toUpperCase());
+
+    const userHasPropiedadPortalAccess = async (userId: number, propiedadId: number): Promise<boolean> => {
+        const r = await pool.query<{ ok: number }>(
+            `
+              SELECT 1 AS ok
+              FROM usuarios_propiedades up
+              WHERE up.user_id = $1
+                AND up.propiedad_id = $2
+                AND COALESCE(up.acceso_portal, true) = true
+              LIMIT 1
+            `,
+            [userId, propiedadId]
+        );
+        return r.rows.length > 0;
+    };
+
+    const adminHasPropiedadAccess = async (adminUserId: number, propiedadId: number): Promise<boolean> => {
+        const r = await pool.query<{ ok: number }>(
+            `
+              SELECT 1 AS ok
+              FROM propiedades p
+              INNER JOIN condominios c ON c.id = p.condominio_id
+              WHERE p.id = $1
+                AND c.admin_user_id = $2
+              LIMIT 1
+            `,
+            [propiedadId, adminUserId]
+        );
+        return r.rows.length > 0;
     };
 
     const parseMesCobroToYyyyMm = (mesCobro: unknown): string | null => {
@@ -523,11 +586,92 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         }
     };
 
+    const aplicarPagoEnCascada = async (client: QueryClient, pago: IPagoFullRow): Promise<void> => {
+        const montoUsd = round2(parseFloat(String(pago.monto_usd || 0)));
+        if (montoUsd <= 0) return;
+
+        const propiedadId = pago.propiedad_id;
+        await client.query('UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2', [montoUsd, propiedadId]);
+
+        let dineroRestante = montoUsd;
+        let montoDistribuibleFondos = 0;
+        let montoExtraTotalUsd = 0;
+
+        const recibosPendientes = await client.query<IReciboRow>(
+            "SELECT * FROM recibos WHERE propiedad_id = $1 AND estado != 'Pagado' ORDER BY fecha_emision ASC, id ASC",
+            [propiedadId]
+        );
+
+        for (const rec of recibosPendientes.rows) {
+            if (dineroRestante <= 0) break;
+
+            const deudaRecibo = round2(parseFloat(String(rec.monto_usd || 0)) - parseFloat(String(rec.monto_pagado_usd || 0)));
+            if (deudaRecibo <= 0) {
+                await client.query("UPDATE recibos SET estado = 'Pagado' WHERE id = $1", [rec.id]);
+                continue;
+            }
+
+            const montoAplicadoRecibo = Math.min(dineroRestante, deudaRecibo);
+
+            if (dineroRestante >= deudaRecibo) {
+                await client.query("UPDATE recibos SET monto_pagado_usd = monto_usd, estado = 'Pagado' WHERE id = $1", [rec.id]);
+                dineroRestante = round2(dineroRestante - deudaRecibo);
+            } else {
+                await client.query(
+                    "UPDATE recibos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1, estado = 'Abonado' WHERE id = $2",
+                    [dineroRestante, rec.id]
+                );
+                dineroRestante = 0;
+            }
+
+            const { montoDistribuibleUsd, montoExtraUsd } = await imputarReciboEnGastos(client, rec, montoAplicadoRecibo);
+            montoDistribuibleFondos = round2(montoDistribuibleFondos + montoDistribuibleUsd);
+            montoExtraTotalUsd = round2(montoExtraTotalUsd + montoExtraUsd);
+        }
+
+        if (dineroRestante > 0) {
+            montoDistribuibleFondos = round2(montoDistribuibleFondos + dineroRestante);
+        }
+
+        const monedaPago = String(pago.moneda || 'BS').toUpperCase();
+        const tasaNum = monedaPago === 'BS' ? (parseFloat(String(pago.tasa_cambio || 0)) || 1) : 1;
+        const montoOrigenNum = parseFloat(String(pago.monto_origen || 0)) || 0;
+        const montoDistribuibleOrigen = monedaPago === 'BS'
+            ? round2(Math.max(0, montoOrigenNum - round2(montoExtraTotalUsd * tasaNum)))
+            : montoDistribuibleFondos;
+
+        if (pago.cuenta_bancaria_id && montoDistribuibleFondos > 0) {
+            await distribuirAbonoEnFondos(client, {
+                cuentaId: pago.cuenta_bancaria_id,
+                montoDistribuibleUsd: montoDistribuibleFondos,
+                montoDistribuibleOrigen,
+                monedaPago,
+                tasaNum,
+                pagoId: pago.id,
+                referencia: pago.referencia || null,
+            });
+        }
+    };
+
     // Ruta de administradores para registrar y aprobar pagos en cascada al instante.
     app.post('/pagos-admin', verifyToken, async (req: Request<{}, unknown, PagosAdminBody>, res: Response, _next: NextFunction) => {
         const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, moneda } = req.body;
 
         try {
+            const user = asAuthUser(req.user);
+            if (!isAdminUser(user)) {
+                return res.status(403).json({ status: 'error', error: 'Solo administradores pueden registrar pagos directos.' });
+            }
+
+            const propiedadIdNum = parseInt(String(propiedad_id), 10);
+            if (!Number.isFinite(propiedadIdNum) || propiedadIdNum <= 0) {
+                return res.status(400).json({ status: 'error', error: 'propiedad_id invalido.' });
+            }
+            const hasAccess = await adminHasPropiedadAccess(user.id, propiedadIdNum);
+            if (!hasAccess) {
+                return res.status(403).json({ status: 'error', error: 'No autorizado para este inmueble.' });
+            }
+
             await pool.query('BEGIN');
 
             // 1. Calculamos montos normalizados.
@@ -664,54 +808,181 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         }
     });
 
+    // Ruta de propietarios: registra el pago en estado PendienteAprobacion (no afecta saldos hasta aprobar).
+    app.post('/pagos-propietario', verifyToken, async (req: Request<{}, unknown, PagosAdminBody>, res: Response, _next: NextFunction) => {
+        const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, moneda, recibo_id } = req.body as PagosAdminBody & { recibo_id?: number | string | null };
+
+        try {
+            const user = asAuthUser(req.user);
+            const propiedadIdNum = parseInt(String(propiedad_id), 10);
+            if (!Number.isFinite(propiedadIdNum) || propiedadIdNum <= 0) {
+                return res.status(400).json({ status: 'error', error: 'propiedad_id invalido.' });
+            }
+
+            const hasAccess = await userHasPropiedadPortalAccess(user.id, propiedadIdNum);
+            if (!hasAccess) {
+                return res.status(403).json({ status: 'error', error: 'No autorizado para registrar pagos en este inmueble.' });
+            }
+
+            await pool.query('BEGIN');
+
+            const monedaFinal = moneda || 'BS';
+            const montoOrigenNum = parseLocaleNumber(monto_origen);
+            const tasaNum = monedaFinal === 'BS' ? (parseLocaleNumber(tasa_cambio) || 1) : 1;
+            const montoUsd = monedaFinal === 'BS' ? round2(montoOrigenNum / tasaNum) : round2(montoOrigenNum);
+            const fechaPagoSafe = toIsoDate(fecha_pago || new Date(), 'fecha_pago');
+
+            const optionalCols = await getPagosColumns();
+            const bancoOrigenSafe = (banco_origen || '').trim();
+            const cedulaOrigenSafe = (cedula_origen || '').trim();
+            const notaBase = (nota || '').trim();
+            const notaOrigenPartes: string[] = [];
+            if (bancoOrigenSafe) notaOrigenPartes.push(`Banco origen: ${bancoOrigenSafe}`);
+            if (cedulaOrigenSafe) notaOrigenPartes.push(`Cedula origen: ${cedulaOrigenSafe}`);
+            const notaConOrigen = [notaBase, ...notaOrigenPartes].filter(Boolean).join(' | ');
+
+            const reciboIdNum = parseInt(String(recibo_id ?? ''), 10);
+            const reciboSafe = Number.isFinite(reciboIdNum) && reciboIdNum > 0 ? reciboIdNum : null;
+
+            const insertColumns = [
+                'propiedad_id',
+                'recibo_id',
+                'cuenta_bancaria_id',
+                'monto_origen',
+                'tasa_cambio',
+                'monto_usd',
+                'moneda',
+                'referencia',
+                'fecha_pago',
+                'metodo',
+                'estado',
+            ];
+            const insertValues: unknown[] = [
+                propiedadIdNum,
+                reciboSafe,
+                cuenta_id,
+                montoOrigenNum,
+                monedaFinal === 'BS' ? tasaNum : null,
+                montoUsd,
+                monedaFinal,
+                referencia || null,
+                fechaPagoSafe,
+                'Transferencia',
+                'PendienteAprobacion',
+            ];
+
+            if (optionalCols.nota) {
+                insertColumns.push('nota');
+                insertValues.push(notaConOrigen || null);
+            }
+            if (optionalCols.cedula_origen) {
+                insertColumns.push('cedula_origen');
+                insertValues.push(cedulaOrigenSafe || null);
+            }
+            if (optionalCols.banco_origen) {
+                insertColumns.push('banco_origen');
+                insertValues.push(bancoOrigenSafe || null);
+            }
+
+            const placeholders = insertValues.map((_, i) => `$${i + 1}`).join(', ');
+            await pool.query(
+                `INSERT INTO pagos (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+                insertValues
+            );
+
+            await pool.query('COMMIT');
+            return res.json({ status: 'success', message: 'Pago enviado para aprobacion de la junta.' });
+        } catch (err: unknown) {
+            const error = asError(err);
+            await pool.query('ROLLBACK');
+            return res.status(500).json({ status: 'error', error: error.message });
+        }
+    });
+
+    // Pagos pendientes de aprobacion para la junta (opcionalmente filtrado por propiedad).
+    app.get('/pagos/pendientes-aprobacion', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            if (!isAdminUser(user)) {
+                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden revisar pagos pendientes.' });
+            }
+
+            const propiedadIdRaw = parseInt(String(req.query.propiedad_id || ''), 10);
+            const whereByPropiedad = Number.isFinite(propiedadIdRaw) && propiedadIdRaw > 0 ? 'AND p.id = $2' : '';
+            const params: Array<number> = [user.id];
+            if (whereByPropiedad) params.push(propiedadIdRaw);
+
+            const r = await pool.query<IPagoPendienteAdminRow>(
+                `
+                  SELECT
+                    pa.id,
+                    pa.propiedad_id,
+                    pa.recibo_id,
+                    p.identificador,
+                    u.nombre AS propietario,
+                    pa.monto_origen,
+                    pa.monto_usd,
+                    pa.moneda,
+                    pa.referencia,
+                    pa.fecha_pago,
+                    pa.estado,
+                    pa.nota
+                  FROM pagos pa
+                  INNER JOIN propiedades p ON p.id = pa.propiedad_id
+                  INNER JOIN condominios c ON c.id = p.condominio_id
+                  LEFT JOIN LATERAL (
+                    SELECT u1.nombre
+                    FROM usuarios_propiedades up1
+                    INNER JOIN users u1 ON u1.id = up1.user_id
+                    WHERE up1.propiedad_id = p.id
+                    ORDER BY
+                      CASE
+                        WHEN LOWER(COALESCE(up1.rol, '')) IN ('propietario', 'owner') THEN 0
+                        ELSE 1
+                      END,
+                      up1.id ASC
+                    LIMIT 1
+                  ) u ON true
+                  WHERE c.admin_user_id = $1
+                    AND pa.estado = 'PendienteAprobacion'
+                    ${whereByPropiedad}
+                  ORDER BY COALESCE(pa.created_at, pa.fecha_pago) DESC, pa.id DESC
+                `,
+                params
+            );
+
+            return res.json({ status: 'success', pagos: r.rows });
+        } catch (err: unknown) {
+            return res.status(500).json({ status: 'error', message: asError(err).message });
+        }
+    });
+
     // Validacion manual de pagos pendientes (FIFO por recibos de la propiedad).
     app.post('/pagos/:id/validar', verifyToken, async (req: Request<PagoValidarParams>, res: Response, _next: NextFunction) => {
         const pagoId = asString(req.params.id);
 
         try {
+            const user = asAuthUser(req.user);
+            if (!isAdminUser(user)) {
+                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden validar pagos.' });
+            }
+
             await pool.query('BEGIN');
 
-            const pagoRes = await pool.query<IPagoPendienteRow>('SELECT * FROM pagos WHERE id = $1 AND estado = $2', [pagoId, 'Pendiente']);
+            const pagoRes = await pool.query<IPagoFullRow>(
+                "SELECT id, monto_usd, monto_origen, tasa_cambio, propiedad_id, estado, cuenta_bancaria_id, moneda, referencia FROM pagos WHERE id = $1 AND estado IN ('Pendiente', 'PendienteAprobacion')",
+                [pagoId]
+            );
             if (pagoRes.rows.length === 0) throw new Error('Pago no encontrado o ya fue procesado.');
 
             const pago = pagoRes.rows[0];
-            const montoAprobado = round2(parseFloat(String(pago.monto_usd || 0)));
-            const propiedadId = pago.propiedad_id;
+            const hasAccess = await adminHasPropiedadAccess(user.id, pago.propiedad_id);
+            if (!hasAccess) {
+                throw new Error('No autorizado para aprobar pagos de otro condominio.');
+            }
 
             await pool.query("UPDATE pagos SET estado = 'Validado' WHERE id = $1", [pagoId]);
-            await pool.query('UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2', [montoAprobado, propiedadId]);
-
-            let dineroRestante = montoAprobado;
-            const recibosPendientes = await pool.query<IReciboRow>(
-                "SELECT * FROM recibos WHERE propiedad_id = $1 AND estado != 'Pagado' ORDER BY fecha_emision ASC, id ASC",
-                [propiedadId]
-            );
-
-            for (const rec of recibosPendientes.rows) {
-                if (dineroRestante <= 0) break;
-
-                const deudaRecibo = round2(parseFloat(String(rec.monto_usd || 0)) - parseFloat(String(rec.monto_pagado_usd || 0)));
-                if (deudaRecibo <= 0) {
-                    await pool.query("UPDATE recibos SET estado = 'Pagado' WHERE id = $1", [rec.id]);
-                    continue;
-                }
-
-                const montoAplicadoRecibo = Math.min(dineroRestante, deudaRecibo);
-
-                if (dineroRestante >= deudaRecibo) {
-                    await pool.query("UPDATE recibos SET monto_pagado_usd = monto_usd, estado = 'Pagado' WHERE id = $1", [rec.id]);
-                    dineroRestante = round2(dineroRestante - deudaRecibo);
-                } else {
-                    await pool.query(
-                        "UPDATE recibos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1, estado = 'Abonado' WHERE id = $2",
-                        [dineroRestante, rec.id]
-                    );
-                    dineroRestante = 0;
-                }
-
-                // Tambien actualizamos el control de pago por gasto en validaciones manuales.
-                await imputarReciboEnGastos(pool, rec, montoAplicadoRecibo);
-            }
+            await aplicarPagoEnCascada(pool, pago);
 
             await pool.query('COMMIT');
             res.json({ status: 'success', message: 'Pago aprobado y saldos distribuidos en cascada correctamente.' });
@@ -719,6 +990,49 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const error = asError(err);
             await pool.query('ROLLBACK');
             res.status(500).json({ error: error.message });
+        }
+    });
+
+    app.post('/pagos/:id/rechazar', verifyToken, async (req: Request<PagoValidarParams, unknown, IRechazarPagoBody>, res: Response, _next: NextFunction) => {
+        const pagoId = asString(req.params.id);
+        const notaRechazo = String(req.body?.nota || '').trim();
+
+        if (!notaRechazo) {
+            return res.status(400).json({ status: 'error', message: 'Debe indicar una nota de rechazo.' });
+        }
+
+        try {
+            const user = asAuthUser(req.user);
+            if (!isAdminUser(user)) {
+                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden rechazar pagos.' });
+            }
+
+            const pagoRes = await pool.query<IPagoFullRow>(
+                "SELECT id, monto_usd, monto_origen, tasa_cambio, propiedad_id, estado, cuenta_bancaria_id, moneda, referencia FROM pagos WHERE id = $1 AND estado = 'PendienteAprobacion'",
+                [pagoId]
+            );
+            if (pagoRes.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'Pago no encontrado o ya procesado.' });
+            }
+            const pago = pagoRes.rows[0];
+            const hasAccess = await adminHasPropiedadAccess(user.id, pago.propiedad_id);
+            if (!hasAccess) {
+                return res.status(403).json({ status: 'error', message: 'No autorizado para rechazar este pago.' });
+            }
+
+            const optionalCols = await getPagosColumns();
+            if (optionalCols.nota) {
+                await pool.query(
+                    "UPDATE pagos SET estado = 'Rechazado', nota = CONCAT(COALESCE(NULLIF(TRIM(nota), ''), ''), CASE WHEN COALESCE(NULLIF(TRIM(nota), ''), '') = '' THEN '' ELSE ' | ' END, 'Rechazado: ', $2::text) WHERE id = $1",
+                    [pagoId, notaRechazo]
+                );
+            } else {
+                await pool.query("UPDATE pagos SET estado = 'Rechazado' WHERE id = $1", [pagoId]);
+            }
+
+            return res.json({ status: 'success', message: 'Pago rechazado correctamente.' });
+        } catch (err: unknown) {
+            return res.status(500).json({ status: 'error', message: asError(err).message });
         }
     });
 

@@ -103,6 +103,7 @@ const { registerFondosRoutes }: { registerFondosRoutes: FondosRoutesRegistrar } 
 const { registerPagosRoutes }: { registerPagosRoutes: PagosRoutesRegistrar } = require('./routes/pagos');
 const { registerDashboardRoutes }: { registerDashboardRoutes: DashboardRoutesRegistrar } = require('./routes/dashboard');
 const perfilRoutes: import('express').Router = require('./routes/perfil');
+const propietarioRoutes: import('express').Router = require('./routes/propietario');
 
 const app: Application = express();
 const PORT: number = Number(process.env.PORT || 3000);
@@ -130,5 +131,6 @@ registerFondosRoutes(app, { pool, verifyToken, parseLocaleNumber });
 registerPagosRoutes(app, { pool, verifyToken, parseLocaleNumber, getPagosOptionalColumns });
 registerDashboardRoutes(app, { pool, verifyToken });
 app.use('/api/perfil', perfilRoutes);
+app.use('/api/propietario', propietarioRoutes);
 
 app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));

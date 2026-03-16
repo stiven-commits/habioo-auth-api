@@ -117,7 +117,16 @@ const registerRecibosRoutes = (app: Application, { pool, verifyToken }: AuthDepe
                  ) upi ON true
                  JOIN condominios c ON c.id = p.condominio_id
                  WHERE r.id = $1
-                   AND c.admin_user_id = $2
+                   AND (
+                     c.admin_user_id = $2
+                     OR EXISTS (
+                       SELECT 1
+                       FROM usuarios_propiedades up_perm
+                       WHERE up_perm.propiedad_id = p.id
+                         AND up_perm.user_id = $2
+                         AND COALESCE(up_perm.acceso_portal, true) = true
+                     )
+                   )
                  LIMIT 1`,
                 [reciboId, user.id]
             );

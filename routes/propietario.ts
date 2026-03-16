@@ -1,0 +1,426 @@
+import type { NextFunction, Request, Response } from 'express';
+import type { Pool } from 'pg';
+
+const express: typeof import('express') = require('express');
+const { pool }: { pool: Pool } = require('../config/db');
+const { verifyToken }: {
+  verifyToken: (req: Request, res: Response, next: NextFunction) => void | Promise<void>;
+} = require('../middleware/verifyToken');
+
+interface AuthUserPayload {
+  id: number;
+}
+
+interface ApiOk<T = Record<string, unknown>> {
+  status: 'success';
+  data?: T;
+  message?: string;
+}
+
+interface ApiErr {
+  status: 'error';
+  message: string;
+}
+
+type ApiRes<T = Record<string, unknown>> = ApiOk<T> | ApiErr;
+
+interface MisPropiedadesRow {
+  id_propiedad: number;
+  identificador: string;
+  nombre_condominio: string;
+  id_condominio: number;
+  saldo_actual: string | number | null;
+}
+
+interface GastoComunRow {
+  id: number;
+  condominio_id: number;
+  concepto: string;
+  monto_bs: string | number;
+  monto_usd: string | number;
+  total_cuotas: number;
+  fecha_gasto: string | Date;
+  nota: string | null;
+  clasificacion: string | null;
+}
+
+interface MisRecibosRow {
+  id: number;
+  propiedad_id: number;
+  mes_cobro: string;
+  monto_usd: string | number;
+  monto_pagado_usd: string | number;
+  estado: string;
+  fecha_emision: string | Date;
+  fecha_vencimiento: string | Date | null;
+}
+
+interface EstadoCuentaRow {
+  id: number;
+  fecha: string | Date;
+  tipo: string;
+  monto: string | number;
+  tasa_cambio: string | number | null;
+  nota: string | null;
+  referencia_id: number | null;
+  fondo_id: number;
+  fondo_nombre: string;
+  fondo_moneda: string | null;
+  cuenta_bancaria_id: number | null;
+  banco_nombre: string | null;
+  banco_apodo: string | null;
+}
+
+interface CuentaPrincipalRow {
+  id: number;
+  nombre_banco: string | null;
+  apodo: string | null;
+  tipo: string | null;
+  es_predeterminada: boolean | null;
+}
+
+interface NotificacionPagoRow {
+  id: number;
+  propiedad_id: number;
+  recibo_id: number | null;
+  referencia: string | null;
+  monto_origen: string | number | null;
+  monto_usd: string | number | null;
+  estado: string;
+  fecha_pago: string | Date | null;
+  created_at: string | Date | null;
+  nota: string | null;
+  identificador: string;
+  nombre_condominio: string;
+}
+
+const router = express.Router();
+
+const getAuthUser = (req: Request): AuthUserPayload | null => {
+  const authUser = req.user as AuthUserPayload | undefined;
+  if (!authUser || typeof authUser.id !== 'number') return null;
+  return authUser;
+};
+
+const toPositiveInt = (value: unknown): number | null => {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+};
+
+const userHasCondominioAccess = async (userId: number, condominioId: number): Promise<boolean> => {
+  const result = await pool.query<{ exists: number }>(
+    `
+      SELECT 1 AS exists
+      FROM usuarios_propiedades up
+      INNER JOIN propiedades p ON p.id = up.propiedad_id
+      WHERE up.user_id = $1
+        AND p.condominio_id = $2
+        AND COALESCE(up.acceso_portal, true) = true
+      LIMIT 1
+    `,
+    [userId, condominioId],
+  );
+  return result.rows.length > 0;
+};
+
+const userHasPropiedadAccess = async (userId: number, propiedadId: number): Promise<boolean> => {
+  const result = await pool.query<{ exists: number }>(
+    `
+      SELECT 1 AS exists
+      FROM usuarios_propiedades up
+      WHERE up.user_id = $1
+        AND up.propiedad_id = $2
+        AND COALESCE(up.acceso_portal, true) = true
+      LIMIT 1
+    `,
+    [userId, propiedadId],
+  );
+  return result.rows.length > 0;
+};
+
+router.get('/mis-propiedades', verifyToken, async (req: Request, res: Response<ApiRes<MisPropiedadesRow[]>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const result = await pool.query<MisPropiedadesRow>(
+      `
+        SELECT
+          p.id AS id_propiedad,
+          p.identificador,
+          COALESCE(c.nombre_legal, c.nombre, 'Condominio') AS nombre_condominio,
+          p.condominio_id AS id_condominio,
+          COALESCE(p.saldo_actual, 0) AS saldo_actual
+        FROM usuarios_propiedades up
+        INNER JOIN propiedades p ON p.id = up.propiedad_id
+        INNER JOIN condominios c ON c.id = p.condominio_id
+        WHERE up.user_id = $1
+          AND COALESCE(up.acceso_portal, true) = true
+        ORDER BY p.condominio_id ASC, p.identificador ASC
+      `,
+      [authUser.id],
+    );
+
+    res.json({ status: 'success', data: result.rows });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener propiedades.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/gastos/:condominio_id', verifyToken, async (req: Request, res: Response<ApiRes<GastoComunRow[]>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const condominioId = toPositiveInt(req.params.condominio_id);
+    if (!condominioId) {
+      res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+      return;
+    }
+
+    const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+    if (!hasAccess) {
+      res.status(403).json({ status: 'error', message: 'No autorizado para ver gastos de este condominio.' });
+      return;
+    }
+
+    const result = await pool.query<GastoComunRow>(
+      `
+        SELECT
+          g.id,
+          g.condominio_id,
+          g.concepto,
+          COALESCE(g.monto_bs, 0) AS monto_bs,
+          COALESCE(g.monto_usd, 0) AS monto_usd,
+          COALESCE(g.total_cuotas, 1) AS total_cuotas,
+          g.fecha_gasto,
+          g.nota,
+          g.clasificacion
+        FROM gastos g
+        WHERE g.condominio_id = $1
+          AND COALESCE(g.tipo, 'Comun') = 'Comun'
+        ORDER BY g.fecha_gasto DESC, g.id DESC
+      `,
+      [condominioId],
+    );
+
+    res.json({ status: 'success', data: result.rows });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener gastos.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/mis-recibos/:propiedad_id', verifyToken, async (req: Request, res: Response<ApiRes<MisRecibosRow[]>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const propiedadId = toPositiveInt(req.params.propiedad_id);
+    if (!propiedadId) {
+      res.status(400).json({ status: 'error', message: 'propiedad_id inválido.' });
+      return;
+    }
+
+    const hasAccess = await userHasPropiedadAccess(authUser.id, propiedadId);
+    if (!hasAccess) {
+      res.status(403).json({ status: 'error', message: 'No autorizado para ver recibos de este inmueble.' });
+      return;
+    }
+
+    const result = await pool.query<MisRecibosRow>(
+      `
+        SELECT
+          r.id,
+          r.propiedad_id,
+          r.mes_cobro,
+          COALESCE(r.monto_usd, 0) AS monto_usd,
+          COALESCE(r.monto_pagado_usd, 0) AS monto_pagado_usd,
+          r.estado,
+          r.fecha_emision,
+          r.fecha_vencimiento
+        FROM recibos r
+        WHERE r.propiedad_id = $1
+        ORDER BY r.fecha_emision DESC, r.id DESC
+      `,
+      [propiedadId],
+    );
+
+    res.json({ status: 'success', data: result.rows });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener recibos.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/estado-cuenta/:condominio_id', verifyToken, async (req: Request, res: Response<ApiRes<EstadoCuentaRow[]>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const condominioId = toPositiveInt(req.params.condominio_id);
+    if (!condominioId) {
+      res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+      return;
+    }
+
+    const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+    if (!hasAccess) {
+      res.status(403).json({ status: 'error', message: 'No autorizado para ver estado de cuenta de este condominio.' });
+      return;
+    }
+
+    const result = await pool.query<EstadoCuentaRow>(
+      `
+        SELECT
+          mf.id,
+          mf.fecha,
+          mf.tipo,
+          COALESCE(mf.monto, 0) AS monto,
+          mf.tasa_cambio,
+          mf.nota,
+          mf.referencia_id,
+          f.id AS fondo_id,
+          f.nombre AS fondo_nombre,
+          f.moneda AS fondo_moneda,
+          cb.id AS cuenta_bancaria_id,
+          cb.nombre_banco AS banco_nombre,
+          cb.apodo AS banco_apodo
+        FROM movimientos_fondos mf
+        INNER JOIN fondos f ON f.id = mf.fondo_id
+        LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+        WHERE f.condominio_id = $1
+        ORDER BY mf.fecha DESC, mf.id DESC
+      `,
+      [condominioId],
+    );
+
+    res.json({ status: 'success', data: result.rows });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener estado de cuenta.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/cuenta-principal/:condominio_id', verifyToken, async (req: Request, res: Response<ApiRes<CuentaPrincipalRow>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const condominioId = toPositiveInt(req.params.condominio_id);
+    if (!condominioId) {
+      res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+      return;
+    }
+
+    const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+    if (!hasAccess) {
+      res.status(403).json({ status: 'error', message: 'No autorizado para ver cuentas de este condominio.' });
+      return;
+    }
+
+    const result = await pool.query<CuentaPrincipalRow>(
+      `
+        SELECT
+          cb.id,
+          cb.nombre_banco,
+          cb.apodo,
+          cb.tipo,
+          cb.es_predeterminada
+        FROM cuentas_bancarias cb
+        INNER JOIN fondos f ON f.cuenta_bancaria_id = cb.id
+        WHERE cb.condominio_id = $1
+          AND COALESCE(cb.activo, true) = true
+          AND COALESCE(f.activo, true) = true
+        GROUP BY cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada
+        ORDER BY
+          CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,
+          cb.id ASC
+        LIMIT 1
+      `,
+      [condominioId],
+    );
+
+    if (result.rows.length === 0) {
+      res.status(404).json({ status: 'error', message: 'No hay cuenta principal activa para este condominio.' });
+      return;
+    }
+
+    res.json({ status: 'success', data: result.rows[0] });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener cuenta principal.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/notificaciones', verifyToken, async (req: Request, res: Response<ApiRes<NotificacionPagoRow[]>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const propiedadIdFilter = toPositiveInt(req.query.propiedad_id);
+    let filterSql = '';
+    const params: Array<number | string> = [authUser.id];
+
+    if (propiedadIdFilter) {
+      params.push(propiedadIdFilter);
+      filterSql = ` AND p.id = $${params.length} `;
+    }
+
+    const result = await pool.query<NotificacionPagoRow>(
+      `
+        SELECT
+          pa.id,
+          pa.propiedad_id,
+          pa.recibo_id,
+          pa.referencia,
+          COALESCE(pa.monto_origen, 0) AS monto_origen,
+          COALESCE(pa.monto_usd, 0) AS monto_usd,
+          pa.estado,
+          pa.fecha_pago,
+          pa.created_at,
+          pa.nota,
+          p.identificador,
+          COALESCE(c.nombre_legal, c.nombre, 'Condominio') AS nombre_condominio
+        FROM pagos pa
+        INNER JOIN propiedades p ON p.id = pa.propiedad_id
+        INNER JOIN condominios c ON c.id = p.condominio_id
+        INNER JOIN usuarios_propiedades up ON up.propiedad_id = p.id
+        WHERE up.user_id = $1
+          AND COALESCE(up.acceso_portal, true) = true
+          AND pa.estado IN ('PendienteAprobacion', 'Rechazado', 'Validado')
+          ${filterSql}
+        ORDER BY COALESCE(pa.created_at, pa.fecha_pago) DESC, pa.id DESC
+        LIMIT 200
+      `,
+      params,
+    );
+
+    res.json({ status: 'success', data: result.rows });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener notificaciones.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+module.exports = router;
