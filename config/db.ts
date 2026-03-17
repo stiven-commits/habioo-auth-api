@@ -1,4 +1,4 @@
-import type { Pool as PoolType, PoolConfig } from 'pg';
+import type { Pool as PoolType, PoolClient, PoolConfig } from 'pg';
 
 const { Pool }: { Pool: new (config?: PoolConfig) => PoolType } = require('pg');
 
@@ -8,6 +8,10 @@ const pool: PoolType = new Pool({
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
+});
+
+pool.on('connect', (client: PoolClient) => {
+    void client.query(`SET TIME ZONE 'America/Caracas'`);
 });
 
 module.exports = { pool };

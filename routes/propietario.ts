@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 
 const express: typeof import('express') = require('express');
+const bcrypt: typeof import('bcryptjs') = require('bcryptjs');
 const { pool }: { pool: Pool } = require('../config/db');
 const { verifyToken }: {
   verifyToken: (req: Request, res: Response, next: NextFunction) => void | Promise<void>;
@@ -53,6 +54,19 @@ interface MisRecibosRow {
   estado: string;
   fecha_emision: string | Date;
   fecha_vencimiento: string | Date | null;
+}
+
+interface EstadoCuentaInmuebleRow {
+  tipo: string;
+  ref_id: number;
+  concepto: string;
+  cargo: string | number;
+  abono: string | number;
+  monto_bs: string | number | null;
+  tasa_cambio: string | number | null;
+  estado_recibo: string | null;
+  fecha_operacion: string | Date;
+  fecha_registro: string | Date;
 }
 
 interface EstadoCuentaRow {
@@ -117,6 +131,14 @@ interface NotificacionPagoRow {
   nombre_condominio: string;
 }
 
+interface PropietarioPerfilRow {
+  id: number;
+  nombre: string | null;
+  cedula: string | null;
+  email: string | null;
+  telefono: string | null;
+}
+
 interface CorteFondoRow {
   id: number;
   condominio_id: number;
@@ -153,6 +175,12 @@ const toPositiveInt = (value: unknown): number | null => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return parsed;
+};
+
+const normalizeNullableText = (value: unknown): string | null => {
+  if (value === null || value === undefined) return null;
+  const str = String(value).trim();
+  return str ? str : null;
 };
 
 const userHasCondominioAccess = async (userId: number, condominioId: number): Promise<boolean> => {
@@ -307,6 +335,107 @@ router.get('/mis-recibos/:propiedad_id', verifyToken, async (req: Request, res: 
     res.json({ status: 'success', data: result.rows });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Error al obtener recibos.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Request, res: Response<ApiRes<EstadoCuentaInmuebleRow[]>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const propiedadId = toPositiveInt(req.params.propiedad_id);
+    if (!propiedadId) {
+      res.status(400).json({ status: 'error', message: 'propiedad_id inválido.' });
+      return;
+    }
+
+    const hasAccess = await userHasPropiedadAccess(authUser.id, propiedadId);
+    if (!hasAccess) {
+      res.status(403).json({ status: 'error', message: 'No autorizado para ver estado de cuenta de este inmueble.' });
+      return;
+    }
+
+    const recibos = await pool.query<EstadoCuentaInmuebleRow>(
+      `
+        SELECT
+          'RECIBO' AS tipo,
+          r.id AS ref_id,
+          CASE
+            WHEN COALESCE(r.n8n_pdf_url, '') LIKE 'IMPORTACION_SILENCIOSA:%'
+              THEN regexp_replace(COALESCE(r.n8n_pdf_url, ''), '^IMPORTACION_SILENCIOSA:\\s*', '')
+            WHEN r.estado = 'Pagado' THEN 'Recibo: ' || r.mes_cobro
+            ELSE 'Aviso de Cobro: ' || r.mes_cobro
+          END AS concepto,
+          COALESCE(r.monto_usd, 0) AS cargo,
+          0 AS abono,
+          NULL::numeric AS monto_bs,
+          NULL::numeric AS tasa_cambio,
+          r.estado AS estado_recibo,
+          r.fecha_emision AS fecha_operacion,
+          r.fecha_emision AS fecha_registro
+        FROM recibos r
+        WHERE r.propiedad_id = $1
+      `,
+      [propiedadId],
+    );
+
+    const pagos = await pool.query<EstadoCuentaInmuebleRow>(
+      `
+        SELECT
+          'PAGO' AS tipo,
+          p.id AS ref_id,
+          'Pago Ref: ' || COALESCE(p.referencia, p.id::text) AS concepto,
+          0 AS cargo,
+          COALESCE(p.monto_usd, 0) AS abono,
+          COALESCE(p.monto_origen, 0) AS monto_bs,
+          p.tasa_cambio,
+          NULL::text AS estado_recibo,
+          p.fecha_pago AS fecha_operacion,
+          COALESCE(p.created_at, p.fecha_pago) AS fecha_registro
+        FROM pagos p
+        WHERE p.propiedad_id = $1
+          AND p.estado = 'Validado'
+      `,
+      [propiedadId],
+    );
+
+    const ajustes = await pool.query<EstadoCuentaInmuebleRow>(
+      `
+        SELECT
+          'AJUSTE' AS tipo,
+          h.id AS ref_id,
+          COALESCE(h.nota, 'Ajuste manual') AS concepto,
+          CASE
+            WHEN h.tipo = 'CARGAR_DEUDA' OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
+              THEN COALESCE(h.monto, 0)
+            ELSE 0
+          END AS cargo,
+          CASE
+            WHEN h.tipo = 'AGREGAR_FAVOR' OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+              THEN COALESCE(h.monto, 0)
+            ELSE 0
+          END AS abono,
+          NULL::numeric AS monto_bs,
+          NULL::numeric AS tasa_cambio,
+          NULL::text AS estado_recibo,
+          h.fecha AS fecha_operacion,
+          h.fecha AS fecha_registro
+        FROM historial_saldos_inmuebles h
+        WHERE h.propiedad_id = $1
+      `,
+      [propiedadId],
+    );
+
+    const movimientos = [...recibos.rows, ...pagos.rows, ...ajustes.rows]
+      .sort((a, b) => new Date(a.fecha_registro).getTime() - new Date(b.fecha_registro).getTime());
+
+    res.json({ status: 'success', data: movimientos });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener estado de cuenta del inmueble.';
     res.status(500).json({ status: 'error', message });
   }
 });
@@ -802,6 +931,138 @@ router.get('/notificaciones', verifyToken, async (req: Request, res: Response<Ap
     res.json({ status: 'success', data: result.rows });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Error al obtener notificaciones.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/perfil', verifyToken, async (req: Request, res: Response<ApiRes<PropietarioPerfilRow>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const result = await pool.query<PropietarioPerfilRow>(
+      `
+        SELECT
+          u.id,
+          u.nombre,
+          u.cedula,
+          u.email,
+          u.telefono
+        FROM users u
+        WHERE u.id = $1
+        LIMIT 1
+      `,
+      [authUser.id],
+    );
+
+    if (result.rows.length === 0) {
+      res.status(404).json({ status: 'error', message: 'Usuario no encontrado.' });
+      return;
+    }
+
+    res.json({ status: 'success', data: result.rows[0] });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener el perfil del propietario.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const body = req.body as { cedula?: unknown; email?: unknown; telefono?: unknown };
+    const cedula = normalizeNullableText(body.cedula)?.toUpperCase() ?? null;
+    const email = normalizeNullableText(body.email)?.toLowerCase() ?? null;
+    const telefono = normalizeNullableText(body.telefono) ?? null;
+
+    if (!cedula) {
+      res.status(400).json({ status: 'error', message: 'La cédula es obligatoria.' });
+      return;
+    }
+    if (!/^[VEJG][0-9]{5,9}$/i.test(cedula)) {
+      res.status(400).json({ status: 'error', message: 'Formato de cédula inválido. Use V, E, J o G seguido de números.' });
+      return;
+    }
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ status: 'error', message: 'Formato de correo inválido.' });
+      return;
+    }
+    if (telefono && !/^[0-9]{7,15}$/.test(telefono)) {
+      res.status(400).json({ status: 'error', message: 'El teléfono debe contener solo números (7 a 15 dígitos).' });
+      return;
+    }
+
+    const updateRes = await pool.query(
+      `
+        UPDATE users
+        SET cedula = $1,
+            email = $2,
+            telefono = $3
+        WHERE id = $4
+      `,
+      [cedula, email, telefono, authUser.id],
+    );
+
+    if (updateRes.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'Usuario no encontrado.' });
+      return;
+    }
+
+    res.json({ status: 'success', message: 'Perfil actualizado correctamente.' });
+  } catch (error) {
+    if (typeof error === 'object' && error && 'code' in error) {
+      const code = String((error as { code?: string }).code || '');
+      if (code === '23505') {
+        res.status(409).json({ status: 'error', message: 'La cédula o el correo ya están registrados por otro usuario.' });
+        return;
+      }
+    }
+    const message = error instanceof Error ? error.message : 'Error al actualizar el perfil del propietario.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.put('/perfil/password', verifyToken, async (req: Request, res: Response<ApiRes>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const body = req.body as { nueva_password?: unknown };
+    const nuevaPassword = String(body.nueva_password ?? '').trim();
+    if (!nuevaPassword) {
+      res.status(400).json({ status: 'error', message: 'Debe enviar nueva_password.' });
+      return;
+    }
+    if (nuevaPassword.length < 6) {
+      res.status(400).json({ status: 'error', message: 'La clave debe tener al menos 6 caracteres.' });
+      return;
+    }
+
+    const hashedPassword = await bcrypt.hash(nuevaPassword, 10);
+    const updateRes = await pool.query(
+      'UPDATE users SET password = $1 WHERE id = $2',
+      [hashedPassword, authUser.id],
+    );
+
+    if (updateRes.rowCount === 0) {
+      res.status(404).json({ status: 'error', message: 'Usuario no encontrado.' });
+      return;
+    }
+
+    res.json({ status: 'success', message: 'Clave actualizada correctamente.' });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al actualizar la clave del propietario.';
     res.status(500).json({ status: 'error', message });
   }
 });
