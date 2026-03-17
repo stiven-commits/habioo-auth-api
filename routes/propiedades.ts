@@ -699,11 +699,29 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     await pool.query('ROLLBACK');
                     return res.status(409).json({ error: 'La cédula ingresada ya existe. Use "Propietario Existente" para vincularlo.' });
                 }
-                const insertRes = await pool.query<IUserIdRow>(
-                    'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-                    [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_telefono || null, prop_password || propCedulaNormalized]
-                );
-                userId = insertRes.rows[0].id;
+
+                // Si el correo ya existe en el sistema, reutilizamos ese usuario para evitar duplicados.
+                if (ownerEmail) {
+                    const userByEmailRes = await pool.query<{ id: number }>(
+                        'SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
+                        [ownerEmail]
+                    );
+                    if (userByEmailRes.rows.length > 0) {
+                        userId = userByEmailRes.rows[0].id;
+                        await pool.query(
+                            'UPDATE users SET nombre = $1, telefono = $2 WHERE id = $3',
+                            [propNombreNormalized, prop_telefono || null, userId]
+                        );
+                    }
+                }
+
+                if (!userId) {
+                    const insertRes = await pool.query<IUserIdRow>(
+                        'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+                        [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_telefono || null, prop_password || propCedulaNormalized]
+                    );
+                    userId = insertRes.rows[0].id;
+                }
             }
 
             const propRes = await pool.query<IPropiedadIdRow>('INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual) VALUES ($1, $2, $3, $4, $5) RETURNING id', [condominioId, identificadorNormalized, alicuotaNum, zona_id || null, saldoBase]);
