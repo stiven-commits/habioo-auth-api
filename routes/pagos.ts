@@ -282,8 +282,6 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         }
     };
 
-    const isAdminUser = (user: AuthUser): boolean => ['J', 'G'].includes(String(user.cedula || '').charAt(0).toUpperCase());
-
     const userHasPropiedadPortalAccess = async (userId: number, propiedadId: number): Promise<boolean> => {
         const r = await pool.query<{ ok: number }>(
             `
@@ -659,9 +657,6 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
         try {
             const user = asAuthUser(req.user);
-            if (!isAdminUser(user)) {
-                return res.status(403).json({ status: 'error', error: 'Solo administradores pueden registrar pagos directos.' });
-            }
 
             const propiedadIdNum = parseInt(String(propiedad_id), 10);
             if (!Number.isFinite(propiedadIdNum) || propiedadIdNum <= 0) {
@@ -903,9 +898,6 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
     app.get('/pagos/pendientes-aprobacion', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            if (!isAdminUser(user)) {
-                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden revisar pagos pendientes.' });
-            }
 
             const propiedadIdRaw = parseInt(String(req.query.propiedad_id || ''), 10);
             const whereByPropiedad = Number.isFinite(propiedadIdRaw) && propiedadIdRaw > 0 ? 'AND p.id = $2' : '';
@@ -963,9 +955,6 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
         try {
             const user = asAuthUser(req.user);
-            if (!isAdminUser(user)) {
-                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden validar pagos.' });
-            }
 
             await pool.query('BEGIN');
 
@@ -1003,10 +992,6 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
         try {
             const user = asAuthUser(req.user);
-            if (!isAdminUser(user)) {
-                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden rechazar pagos.' });
-            }
-
             const pagoRes = await pool.query<IPagoFullRow>(
                 "SELECT id, monto_usd, monto_origen, tasa_cambio, propiedad_id, estado, cuenta_bancaria_id, moneda, referencia FROM pagos WHERE id = $1 AND estado = 'PendienteAprobacion'",
                 [pagoId]

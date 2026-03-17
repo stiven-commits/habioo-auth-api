@@ -50,6 +50,14 @@ interface IUserIdRow {
     id: number;
 }
 
+interface IUserProfileRow {
+    id: number;
+    cedula: string;
+    nombre: string | null;
+    email: string | null;
+    telefono: string | null;
+}
+
 interface IPropiedadIdRow {
     id: number;
 }
@@ -242,6 +250,51 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value).trim());
     };
 
+    const userHasLinksOutsideProperty = async (userId: number, propiedadId: number): Promise<boolean> => {
+        const r = await pool.query<{ ok: number }>(
+            `SELECT 1 AS ok
+             FROM usuarios_propiedades
+             WHERE user_id = $1
+               AND propiedad_id <> $2
+             LIMIT 1`,
+            [userId, propiedadId]
+        );
+        return r.rows.length > 0;
+    };
+
+    const updateUserIfExclusiveToProperty = async (
+        userId: number,
+        propiedadId: number,
+        values: { cedula?: string; nombre?: string; email?: string | null; telefono?: string | null; password?: string | null },
+        failIfShared = false
+    ): Promise<boolean> => {
+        const hasExternalLinks = await userHasLinksOutsideProperty(userId, propiedadId);
+        if (hasExternalLinks) {
+            if (failIfShared) {
+                throw new Error('El usuario está vinculado a otros inmuebles. Edite sus datos globales desde el perfil de usuario para evitar conflictos.');
+            }
+            return false;
+        }
+
+        const currentRes = await pool.query<IUserProfileRow>('SELECT id, cedula, nombre, email, telefono FROM users WHERE id = $1 LIMIT 1', [userId]);
+        if (currentRes.rows.length === 0) return false;
+        const current = currentRes.rows[0];
+
+        const nextCedula = values.cedula ?? current.cedula;
+        const nextNombre = values.nombre ?? (current.nombre || '');
+        const nextEmail = values.email !== undefined ? values.email : current.email;
+        const nextTelefono = values.telefono !== undefined ? values.telefono : current.telefono;
+
+        await pool.query(
+            'UPDATE users SET cedula = $1, nombre = $2, email = $3, telefono = $4 WHERE id = $5',
+            [nextCedula, nextNombre, nextEmail, nextTelefono, userId]
+        );
+        if (values.password) {
+            await pool.query('UPDATE users SET password = $1 WHERE id = $2', [values.password, userId]);
+        }
+        return true;
+    };
+
     // 1. OBTENER PROPIEDADES
     app.get('/propiedades-admin', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
@@ -411,9 +464,11 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             const userByCedula = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1 LIMIT 1', [cedulaNormalized]);
             if (userByCedula.rows.length > 0) {
                 userId = userByCedula.rows[0].id;
-                await pool.query(
-                    'UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE id = $4',
-                    [nombreNormalized, correo, telefono, userId]
+                await updateUserIfExclusiveToProperty(
+                    userId,
+                    propiedadId,
+                    { nombre: nombreNormalized, email: correo, telefono },
+                    false
                 );
             } else {
                 if (correo) {
@@ -542,9 +597,11 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 }
             }
 
-            await pool.query(
-                'UPDATE users SET cedula = $1, nombre = $2, email = $3, telefono = $4 WHERE id = $5',
-                [cedulaNormalized, nombreNormalized, correo, telefono, userId]
+            await updateUserIfExclusiveToProperty(
+                userId,
+                propiedadId,
+                { cedula: cedulaNormalized, nombre: nombreNormalized, email: correo, telefono },
+                true
             );
 
             await pool.query(
@@ -557,6 +614,9 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         } catch (err: unknown) {
             const error = asPgError(err);
             await pool.query('ROLLBACK');
+            if (error.message.includes('vinculado a otros inmuebles')) {
+                return res.status(409).json({ error: error.message });
+            }
             if (error.code === '23505') {
                 return res.status(409).json({ error: 'No se pudo actualizar porque cédula o correo ya existen en otro usuario.' });
             }
@@ -859,9 +919,11 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     userId = insertUser.rows[0].id;
                 } else {
                     userId = userRes.rows[0].id;
-                    await pool.query(
-                        'UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE id = $4',
-                        [nombre, correo, telefonoFinal, userId]
+                    await updateUserIfExclusiveToProperty(
+                        userId,
+                        propiedadId,
+                        { nombre, email: correo, telefono: telefonoFinal },
+                        false
                     );
                 }
 
@@ -1028,16 +1090,16 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 
                 // Si el correo ya existe en el sistema, reutilizamos ese usuario para evitar duplicados.
                 if (ownerEmail) {
-                    const userByEmailRes = await pool.query<{ id: number }>(
-                        'SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
+                    const userByEmailRes = await pool.query<{ id: number; cedula: string }>(
+                        'SELECT id, cedula FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
                         [ownerEmail]
                     );
                     if (userByEmailRes.rows.length > 0) {
+                        if (normalizeDoc(userByEmailRes.rows[0].cedula) !== propCedulaNormalized) {
+                            await pool.query('ROLLBACK');
+                            return res.status(409).json({ error: 'El correo ingresado pertenece a otro usuario con cédula distinta. Use "Propietario Existente".' });
+                        }
                         userId = userByEmailRes.rows[0].id;
-                        await pool.query(
-                            'UPDATE users SET nombre = $1, telefono = $2 WHERE id = $3',
-                            [propNombreNormalized, prop_telefono || null, userId]
-                        );
                     }
                 }
 
@@ -1075,8 +1137,13 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 if (tenantRes.rows.length === 0) {
                     tenantRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inqCedulaNormalized, inqNombreNormalized, tenantEmail, inq_telefono || null, inq_password || inqCedulaNormalized]);
                 } else {
-                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [inqNombreNormalized, tenantEmail, inq_telefono || null, inqCedulaNormalized]);
-                    if (inq_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inqCedulaNormalized]);
+                    const existingTenantId = tenantRes.rows[0].id;
+                    await updateUserIfExclusiveToProperty(
+                        existingTenantId,
+                        nuevaPropId,
+                        { nombre: inqNombreNormalized, email: tenantEmail, telefono: inq_telefono || null, password: inq_password || null },
+                        false
+                    );
                 }
                 await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol, acceso_portal) VALUES ($1, $2, $3, $4)', [tenantRes.rows[0].id, nuevaPropId, 'Inquilino', inqPermitirAcceso]);
             }
@@ -1116,8 +1183,14 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 if (userRes.rows.length === 0) {
                     userRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_telefono || null, prop_password || propCedulaNormalized]);
                 } else {
-                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [propNombreNormalized, ownerEmail, prop_telefono || null, propCedulaNormalized]);
-                    if (prop_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [prop_password, propCedulaNormalized]);
+                    const existingOwnerId = userRes.rows[0].id;
+                    const propiedadIdNum = parseInt(propiedadId, 10) || 0;
+                    await updateUserIfExclusiveToProperty(
+                        existingOwnerId,
+                        propiedadIdNum,
+                        { nombre: propNombreNormalized, email: ownerEmail, telefono: prop_telefono || null, password: prop_password || null },
+                        false
+                    );
                 }
                 userId = userRes.rows[0].id;
                 const linkRes = await pool.query<ILinkIdRow>('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Propietario']);
@@ -1131,8 +1204,14 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 if (tenantRes.rows.length === 0) {
                     tenantRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [inqCedulaNormalized, inqNombreNormalized, tenantEmail, inq_telefono || null, inq_password || inqCedulaNormalized]);
                 } else {
-                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [inqNombreNormalized, tenantEmail, inq_telefono || null, inqCedulaNormalized]);
-                    if (inq_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [inq_password, inqCedulaNormalized]);
+                    const existingTenantId = tenantRes.rows[0].id;
+                    const propiedadIdNum = parseInt(propiedadId, 10) || 0;
+                    await updateUserIfExclusiveToProperty(
+                        existingTenantId,
+                        propiedadIdNum,
+                        { nombre: inqNombreNormalized, email: tenantEmail, telefono: inq_telefono || null, password: inq_password || null },
+                        false
+                    );
                 }
                 const tenantId = tenantRes.rows[0].id;
                 const tenantLink = await pool.query<ILinkIdRow>('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
