@@ -84,6 +84,11 @@ interface PropiedadEstadoCuentaParams {
     id?: string;
 }
 
+interface CopropietarioParams {
+    id?: string;
+    linkId?: string;
+}
+
 interface InmuebleLote {
     identificador: string;
     alicuota?: string | number;
@@ -156,6 +161,26 @@ interface AjustarSaldoBody {
     monto?: string | number;
     tipo_ajuste: string;
     nota?: string;
+}
+
+interface CopropietarioBody {
+    cedula?: string;
+    nombre?: string;
+    email?: string | null;
+    telefono?: string | null;
+    acceso_portal?: boolean;
+}
+
+interface CopropietarioRow {
+    id: number;
+    user_id: number;
+    propiedad_id: number;
+    rol: string;
+    acceso_portal: boolean;
+    cedula: string;
+    nombre: string | null;
+    email: string | null;
+    telefono: string | null;
 }
 
 const asAuthUser = (value: unknown): AuthUser => {
@@ -275,6 +300,307 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         } catch (err: unknown) {
             const error = asError(err);
             res.status(500).json({ error: error.message });
+        }
+    });
+
+    // 1.2 LISTAR COPROPIETARIOS DE UN INMUEBLE
+    app.get('/propiedades-admin/:id/copropietarios', verifyToken, async (req: Request<PropiedadEstadoCuentaParams>, res: Response, _next: NextFunction) => {
+        const propiedadIdRaw = asString(req.params.id);
+        const propiedadId = parseInt(propiedadIdRaw, 10);
+        if (!Number.isFinite(propiedadId) || propiedadId <= 0) {
+            return res.status(400).json({ error: 'ID de inmueble inválido.' });
+        }
+
+        try {
+            const user = asAuthUser(req.user);
+            const condominioId = await getCondominioIdByAdmin(user.id);
+            if (!condominioId) {
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
+
+            const propRes = await pool.query<IPropiedadIdRow>(
+                'SELECT id FROM propiedades WHERE id = $1 AND condominio_id = $2 LIMIT 1',
+                [propiedadId, condominioId]
+            );
+            if (propRes.rows.length === 0) {
+                return res.status(404).json({ error: 'Inmueble no encontrado.' });
+            }
+
+            const result = await pool.query<CopropietarioRow>(
+                `SELECT
+                    up.id,
+                    up.user_id,
+                    up.propiedad_id,
+                    up.rol,
+                    COALESCE(up.acceso_portal, true) AS acceso_portal,
+                    u.cedula,
+                    u.nombre,
+                    u.email,
+                    u.telefono
+                 FROM usuarios_propiedades up
+                 INNER JOIN users u ON u.id = up.user_id
+                 WHERE up.propiedad_id = $1
+                   AND up.rol = 'Copropietario'
+                 ORDER BY up.id ASC`,
+                [propiedadId]
+            );
+
+            return res.json({ status: 'success', copropietarios: result.rows });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ error: error.message });
+        }
+    });
+
+    // 1.3 AGREGAR COPROPIETARIO A UN INMUEBLE
+    app.post('/propiedades-admin/:id/copropietarios', verifyToken, async (req: Request<PropiedadEstadoCuentaParams, unknown, CopropietarioBody>, res: Response, _next: NextFunction) => {
+        const propiedadIdRaw = asString(req.params.id);
+        const propiedadId = parseInt(propiedadIdRaw, 10);
+        if (!Number.isFinite(propiedadId) || propiedadId <= 0) {
+            return res.status(400).json({ error: 'ID de inmueble inválido.' });
+        }
+
+        const cedulaNormalized = normalizeDoc(req.body?.cedula);
+        const nombreNormalized = toTitleCase(req.body?.nombre);
+        const correo = (req.body?.email || '').trim() || null;
+        const telefono = normalizeWhitespace(req.body?.telefono) || null;
+        const accesoPortal = req.body?.acceso_portal !== false;
+
+        if (!cedulaNormalized || !nombreNormalized) {
+            return res.status(400).json({ error: 'Cédula y nombre del copropietario son obligatorios.' });
+        }
+        if (!isValidEmail(correo)) {
+            return res.status(400).json({ error: 'Email del copropietario inválido.' });
+        }
+
+        try {
+            const user = asAuthUser(req.user);
+            await pool.query('BEGIN');
+
+            const condominioId = await getCondominioIdByAdmin(user.id);
+            if (!condominioId) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
+
+            const propRes = await pool.query<IPropiedadIdRow>(
+                'SELECT id FROM propiedades WHERE id = $1 AND condominio_id = $2 LIMIT 1',
+                [propiedadId, condominioId]
+            );
+            if (propRes.rows.length === 0) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ error: 'Inmueble no encontrado.' });
+            }
+
+            const ownerRes = await pool.query<{ cedula: string }>(
+                `SELECT u.cedula
+                 FROM usuarios_propiedades up
+                 INNER JOIN users u ON u.id = up.user_id
+                 WHERE up.propiedad_id = $1
+                   AND up.rol = 'Propietario'
+                 ORDER BY up.id ASC
+                 LIMIT 1`,
+                [propiedadId]
+            );
+            if (ownerRes.rows.length > 0 && normalizeDoc(ownerRes.rows[0].cedula) === cedulaNormalized) {
+                await pool.query('ROLLBACK');
+                return res.status(409).json({ error: 'Este usuario ya es el propietario principal del inmueble.' });
+            }
+
+            let userId: number;
+            const userByCedula = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1 LIMIT 1', [cedulaNormalized]);
+            if (userByCedula.rows.length > 0) {
+                userId = userByCedula.rows[0].id;
+                await pool.query(
+                    'UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE id = $4',
+                    [nombreNormalized, correo, telefono, userId]
+                );
+            } else {
+                if (correo) {
+                    const userByEmail = await pool.query<{ id: number }>(
+                        'SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
+                        [correo]
+                    );
+                    if (userByEmail.rows.length > 0) {
+                        await pool.query('ROLLBACK');
+                        return res.status(409).json({ error: 'El correo ingresado ya pertenece a otro usuario. Use otro correo o la cédula correcta.' });
+                    }
+                }
+
+                const insertUser = await pool.query<IUserIdRow>(
+                    'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+                    [cedulaNormalized, nombreNormalized, correo, telefono, cedulaNormalized]
+                );
+                userId = insertUser.rows[0].id;
+            }
+
+            const existingAnyRole = await pool.query<{ id: number; rol: string }>(
+                'SELECT id, rol FROM usuarios_propiedades WHERE propiedad_id = $1 AND user_id = $2 LIMIT 1',
+                [propiedadId, userId]
+            );
+
+            if (existingAnyRole.rows.length > 0) {
+                const currentRole = String(existingAnyRole.rows[0].rol || '');
+                if (currentRole === 'Copropietario') {
+                    await pool.query(
+                        'UPDATE usuarios_propiedades SET acceso_portal = $1 WHERE id = $2',
+                        [accesoPortal, existingAnyRole.rows[0].id]
+                    );
+                    await pool.query('COMMIT');
+                    return res.json({ status: 'success', message: 'Copropietario actualizado correctamente.' });
+                }
+                await pool.query('ROLLBACK');
+                return res.status(409).json({ error: `Este usuario ya está vinculado al inmueble como ${currentRole}.` });
+            }
+
+            await pool.query(
+                'INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol, acceso_portal) VALUES ($1, $2, $3, $4)',
+                [userId, propiedadId, 'Copropietario', accesoPortal]
+            );
+
+            await pool.query('COMMIT');
+            return res.json({ status: 'success', message: 'Copropietario agregado correctamente.' });
+        } catch (err: unknown) {
+            const error = asPgError(err);
+            await pool.query('ROLLBACK');
+            if (error.code === '23505' && error.message.includes('email')) {
+                return res.status(400).json({ error: 'El correo ingresado ya pertenece a otro usuario en el sistema. Debe usar un correo distinto.' });
+            }
+            return res.status(500).json({ error: error.message });
+        }
+    });
+
+    // 1.4 EDITAR COPROPIETARIO DE UN INMUEBLE
+    app.put('/propiedades-admin/:id/copropietarios/:linkId', verifyToken, async (req: Request<CopropietarioParams, unknown, CopropietarioBody>, res: Response, _next: NextFunction) => {
+        const propiedadIdRaw = asString(req.params.id);
+        const linkIdRaw = asString(req.params.linkId);
+        const propiedadId = parseInt(propiedadIdRaw, 10);
+        const linkId = parseInt(linkIdRaw, 10);
+        if (!Number.isFinite(propiedadId) || propiedadId <= 0 || !Number.isFinite(linkId) || linkId <= 0) {
+            return res.status(400).json({ error: 'Parámetros inválidos.' });
+        }
+
+        const cedulaNormalized = normalizeDoc(req.body?.cedula);
+        const nombreNormalized = toTitleCase(req.body?.nombre);
+        const correo = (req.body?.email || '').trim() || null;
+        const telefono = normalizeWhitespace(req.body?.telefono) || null;
+        const accesoPortal = req.body?.acceso_portal !== false;
+
+        if (!cedulaNormalized || !nombreNormalized) {
+            return res.status(400).json({ error: 'Cédula y nombre del copropietario son obligatorios.' });
+        }
+        if (!isValidEmail(correo)) {
+            return res.status(400).json({ error: 'Email del copropietario inválido.' });
+        }
+
+        try {
+            const user = asAuthUser(req.user);
+            await pool.query('BEGIN');
+
+            const condominioId = await getCondominioIdByAdmin(user.id);
+            if (!condominioId) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
+
+            const copropRes = await pool.query<{ id: number; user_id: number }>(
+                `SELECT up.id, up.user_id
+                 FROM usuarios_propiedades up
+                 INNER JOIN propiedades p ON p.id = up.propiedad_id
+                 WHERE up.id = $1
+                   AND up.propiedad_id = $2
+                   AND up.rol = 'Copropietario'
+                   AND p.condominio_id = $3
+                 LIMIT 1`,
+                [linkId, propiedadId, condominioId]
+            );
+
+            if (copropRes.rows.length === 0) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ error: 'Copropietario no encontrado para este inmueble.' });
+            }
+
+            const userId = copropRes.rows[0].user_id;
+
+            const cedulaConflict = await pool.query<{ id: number }>(
+                'SELECT id FROM users WHERE cedula = $1 AND id <> $2 LIMIT 1',
+                [cedulaNormalized, userId]
+            );
+            if (cedulaConflict.rows.length > 0) {
+                await pool.query('ROLLBACK');
+                return res.status(409).json({ error: 'La cédula ingresada ya pertenece a otro usuario.' });
+            }
+
+            if (correo) {
+                const emailConflict = await pool.query<{ id: number }>(
+                    'SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id <> $2 LIMIT 1',
+                    [correo, userId]
+                );
+                if (emailConflict.rows.length > 0) {
+                    await pool.query('ROLLBACK');
+                    return res.status(409).json({ error: 'El correo ingresado ya pertenece a otro usuario.' });
+                }
+            }
+
+            await pool.query(
+                'UPDATE users SET cedula = $1, nombre = $2, email = $3, telefono = $4 WHERE id = $5',
+                [cedulaNormalized, nombreNormalized, correo, telefono, userId]
+            );
+
+            await pool.query(
+                'UPDATE usuarios_propiedades SET acceso_portal = $1 WHERE id = $2',
+                [accesoPortal, linkId]
+            );
+
+            await pool.query('COMMIT');
+            return res.json({ status: 'success', message: 'Copropietario actualizado correctamente.' });
+        } catch (err: unknown) {
+            const error = asPgError(err);
+            await pool.query('ROLLBACK');
+            if (error.code === '23505') {
+                return res.status(409).json({ error: 'No se pudo actualizar porque cédula o correo ya existen en otro usuario.' });
+            }
+            return res.status(500).json({ error: error.message });
+        }
+    });
+
+    // 1.5 ELIMINAR COPROPIETARIO DE UN INMUEBLE
+    app.delete('/propiedades-admin/:id/copropietarios/:linkId', verifyToken, async (req: Request<CopropietarioParams>, res: Response, _next: NextFunction) => {
+        const propiedadIdRaw = asString(req.params.id);
+        const linkIdRaw = asString(req.params.linkId);
+        const propiedadId = parseInt(propiedadIdRaw, 10);
+        const linkId = parseInt(linkIdRaw, 10);
+        if (!Number.isFinite(propiedadId) || propiedadId <= 0 || !Number.isFinite(linkId) || linkId <= 0) {
+            return res.status(400).json({ error: 'Parámetros inválidos.' });
+        }
+
+        try {
+            const user = asAuthUser(req.user);
+            const condominioId = await getCondominioIdByAdmin(user.id);
+            if (!condominioId) {
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
+
+            const result = await pool.query<{ id: number }>(
+                `DELETE FROM usuarios_propiedades up
+                 USING propiedades p
+                 WHERE up.id = $1
+                   AND up.propiedad_id = $2
+                   AND up.rol = 'Copropietario'
+                   AND p.id = up.propiedad_id
+                   AND p.condominio_id = $3
+                 RETURNING up.id`,
+                [linkId, propiedadId, condominioId]
+            );
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({ error: 'Copropietario no encontrado para este inmueble.' });
+            }
+
+            return res.json({ status: 'success', message: 'Copropietario eliminado correctamente.' });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ error: error.message });
         }
     });
 
