@@ -25,6 +25,7 @@ interface IFondoWithBancoRow {
     saldo_actual: string | number;
     es_operativo: boolean;
     activo: boolean;
+    visible_propietarios: boolean;
     nombre_banco: string;
     apodo: string | null;
 }
@@ -43,6 +44,7 @@ interface IFondoRow {
     saldo_actual: string | number;
     es_operativo: boolean;
     activo: boolean;
+    visible_propietarios: boolean;
 }
 
 interface IUsageRow {
@@ -58,6 +60,10 @@ interface IFondoUsageCountRow {
 
 interface FondosDeleteParams {
     id?: string;
+}
+
+interface FondoVisibilityBody {
+    visible_propietarios?: boolean;
 }
 
 interface CreateFondoBody {
@@ -114,6 +120,43 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
         } catch (err: unknown) {
             const error = asError(err);
             res.status(500).json({ error: error.message });
+        }
+    });
+
+    app.put('/fondos/:id/visibilidad-propietarios', verifyToken, async (req: Request<FondosDeleteParams, unknown, FondoVisibilityBody>, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const fondoId = asString(req.params.id);
+            const visible = Boolean(req.body?.visible_propietarios);
+            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            const condoId = condoRes.rows[0]?.id;
+
+            if (!condoId) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            }
+
+            const updated = await pool.query<IFondoRow>(
+                `
+                UPDATE fondos
+                SET visible_propietarios = $1
+                WHERE id = $2
+                  AND condominio_id = $3
+                RETURNING id, condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, activo, visible_propietarios
+                `,
+                [visible, fondoId, condoId]
+            );
+
+            if (updated.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'Fondo no encontrado.' });
+            }
+
+            return res.json({
+                status: 'success',
+                message: visible ? 'Fondo visible para inmuebles.' : 'Fondo oculto para inmuebles.',
+            });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ status: 'error', message: error.message });
         }
     });
 

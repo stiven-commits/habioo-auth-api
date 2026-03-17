@@ -67,6 +67,14 @@ interface ICountRow {
     count: string;
 }
 
+interface IPropietarioExistenteRow {
+    id: number;
+    cedula: string;
+    nombre: string | null;
+    email: string | null;
+    telefono: string | null;
+}
+
 interface PGError {
     code?: string;
     message: string;
@@ -122,6 +130,8 @@ interface PropiedadAdminBody {
         monto_deuda?: string | number;
         monto_abono?: string | number;
     }>;
+    propietario_modo?: 'NUEVO' | 'EXISTENTE';
+    propietario_existente_id?: string | number | null;
 }
 
 interface PropiedadEditBody {
@@ -235,6 +245,37 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 can_delete_all: totalGastos === 0
             });
         } catch (err: unknown) { const error = asError(err); res.status(500).json({ error: error.message }); }
+    });
+
+    // 1.1 OBTENER PROPIETARIOS YA REGISTRADOS EN EL CONDOMINIO
+    app.get('/propiedades-admin/propietarios-existentes', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const condominioId = await getCondominioIdByAdmin(user.id);
+            if (!condominioId) {
+                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            }
+
+            const result = await pool.query<IPropietarioExistenteRow>(`
+                SELECT DISTINCT
+                    u.id,
+                    u.cedula,
+                    u.nombre,
+                    u.email,
+                    u.telefono
+                FROM usuarios_propiedades up
+                INNER JOIN propiedades p ON p.id = up.propiedad_id
+                INNER JOIN users u ON u.id = up.user_id
+                WHERE up.rol = 'Propietario'
+                  AND p.condominio_id = $1
+                ORDER BY u.nombre ASC NULLS LAST, u.cedula ASC
+            `, [condominioId]);
+
+            res.json({ status: 'success', propietarios: result.rows });
+        } catch (err: unknown) {
+            const error = asError(err);
+            res.status(500).json({ error: error.message });
+        }
     });
 
     app.delete('/propiedades-admin/eliminar-todos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
@@ -583,7 +624,9 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             inq_permitir_acceso,
             monto_saldo_inicial,
             tiene_deuda_inicial,
-            deudas_iniciales
+            deudas_iniciales,
+            propietario_modo,
+            propietario_existente_id
         } = req.body;
         const ownerEmail = (prop_email || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
@@ -592,6 +635,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         const propNombreNormalized = toTitleCase(prop_nombre);
         const inqCedulaNormalized = normalizeDoc(inq_cedula);
         const inqNombreNormalized = toTitleCase(inq_nombre);
+        const propietarioModo = propietario_modo === 'EXISTENTE' ? 'EXISTENTE' : 'NUEVO';
+        const propietarioExistenteId = Number(propietario_existente_id);
         const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
         const parseMoney = (value: string | number | undefined | null): number => {
             const parsed = parseFloat(String(value ?? '0').replace(',', '.'));
@@ -626,15 +671,39 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             }
 
             let userId: number | null = null;
-            if (propCedulaNormalized && propNombreNormalized) {
-                let userRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [propCedulaNormalized]);
-                if (userRes.rows.length === 0) {
-                    userRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_telefono || null, prop_password || propCedulaNormalized]);
-                } else {
-                    await pool.query('UPDATE users SET nombre = $1, email = $2, telefono = $3 WHERE cedula = $4', [propNombreNormalized, ownerEmail, prop_telefono || null, propCedulaNormalized]);
-                    if (prop_password) await pool.query('UPDATE users SET password = $1 WHERE cedula = $2', [prop_password, propCedulaNormalized]);
+            if (propietarioModo === 'EXISTENTE') {
+                if (!Number.isFinite(propietarioExistenteId) || propietarioExistenteId <= 0) {
+                    await pool.query('ROLLBACK');
+                    return res.status(400).json({ error: 'Debe seleccionar un propietario existente válido.' });
                 }
-                userId = userRes.rows[0].id;
+
+                const propietarioRes = await pool.query<IUserIdRow>(`
+                    SELECT u.id
+                    FROM users u
+                    INNER JOIN usuarios_propiedades up ON up.user_id = u.id AND up.rol = 'Propietario'
+                    INNER JOIN propiedades p ON p.id = up.propiedad_id
+                    WHERE u.id = $1
+                      AND p.condominio_id = $2
+                    LIMIT 1
+                `, [propietarioExistenteId, condominioId]);
+
+                if (propietarioRes.rows.length === 0) {
+                    await pool.query('ROLLBACK');
+                    return res.status(400).json({ error: 'El propietario seleccionado no pertenece a este condominio.' });
+                }
+
+                userId = propietarioRes.rows[0].id;
+            } else if (propCedulaNormalized && propNombreNormalized) {
+                const userRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [propCedulaNormalized]);
+                if (userRes.rows.length > 0) {
+                    await pool.query('ROLLBACK');
+                    return res.status(409).json({ error: 'La cédula ingresada ya existe. Use "Propietario Existente" para vincularlo.' });
+                }
+                const insertRes = await pool.query<IUserIdRow>(
+                    'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+                    [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_telefono || null, prop_password || propCedulaNormalized]
+                );
+                userId = insertRes.rows[0].id;
             }
 
             const propRes = await pool.query<IPropiedadIdRow>('INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual) VALUES ($1, $2, $3, $4, $5) RETURNING id', [condominioId, identificadorNormalized, alicuotaNum, zona_id || null, saldoBase]);

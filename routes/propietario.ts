@@ -62,6 +62,8 @@ interface EstadoCuentaRow {
   monto: string | number;
   tasa_cambio: string | number | null;
   nota: string | null;
+  concepto?: string | null;
+  referencia?: string | null;
   referencia_id: number | null;
   fondo_id: number;
   fondo_nombre: string;
@@ -69,9 +71,30 @@ interface EstadoCuentaRow {
   cuenta_bancaria_id: number | null;
   banco_nombre: string | null;
   banco_apodo: string | null;
+  banco_origen?: string | null;
+  cedula_origen?: string | null;
+}
+
+interface FondoPrincipalRow {
+  id: number;
+  cuenta_bancaria_id: number;
+  nombre: string;
+  moneda: string | null;
+  saldo_actual: string | number;
+  visible_propietarios?: boolean;
+  nombre_banco?: string | null;
+  apodo?: string | null;
 }
 
 interface CuentaPrincipalRow {
+  id: number;
+  nombre_banco: string | null;
+  apodo: string | null;
+  tipo: string | null;
+  es_predeterminada: boolean | null;
+}
+
+interface CuentaCondominioRow {
   id: number;
   nombre_banco: string | null;
   apodo: string | null;
@@ -92,6 +115,30 @@ interface NotificacionPagoRow {
   nota: string | null;
   identificador: string;
   nombre_condominio: string;
+}
+
+interface CorteFondoRow {
+  id: number;
+  condominio_id: number;
+  anio: number;
+  mes: number;
+  fondo_id: number;
+  cuenta_bancaria_id: number | null;
+  nombre_fondo: string;
+  nombre_banco: string | null;
+  apodo_cuenta: string | null;
+  moneda: string;
+  saldo_actual: string | number;
+  saldo_bs: string | number;
+  saldo_usd: string | number;
+  tasa_referencia: string | number | null;
+  visible_propietarios: boolean;
+  created_at: string | Date;
+}
+
+interface CortePeriodoRow {
+  anio: number;
+  mes: number;
 }
 
 const router = express.Router();
@@ -284,34 +331,369 @@ router.get('/estado-cuenta/:condominio_id', verifyToken, async (req: Request, re
       return;
     }
 
+    const cuentaId = toPositiveInt(req.query.cuenta_id);
+    let cuentaFilterSql = '';
+    const params: Array<number | string> = [condominioId];
+
+    if (cuentaId) {
+      const cuentaAccess = await pool.query<{ id: number }>(
+        `
+          SELECT cb.id
+          FROM cuentas_bancarias cb
+          WHERE cb.id = $1
+            AND cb.condominio_id = $2
+            AND COALESCE(cb.activo, true) = true
+          LIMIT 1
+        `,
+        [cuentaId, condominioId],
+      );
+      if (cuentaAccess.rows.length === 0) {
+        res.status(403).json({ status: 'error', message: 'No autorizado para ver esa cuenta bancaria.' });
+        return;
+      }
+      params.push(cuentaId);
+      cuentaFilterSql = ` AND cb.id = $${params.length} `;
+    }
+
     const result = await pool.query<EstadoCuentaRow>(
       `
+        WITH movimientos_base AS (
+          SELECT
+            mf.id,
+            mf.fecha,
+            mf.tipo,
+            COALESCE(mf.monto, 0) AS monto,
+            mf.tasa_cambio,
+            mf.nota,
+            CASE
+              WHEN p.id IS NOT NULL
+                THEN ('Pago de Recibo #' || p.id::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A'))
+              ELSE COALESCE(mf.nota, f.nombre, 'Movimiento')
+            END AS concepto,
+            COALESCE(p.referencia, NULLIF(mf.referencia_id::text, '')) AS referencia,
+            mf.referencia_id,
+            f.id AS fondo_id,
+            f.nombre AS fondo_nombre,
+            f.moneda AS fondo_moneda,
+            cb.id AS cuenta_bancaria_id,
+            cb.nombre_banco AS banco_nombre,
+            cb.apodo AS banco_apodo,
+            p.banco_origen,
+            p.cedula_origen
+          FROM movimientos_fondos mf
+          INNER JOIN fondos f ON f.id = mf.fondo_id
+          LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+          LEFT JOIN pagos p ON p.id = mf.referencia_id
+          LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
+          WHERE f.condominio_id = $1
+            AND COALESCE(f.visible_propietarios, true) = true
+            ${cuentaFilterSql}
+        ),
+        transferencias_salida AS (
+          SELECT
+            (1000000000 + t.id) AS id,
+            t.fecha,
+            'EGRESO'::text AS tipo,
+            COALESCE(t.monto_origen, 0) AS monto,
+            t.tasa_cambio,
+            t.nota,
+            ('Transferencia enviada a ' || COALESCE(cb_dest.nombre_banco, 'Cuenta destino') || ' - Fondo: ' || COALESCE(f_dest.nombre, 'N/A')) AS concepto,
+            t.referencia,
+            NULL::int AS referencia_id,
+            f_orig.id AS fondo_id,
+            f_orig.nombre AS fondo_nombre,
+            f_orig.moneda AS fondo_moneda,
+            cb_orig.id AS cuenta_bancaria_id,
+            cb_orig.nombre_banco AS banco_nombre,
+            cb_orig.apodo AS banco_apodo,
+            NULL::text AS banco_origen,
+            NULL::text AS cedula_origen
+          FROM transferencias t
+          INNER JOIN fondos f_orig ON f_orig.id = t.fondo_origen_id
+          INNER JOIN fondos f_dest ON f_dest.id = t.fondo_destino_id
+          LEFT JOIN cuentas_bancarias cb_orig ON cb_orig.id = f_orig.cuenta_bancaria_id
+          LEFT JOIN cuentas_bancarias cb_dest ON cb_dest.id = f_dest.cuenta_bancaria_id
+          WHERE t.condominio_id = $1
+            AND COALESCE(f_orig.visible_propietarios, true) = true
+            ${cuentaFilterSql.replace(/cb\./g, 'cb_orig.')}
+        )
+        SELECT *
+        FROM (
+          SELECT * FROM movimientos_base
+          UNION ALL
+          SELECT * FROM transferencias_salida
+        ) mov
+        ORDER BY mov.fecha DESC, mov.id DESC
+      `,
+      params,
+    );
+
+    res.json({ status: 'success', data: result.rows });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener estado de cuenta.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/cuentas/:condominio_id', verifyToken, async (req: Request, res: Response<ApiRes<CuentaCondominioRow[]>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const condominioId = toPositiveInt(req.params.condominio_id);
+    if (!condominioId) {
+      res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+      return;
+    }
+
+    const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+    if (!hasAccess) {
+      res.status(403).json({ status: 'error', message: 'No autorizado para ver cuentas de este condominio.' });
+      return;
+    }
+
+    const result = await pool.query<CuentaCondominioRow>(
+      `
         SELECT
-          mf.id,
-          mf.fecha,
-          mf.tipo,
-          COALESCE(mf.monto, 0) AS monto,
-          mf.tasa_cambio,
-          mf.nota,
-          mf.referencia_id,
-          f.id AS fondo_id,
-          f.nombre AS fondo_nombre,
-          f.moneda AS fondo_moneda,
-          cb.id AS cuenta_bancaria_id,
-          cb.nombre_banco AS banco_nombre,
-          cb.apodo AS banco_apodo
-        FROM movimientos_fondos mf
-        INNER JOIN fondos f ON f.id = mf.fondo_id
-        LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
-        WHERE f.condominio_id = $1
-        ORDER BY mf.fecha DESC, mf.id DESC
+          cb.id,
+          cb.nombre_banco,
+          cb.apodo,
+          cb.tipo,
+          cb.es_predeterminada
+        FROM cuentas_bancarias cb
+        INNER JOIN fondos f ON f.cuenta_bancaria_id = cb.id
+        WHERE cb.condominio_id = $1
+          AND COALESCE(cb.activo, true) = true
+          AND COALESCE(f.activo, true) = true
+          AND COALESCE(f.visible_propietarios, true) = true
+        GROUP BY cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada
+        ORDER BY
+          CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,
+          cb.id ASC
       `,
       [condominioId],
     );
 
     res.json({ status: 'success', data: result.rows });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Error al obtener estado de cuenta.';
+    const message = error instanceof Error ? error.message : 'Error al obtener cuentas bancarias.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/fondos-principal/:condominio_id', verifyToken, async (req: Request, res: Response<ApiRes<FondoPrincipalRow[]>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const condominioId = toPositiveInt(req.params.condominio_id);
+    if (!condominioId) {
+      res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+      return;
+    }
+
+    const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+    if (!hasAccess) {
+      res.status(403).json({ status: 'error', message: 'No autorizado para ver fondos de este condominio.' });
+      return;
+    }
+
+    const cuentaPrincipal = await pool.query<CuentaPrincipalRow>(
+      `
+        SELECT
+          cb.id,
+          cb.nombre_banco,
+          cb.apodo,
+          cb.tipo,
+          cb.es_predeterminada
+        FROM cuentas_bancarias cb
+        INNER JOIN fondos f ON f.cuenta_bancaria_id = cb.id
+        WHERE cb.condominio_id = $1
+          AND COALESCE(cb.activo, true) = true
+          AND COALESCE(f.activo, true) = true
+        GROUP BY cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada
+        ORDER BY
+          CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,
+          cb.id ASC
+        LIMIT 1
+      `,
+      [condominioId],
+    );
+
+    if (cuentaPrincipal.rows.length === 0) {
+      res.json({ status: 'success', data: [] });
+      return;
+    }
+
+    const cuentaId = cuentaPrincipal.rows[0]?.id;
+    const fondos = await pool.query<FondoPrincipalRow>(
+      `
+        SELECT
+          f.id,
+          f.cuenta_bancaria_id,
+          COALESCE(f.nombre, 'Fondo') AS nombre,
+          f.moneda,
+          COALESCE(f.saldo_actual, 0) AS saldo_actual,
+          COALESCE(f.visible_propietarios, true) AS visible_propietarios
+        FROM fondos f
+        WHERE f.condominio_id = $1
+          AND f.cuenta_bancaria_id = $2
+          AND COALESCE(f.activo, true) = true
+          AND COALESCE(f.visible_propietarios, true) = true
+        ORDER BY f.id ASC
+      `,
+      [condominioId, cuentaId],
+    );
+
+    res.json({ status: 'success', data: fondos.rows });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener fondos principales.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/fondos/:condominio_id', verifyToken, async (req: Request, res: Response<ApiRes<FondoPrincipalRow[]>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const condominioId = toPositiveInt(req.params.condominio_id);
+    if (!condominioId) {
+      res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+      return;
+    }
+
+    const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+    if (!hasAccess) {
+      res.status(403).json({ status: 'error', message: 'No autorizado para ver fondos de este condominio.' });
+      return;
+    }
+
+    const fondos = await pool.query<FondoPrincipalRow>(
+      `
+        SELECT
+          f.id,
+          f.cuenta_bancaria_id,
+          COALESCE(f.nombre, 'Fondo') AS nombre,
+          f.moneda,
+          COALESCE(f.saldo_actual, 0) AS saldo_actual,
+          COALESCE(f.visible_propietarios, true) AS visible_propietarios,
+          cb.nombre_banco,
+          cb.apodo
+        FROM fondos f
+        LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+        WHERE f.condominio_id = $1
+          AND COALESCE(f.visible_propietarios, true) = true
+          AND COALESCE(f.activo, true) = true
+        ORDER BY f.id ASC
+      `,
+      [condominioId],
+    );
+
+    res.json({ status: 'success', data: fondos.rows });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener fondos.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/estado-cuenta-cortes/:condominio_id', verifyToken, async (req: Request, res: Response<ApiRes<{ cortes: CorteFondoRow[]; periodos: CortePeriodoRow[] }>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const condominioId = toPositiveInt(req.params.condominio_id);
+    if (!condominioId) {
+      res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+      return;
+    }
+
+    const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+    if (!hasAccess) {
+      res.status(403).json({ status: 'error', message: 'No autorizado para ver cortes de este condominio.' });
+      return;
+    }
+
+    const anio = toPositiveInt(req.query.anio);
+    const mes = toPositiveInt(req.query.mes);
+    const cuentaId = toPositiveInt(req.query.cuenta_id);
+
+    const params: Array<number> = [condominioId];
+    let whereExtra = '';
+
+    if (anio) {
+      params.push(anio);
+      whereExtra += ` AND cef.anio = $${params.length}`;
+    }
+    if (mes) {
+      params.push(mes);
+      whereExtra += ` AND cef.mes = $${params.length}`;
+    }
+    if (cuentaId) {
+      params.push(cuentaId);
+      whereExtra += ` AND cef.cuenta_bancaria_id = $${params.length}`;
+    }
+
+    const periodos = await pool.query<CortePeriodoRow>(
+      `
+      SELECT DISTINCT cef.anio, cef.mes
+      FROM cortes_estado_cuenta_fondos cef
+      WHERE cef.condominio_id = $1
+        AND COALESCE(cef.visible_propietarios, true) = true
+      ORDER BY cef.anio DESC, cef.mes DESC
+      `,
+      [condominioId],
+    );
+
+    const cortes = await pool.query<CorteFondoRow>(
+      `
+      SELECT
+        cef.id,
+        cef.condominio_id,
+        cef.anio,
+        cef.mes,
+        cef.fondo_id,
+        cef.cuenta_bancaria_id,
+        cef.nombre_fondo,
+        cef.nombre_banco,
+        cef.apodo_cuenta,
+        cef.moneda,
+        COALESCE(cef.saldo_actual, 0) AS saldo_actual,
+        COALESCE(cef.saldo_bs, 0) AS saldo_bs,
+        COALESCE(cef.saldo_usd, 0) AS saldo_usd,
+        cef.tasa_referencia,
+        COALESCE(cef.visible_propietarios, true) AS visible_propietarios,
+        cef.created_at
+      FROM cortes_estado_cuenta_fondos cef
+      WHERE cef.condominio_id = $1
+        AND COALESCE(cef.visible_propietarios, true) = true
+        ${whereExtra}
+      ORDER BY cef.anio DESC, cef.mes DESC, cef.nombre_fondo ASC
+      `,
+      params,
+    );
+
+    res.json({
+      status: 'success',
+      data: {
+        cortes: cortes.rows,
+        periodos: periodos.rows,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener cortes del estado de cuenta.';
     res.status(500).json({ status: 'error', message });
   }
 });
@@ -349,6 +731,7 @@ router.get('/cuenta-principal/:condominio_id', verifyToken, async (req: Request,
         WHERE cb.condominio_id = $1
           AND COALESCE(cb.activo, true) = true
           AND COALESCE(f.activo, true) = true
+          AND COALESCE(f.visible_propietarios, true) = true
         GROUP BY cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada
         ORDER BY
           CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,

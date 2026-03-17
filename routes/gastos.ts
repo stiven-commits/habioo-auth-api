@@ -125,12 +125,14 @@ interface ICuotaCierreRow {
 
 interface IFondoSnapshotRow {
     id: number;
+    cuenta_bancaria_id: number | null;
     nombre: string;
     moneda: string | null;
     porcentaje_asignacion: string | number | null;
     saldo_actual: string | number;
     banco: string | null;
     apodo: string | null;
+    visible_propietarios: boolean;
 }
 
 interface IPropiedadZonaRow {
@@ -148,6 +150,15 @@ interface ICountRow {
 
 interface ISumTotalRow {
     total: string | null;
+}
+
+interface IPeriodRow {
+    anio: number;
+    mes: number;
+}
+
+interface IBcvApiResponse {
+    promedio?: string | number;
 }
 
 interface CreateGastoBody {
@@ -201,6 +212,19 @@ const asError = (value: unknown): Error => {
 };
 
 const toNumber = (value: string | number | null | undefined): number => parseFloat(String(value ?? 0)) || 0;
+
+const fetchBcvRateToday = async (): Promise<number> => {
+    const response = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
+    if (!response.ok) {
+        throw new Error('No se pudo obtener la tasa BCV del día.');
+    }
+    const data = await response.json() as IBcvApiResponse;
+    const rate = toNumber(data?.promedio);
+    if (!Number.isFinite(rate) || rate <= 0) {
+        throw new Error('La tasa BCV del día es inválida.');
+    }
+    return rate;
+};
 
 const toIsoDateOrNull = (value: unknown): string | null => {
     if (value === null || value === undefined) return null;
@@ -454,12 +478,14 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const fondosRes = await pool.query<IFondoSnapshotRow>(
                 `SELECT
                     f.id,
+                    f.cuenta_bancaria_id,
                     f.nombre,
                     f.moneda,
                     f.porcentaje_asignacion,
                     f.saldo_actual,
                     cb.nombre_banco AS banco,
-                    cb.apodo
+                    cb.apodo,
+                    COALESCE(f.visible_propietarios, true) AS visible_propietarios
                  FROM fondos f
                  LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
                  WHERE f.condominio_id = $1
@@ -467,6 +493,80 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                  ORDER BY f.id ASC`,
                 [condo_id]
             );
+
+            const periodoRes = await pool.query<IPeriodRow>(
+                `
+                SELECT
+                  CAST(SPLIT_PART($1, '-', 1) AS integer) AS anio,
+                  CAST(SPLIT_PART($1, '-', 2) AS integer) AS mes
+                `,
+                [mes_actual]
+            );
+            const anioCorte = periodoRes.rows[0]?.anio;
+            const mesCorte = periodoRes.rows[0]?.mes;
+            const tasaCorte = await fetchBcvRateToday();
+
+            if (anioCorte && mesCorte) {
+                for (const fondo of fondosRes.rows) {
+                    const saldo = toNumber(fondo.saldo_actual);
+                    const esBs = String(fondo.moneda || '').toUpperCase() === 'BS';
+                    const saldoBs = esBs ? saldo : saldo * tasaCorte;
+                    const saldoUsd = esBs ? (tasaCorte > 0 ? saldo / tasaCorte : 0) : saldo;
+
+                    await pool.query(
+                        `
+                        INSERT INTO cortes_estado_cuenta_fondos (
+                          condominio_id,
+                          recibo_generado_id,
+                          anio,
+                          mes,
+                          fondo_id,
+                          cuenta_bancaria_id,
+                          nombre_fondo,
+                          nombre_banco,
+                          apodo_cuenta,
+                          moneda,
+                          saldo_actual,
+                          saldo_bs,
+                          saldo_usd,
+                          tasa_referencia,
+                          visible_propietarios
+                        ) VALUES (
+                          $1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+                        )
+                        ON CONFLICT (condominio_id, anio, mes, fondo_id)
+                        DO UPDATE SET
+                          cuenta_bancaria_id = EXCLUDED.cuenta_bancaria_id,
+                          nombre_fondo = EXCLUDED.nombre_fondo,
+                          nombre_banco = EXCLUDED.nombre_banco,
+                          apodo_cuenta = EXCLUDED.apodo_cuenta,
+                          moneda = EXCLUDED.moneda,
+                          saldo_actual = EXCLUDED.saldo_actual,
+                          saldo_bs = EXCLUDED.saldo_bs,
+                          saldo_usd = EXCLUDED.saldo_usd,
+                          tasa_referencia = EXCLUDED.tasa_referencia,
+                          visible_propietarios = EXCLUDED.visible_propietarios,
+                          created_at = now()
+                        `,
+                        [
+                            condo_id,
+                            anioCorte,
+                            mesCorte,
+                            fondo.id,
+                            fondo.cuenta_bancaria_id,
+                            fondo.nombre,
+                            fondo.banco,
+                            fondo.apodo,
+                            String(fondo.moneda || 'BS'),
+                            saldo,
+                            Number(saldoBs.toFixed(2)),
+                            Number(saldoUsd.toFixed(2)),
+                            tasaCorte > 0 ? Number(tasaCorte.toFixed(4)) : null,
+                            Boolean(fondo.visible_propietarios),
+                        ]
+                    );
+                }
+            }
 
             const perfilCondo = condoRes.rows[0];
             const mensajesSnapshot = [
