@@ -148,6 +148,7 @@ interface PagosAdminBody {
     cedula_origen?: string | null;
     banco_origen?: string | null;
     moneda?: string | null;
+    metodo?: string | null;
 }
 
 interface PagoValidarParams {
@@ -653,7 +654,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
     // Ruta de administradores para registrar y aprobar pagos en cascada al instante.
     app.post('/pagos-admin', verifyToken, async (req: Request<{}, unknown, PagosAdminBody>, res: Response, _next: NextFunction) => {
-        const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, moneda } = req.body;
+        const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, moneda, metodo } = req.body;
 
         try {
             const user = asAuthUser(req.user);
@@ -671,6 +672,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
             // 1. Calculamos montos normalizados.
             const monedaFinal = moneda || 'BS';
+            const metodoFinal = String(metodo || 'Transferencia').trim() || 'Transferencia';
             const montoOrigenNum = parseLocaleNumber(monto_origen);
             const tasaNum = monedaFinal === 'BS' ? (parseLocaleNumber(tasa_cambio) || 1) : 1;
             const montoUsd = monedaFinal === 'BS' ? round2(montoOrigenNum / tasaNum) : round2(montoOrigenNum);
@@ -708,7 +710,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 monedaFinal,
                 referencia || null,
                 fechaPagoSafe,
-                'Transferencia',
+                metodoFinal,
                 'Validado',
             ];
 
@@ -805,7 +807,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
     // Ruta de propietarios: registra el pago en estado PendienteAprobacion (no afecta saldos hasta aprobar).
     app.post('/pagos-propietario', verifyToken, async (req: Request<{}, unknown, PagosAdminBody>, res: Response, _next: NextFunction) => {
-        const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, moneda, recibo_id } = req.body as PagosAdminBody & { recibo_id?: number | string | null };
+        const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, moneda, recibo_id, metodo } = req.body as PagosAdminBody & { recibo_id?: number | string | null };
 
         try {
             const user = asAuthUser(req.user);
@@ -822,6 +824,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             await pool.query('BEGIN');
 
             const monedaFinal = moneda || 'BS';
+            const metodoFinal = String(metodo || 'Transferencia').trim() || 'Transferencia';
             const montoOrigenNum = parseLocaleNumber(monto_origen);
             const tasaNum = monedaFinal === 'BS' ? (parseLocaleNumber(tasa_cambio) || 1) : 1;
             const montoUsd = monedaFinal === 'BS' ? round2(montoOrigenNum / tasaNum) : round2(montoOrigenNum);
@@ -862,7 +865,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 monedaFinal,
                 referencia || null,
                 fechaPagoSafe,
-                'Transferencia',
+                metodoFinal,
                 'PendienteAprobacion',
             ];
 

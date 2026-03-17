@@ -311,9 +311,9 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
 
             const cuentaPrincipalBs = await pool.query<IIdRow>(
                 `INSERT INTO cuentas_bancarias
-                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
+                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada, acepta_transferencia, acepta_pago_movil, pago_movil_telefono, pago_movil_cedula_rif)
                  VALUES
-                    ($1, $2, $3, $4, 'Transferencia', $5, $6, $7, true)
+                    ($1, $2, $3, $4, 'Transferencia', $5, $6, $7, true, true, true, $7, $6)
                  RETURNING id`,
                 [
                     condoId,
@@ -328,9 +328,9 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
 
             const cuentaPagoMovilBs = await pool.query<IIdRow>(
                 `INSERT INTO cuentas_bancarias
-                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
+                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada, acepta_transferencia, acepta_pago_movil, pago_movil_telefono, pago_movil_cedula_rif)
                  VALUES
-                    ($1, $2, $3, $4, 'Pago Movil', $5, $6, $7, false)
+                    ($1, $2, $3, $4, 'Pago Movil', $5, $6, $7, false, false, true, $7, $6)
                  RETURNING id`,
                 [
                     condoId,
@@ -345,9 +345,9 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
 
             const cuentaSecundariaBs = await pool.query<IIdRow>(
                 `INSERT INTO cuentas_bancarias
-                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
+                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada, acepta_transferencia, acepta_pago_movil, pago_movil_telefono, pago_movil_cedula_rif)
                  VALUES
-                    ($1, $2, $3, $4, 'Transferencia', $5, $6, $7, false)
+                    ($1, $2, $3, $4, 'Transferencia', $5, $6, $7, false, true, false, NULL, NULL)
                  RETURNING id`,
                 [
                     condoId,
@@ -362,9 +362,9 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
 
             const cuentaUsd = await pool.query<IIdRow>(
                 `INSERT INTO cuentas_bancarias
-                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada)
+                    (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono, es_predeterminada, acepta_transferencia, acepta_pago_movil, pago_movil_telefono, pago_movil_cedula_rif)
                  VALUES
-                    ($1, $2, $3, $4, 'Zelle', $5, $6, NULL, false)
+                    ($1, $2, $3, $4, 'Zelle', $5, $6, NULL, false, false, false, NULL, NULL)
                  RETURNING id`,
                 [
                     condoId,

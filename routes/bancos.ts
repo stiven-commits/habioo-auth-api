@@ -24,6 +24,10 @@ interface ICuentaBancariaRow {
     nombre_titular: string | null;
     cedula_rif: string | null;
     telefono: string | null;
+    acepta_transferencia?: boolean;
+    acepta_pago_movil?: boolean;
+    pago_movil_telefono?: string | null;
+    pago_movil_cedula_rif?: string | null;
     activo: boolean;
     es_predeterminada: boolean;
 }
@@ -65,6 +69,10 @@ interface ITableColumnRow {
     column_name: string;
 }
 
+interface IColumnNameRow {
+    column_name: string;
+}
+
 interface BancosParams {
     id?: string;
 }
@@ -77,6 +85,10 @@ interface CreateBancoBody {
     nombre_titular?: string | null;
     cedula_rif?: string | null;
     telefono?: string | null;
+    acepta_transferencia?: boolean;
+    acepta_pago_movil?: boolean;
+    pago_movil_telefono?: string | null;
+    pago_movil_cedula_rif?: string | null;
 }
 
 interface PagoProveedorBody {
@@ -146,6 +158,17 @@ const asOptionalStringOrNull = (value: unknown): string | null | undefined => {
     throw new TypeError('Invalid optional string value');
 };
 
+const asOptionalBoolean = (value: unknown): boolean | undefined => {
+    if (value === undefined || value === null || value === '') return undefined;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'true') return true;
+        if (normalized === 'false') return false;
+    }
+    throw new TypeError('Invalid optional boolean value');
+};
+
 const asError = (value: unknown): Error => {
     return value instanceof Error ? value : new Error(String(value));
 };
@@ -184,7 +207,19 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
     });
 
     app.post('/bancos', verifyToken, async (req: Request<{}, unknown, CreateBancoBody>, res: Response, _next: NextFunction) => {
-        const { numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono } = req.body;
+        const {
+            numero_cuenta,
+            nombre_banco,
+            apodo,
+            tipo,
+            nombre_titular,
+            cedula_rif,
+            telefono,
+            acepta_transferencia,
+            acepta_pago_movil,
+            pago_movil_telefono,
+            pago_movil_cedula_rif,
+        } = req.body;
         try {
             const user = asAuthUser(req.user);
             const numeroCuentaSafe = asOptionalStringOrNull(numero_cuenta);
@@ -194,17 +229,166 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const nombreTitularSafe = asOptionalStringOrNull(nombre_titular);
             const cedulaRifSafe = asOptionalStringOrNull(cedula_rif);
             const telefonoSafe = asOptionalStringOrNull(telefono);
+            const aceptaTransferenciaSafe = asOptionalBoolean(acepta_transferencia);
+            const aceptaPagoMovilSafe = asOptionalBoolean(acepta_pago_movil);
+            const pagoMovilTelefonoSafe = asOptionalStringOrNull(pago_movil_telefono);
+            const pagoMovilCedulaRifSafe = asOptionalStringOrNull(pago_movil_cedula_rif);
             const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const condoId = c.rows[0].id;
 
+            const cuentaCols = await pool.query<IColumnNameRow>(
+                `SELECT column_name
+                 FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'cuentas_bancarias'`
+            );
+            const hasCuentaCol = (name: string): boolean => cuentaCols.rows.some((r) => r.column_name === name);
+
+            const tipoNormalized = String(tipoSafe || '').trim();
+            const isLegacyTransfer = tipoNormalized === 'Transferencia';
+            const isLegacyPagoMovil = tipoNormalized === 'Pago Movil';
+
+            const canales = {
+                aceptaTransferencia: aceptaTransferenciaSafe ?? (isLegacyTransfer ? true : (isLegacyPagoMovil ? false : false)),
+                aceptaPagoMovil: aceptaPagoMovilSafe ?? isLegacyPagoMovil,
+                pagoMovilTelefono: (pagoMovilTelefonoSafe || telefonoSafe || '').trim(),
+                pagoMovilCedulaRif: (pagoMovilCedulaRifSafe || cedulaRifSafe || '').trim(),
+            };
+
+            const insertCols: string[] = ['condominio_id', 'numero_cuenta', 'nombre_banco', 'apodo', 'tipo', 'nombre_titular', 'cedula_rif', 'telefono'];
+            const insertVals: unknown[] = [condoId, numeroCuentaSafe || '', nombreBancoSafe || '', apodoSafe, tipoSafe, nombreTitularSafe || '', cedulaRifSafe || '', telefonoSafe || ''];
+
+            if (hasCuentaCol('acepta_transferencia')) {
+                insertCols.push('acepta_transferencia');
+                insertVals.push(canales.aceptaTransferencia);
+            }
+            if (hasCuentaCol('acepta_pago_movil')) {
+                insertCols.push('acepta_pago_movil');
+                insertVals.push(canales.aceptaPagoMovil);
+            }
+            if (hasCuentaCol('pago_movil_telefono')) {
+                insertCols.push('pago_movil_telefono');
+                insertVals.push(canales.aceptaPagoMovil ? canales.pagoMovilTelefono : null);
+            }
+            if (hasCuentaCol('pago_movil_cedula_rif')) {
+                insertCols.push('pago_movil_cedula_rif');
+                insertVals.push(canales.aceptaPagoMovil ? canales.pagoMovilCedulaRif : null);
+            }
+
+            const placeholders = insertVals.map((_, i) => `$${i + 1}`).join(', ');
             await pool.query(
-                'INSERT INTO cuentas_bancarias (condominio_id, numero_cuenta, nombre_banco, apodo, tipo, nombre_titular, cedula_rif, telefono) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-                [condoId, numeroCuentaSafe || '', nombreBancoSafe || '', apodoSafe, tipoSafe, nombreTitularSafe || '', cedulaRifSafe || '', telefonoSafe || '']
+                `INSERT INTO cuentas_bancarias (${insertCols.join(', ')}) VALUES (${placeholders})`,
+                insertVals
             );
             res.json({ status: 'success', message: 'Cuenta agregada' });
         } catch (err: unknown) {
             const error = asError(err);
             res.status(500).json({ error: error.message });
+        }
+    });
+
+    app.put('/bancos/:id', verifyToken, async (req: Request<BancosParams, unknown, CreateBancoBody>, res: Response, _next: NextFunction) => {
+        const {
+            numero_cuenta,
+            nombre_banco,
+            apodo,
+            tipo,
+            nombre_titular,
+            cedula_rif,
+            telefono,
+            acepta_transferencia,
+            acepta_pago_movil,
+            pago_movil_telefono,
+            pago_movil_cedula_rif,
+        } = req.body;
+        try {
+            const user = asAuthUser(req.user);
+            const cuentaId = asPositiveInt(req.params.id, 'id');
+            const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            if (!c.rows.length) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            }
+            const condoId = c.rows[0].id;
+
+            const numeroCuentaSafe = asOptionalStringOrNull(numero_cuenta);
+            const nombreBancoSafe = asOptionalStringOrNull(nombre_banco);
+            const apodoSafe = asOptionalStringOrNull(apodo);
+            const tipoSafe = asOptionalStringOrNull(tipo);
+            const nombreTitularSafe = asOptionalStringOrNull(nombre_titular);
+            const cedulaRifSafe = asOptionalStringOrNull(cedula_rif);
+            const telefonoSafe = asOptionalStringOrNull(telefono);
+            const aceptaTransferenciaSafe = asOptionalBoolean(acepta_transferencia);
+            const aceptaPagoMovilSafe = asOptionalBoolean(acepta_pago_movil);
+            const pagoMovilTelefonoSafe = asOptionalStringOrNull(pago_movil_telefono);
+            const pagoMovilCedulaRifSafe = asOptionalStringOrNull(pago_movil_cedula_rif);
+
+            const cuentaCols = await pool.query<IColumnNameRow>(
+                `SELECT column_name
+                 FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'cuentas_bancarias'`
+            );
+            const hasCuentaCol = (name: string): boolean => cuentaCols.rows.some((r) => r.column_name === name);
+
+            const tipoNormalized = String(tipoSafe || '').trim();
+            const isLegacyTransfer = tipoNormalized === 'Transferencia';
+            const isLegacyPagoMovil = tipoNormalized === 'Pago Movil';
+            const canales = {
+                aceptaTransferencia: aceptaTransferenciaSafe ?? (isLegacyTransfer ? true : (isLegacyPagoMovil ? false : false)),
+                aceptaPagoMovil: aceptaPagoMovilSafe ?? isLegacyPagoMovil,
+                pagoMovilTelefono: (pagoMovilTelefonoSafe || telefonoSafe || '').trim(),
+                pagoMovilCedulaRif: (pagoMovilCedulaRifSafe || cedulaRifSafe || '').trim(),
+            };
+
+            const updateSets: string[] = [
+                'numero_cuenta = $1',
+                'nombre_banco = $2',
+                'apodo = $3',
+                'tipo = $4',
+                'nombre_titular = $5',
+                'cedula_rif = $6',
+                'telefono = $7',
+            ];
+            const updateVals: unknown[] = [
+                numeroCuentaSafe || '',
+                nombreBancoSafe || '',
+                apodoSafe || '',
+                tipoSafe || '',
+                nombreTitularSafe || '',
+                cedulaRifSafe || '',
+                telefonoSafe || '',
+            ];
+
+            if (hasCuentaCol('acepta_transferencia')) {
+                updateSets.push(`acepta_transferencia = $${updateVals.length + 1}`);
+                updateVals.push(canales.aceptaTransferencia);
+            }
+            if (hasCuentaCol('acepta_pago_movil')) {
+                updateSets.push(`acepta_pago_movil = $${updateVals.length + 1}`);
+                updateVals.push(canales.aceptaPagoMovil);
+            }
+            if (hasCuentaCol('pago_movil_telefono')) {
+                updateSets.push(`pago_movil_telefono = $${updateVals.length + 1}`);
+                updateVals.push(canales.aceptaPagoMovil ? canales.pagoMovilTelefono : null);
+            }
+            if (hasCuentaCol('pago_movil_cedula_rif')) {
+                updateSets.push(`pago_movil_cedula_rif = $${updateVals.length + 1}`);
+                updateVals.push(canales.aceptaPagoMovil ? canales.pagoMovilCedulaRif : null);
+            }
+
+            updateVals.push(cuentaId, condoId);
+            const result = await pool.query(
+                `UPDATE cuentas_bancarias
+                 SET ${updateSets.join(', ')}
+                 WHERE id = $${updateVals.length - 1} AND condominio_id = $${updateVals.length}
+                 RETURNING id`,
+                updateVals
+            );
+            if (!result.rows.length) {
+                return res.status(404).json({ status: 'error', message: 'Cuenta bancaria no encontrada.' });
+            }
+            return res.json({ status: 'success', message: 'Cuenta actualizada.' });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ status: 'error', message: error.message });
         }
     });
 

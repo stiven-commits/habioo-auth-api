@@ -106,6 +106,10 @@ interface CuentaPrincipalRow {
   apodo: string | null;
   tipo: string | null;
   es_predeterminada: boolean | null;
+  acepta_transferencia?: boolean | null;
+  acepta_pago_movil?: boolean | null;
+  pago_movil_telefono?: string | null;
+  pago_movil_cedula_rif?: string | null;
 }
 
 interface CuentaCondominioRow {
@@ -114,6 +118,10 @@ interface CuentaCondominioRow {
   apodo: string | null;
   tipo: string | null;
   es_predeterminada: boolean | null;
+  acepta_transferencia?: boolean | null;
+  acepta_pago_movil?: boolean | null;
+  pago_movil_telefono?: string | null;
+  pago_movil_cedula_rif?: string | null;
 }
 
 interface NotificacionPagoRow {
@@ -591,14 +599,20 @@ router.get('/cuentas/:condominio_id', verifyToken, async (req: Request, res: Res
           cb.nombre_banco,
           cb.apodo,
           cb.tipo,
-          cb.es_predeterminada
+          cb.es_predeterminada,
+          cb.acepta_transferencia,
+          cb.acepta_pago_movil,
+          cb.pago_movil_telefono,
+          cb.pago_movil_cedula_rif
         FROM cuentas_bancarias cb
         INNER JOIN fondos f ON f.cuenta_bancaria_id = cb.id
         WHERE cb.condominio_id = $1
           AND COALESCE(cb.activo, true) = true
           AND COALESCE(f.activo, true) = true
           AND COALESCE(f.visible_propietarios, true) = true
-        GROUP BY cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada
+        GROUP BY
+          cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada,
+          cb.acepta_transferencia, cb.acepta_pago_movil, cb.pago_movil_telefono, cb.pago_movil_cedula_rif
         ORDER BY
           CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,
           cb.id ASC
@@ -640,13 +654,19 @@ router.get('/fondos-principal/:condominio_id', verifyToken, async (req: Request,
           cb.nombre_banco,
           cb.apodo,
           cb.tipo,
-          cb.es_predeterminada
+          cb.es_predeterminada,
+          cb.acepta_transferencia,
+          cb.acepta_pago_movil,
+          cb.pago_movil_telefono,
+          cb.pago_movil_cedula_rif
         FROM cuentas_bancarias cb
         INNER JOIN fondos f ON f.cuenta_bancaria_id = cb.id
         WHERE cb.condominio_id = $1
           AND COALESCE(cb.activo, true) = true
           AND COALESCE(f.activo, true) = true
-        GROUP BY cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada
+        GROUP BY
+          cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada,
+          cb.acepta_transferencia, cb.acepta_pago_movil, cb.pago_movil_telefono, cb.pago_movil_cedula_rif
         ORDER BY
           CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,
           cb.id ASC
@@ -854,14 +874,20 @@ router.get('/cuenta-principal/:condominio_id', verifyToken, async (req: Request,
           cb.nombre_banco,
           cb.apodo,
           cb.tipo,
-          cb.es_predeterminada
+          cb.es_predeterminada,
+          cb.acepta_transferencia,
+          cb.acepta_pago_movil,
+          cb.pago_movil_telefono,
+          cb.pago_movil_cedula_rif
         FROM cuentas_bancarias cb
         INNER JOIN fondos f ON f.cuenta_bancaria_id = cb.id
         WHERE cb.condominio_id = $1
           AND COALESCE(cb.activo, true) = true
           AND COALESCE(f.activo, true) = true
           AND COALESCE(f.visible_propietarios, true) = true
-        GROUP BY cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada
+        GROUP BY
+          cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada,
+          cb.acepta_transferencia, cb.acepta_pago_movil, cb.pago_movil_telefono, cb.pago_movil_cedula_rif
         ORDER BY
           CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,
           cb.id ASC
