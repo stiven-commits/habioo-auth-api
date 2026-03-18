@@ -1,4 +1,4 @@
-﻿import type { Application, NextFunction, Request, Response } from 'express';
+import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 
 const fs: typeof import('fs') = require('fs');
@@ -791,6 +791,32 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const error = asError(err);
             await pool.query('ROLLBACK');
             res.status(500).json({ error: error.message });
+        }
+    });
+
+    app.get('/gastos-extras-procesados', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const condoRes = await pool.query<{id: number}>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            if (condoRes.rows.length === 0) return res.status(404).json({status:'error'});
+            
+            const condoId = condoRes.rows[0].id;
+
+            const result = await pool.query(
+                `
+                SELECT DISTINCT g.id, g.concepto, g.monto_usd, COALESCE(g.monto_pagado_usd, 0) as monto_pagado_usd, (g.monto_usd - COALESCE(g.monto_pagado_usd, 0)) as deuda_restante
+                FROM gastos g
+                JOIN gastos_cuotas gc ON g.id = gc.gasto_id
+                WHERE g.condominio_id = $1 AND g.tipo = 'Extra' AND gc.estado = 'Procesado'
+                  AND (g.monto_usd - COALESCE(g.monto_pagado_usd, 0)) > 0
+                ORDER BY g.id DESC
+                `,
+                [condoId]
+            );
+
+            res.json({ status: 'success', gastos: result.rows });
+        } catch (err: unknown) {
+            res.status(500).json({ error: asError(err).message });
         }
     });
 };

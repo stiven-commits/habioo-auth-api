@@ -13,6 +13,7 @@ interface PagosOptionalColumns {
     nota: boolean;
     cedula_origen: boolean;
     banco_origen: boolean;
+    telefono_origen: boolean;
 }
 
 type VerifyTokenMiddleware = (req: Request, res: Response, next: NextFunction) => unknown;

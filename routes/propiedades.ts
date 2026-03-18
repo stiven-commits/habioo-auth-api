@@ -1,4 +1,4 @@
-﻿import type { Application, NextFunction, Request, Response } from 'express';
+import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 
 interface AuthUser {
@@ -169,6 +169,11 @@ interface AjustarSaldoBody {
     monto?: string | number;
     tipo_ajuste: string;
     nota?: string;
+    monto_bs?: string | number;
+    tasa_cambio?: string | number;
+    cuenta_bancaria_id?: number | null;
+    es_gasto_extra?: boolean;
+    gasto_extra_id?: number | null;
 }
 
 interface CopropietarioBody {
@@ -1193,8 +1198,20 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     );
                 }
                 userId = userRes.rows[0].id;
-                const linkRes = await pool.query<ILinkIdRow>('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Propietario']);
-                if (linkRes.rows.length > 0) { await pool.query('UPDATE usuarios_propiedades SET user_id = $1 WHERE id = $2', [userId, linkRes.rows[0].id]); }
+                const linkRes = await pool.query<{ id: number; user_id: number }>('SELECT id, user_id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Propietario']);
+                if (linkRes.rows.length > 0) { 
+                    const oldUserId = linkRes.rows[0].user_id;
+                    await pool.query('UPDATE usuarios_propiedades SET user_id = $1 WHERE id = $2', [userId, linkRes.rows[0].id]); 
+                    
+                    if (oldUserId !== userId) {
+                        await pool.query(`
+                            DELETE FROM users 
+                            WHERE id = $1 
+                              AND NOT EXISTS (SELECT 1 FROM usuarios_propiedades WHERE user_id = $1)
+                              AND NOT EXISTS (SELECT 1 FROM condominios WHERE admin_user_id = $1)
+                        `, [oldUserId]);
+                    }
+                }
                 else { await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol) VALUES ($1, $2, $3)', [userId, propiedadId, 'Propietario']); }
             }
 
@@ -1214,11 +1231,33 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     );
                 }
                 const tenantId = tenantRes.rows[0].id;
-                const tenantLink = await pool.query<ILinkIdRow>('SELECT id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
-                if (tenantLink.rows.length > 0) { await pool.query('UPDATE usuarios_propiedades SET user_id = $1, acceso_portal = $2 WHERE id = $3', [tenantId, inqPermitirAcceso, tenantLink.rows[0].id]); }
+                const tenantLink = await pool.query<{ id: number; user_id: number }>('SELECT id, user_id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
+                if (tenantLink.rows.length > 0) { 
+                    const oldTenantId = tenantLink.rows[0].user_id;
+                    await pool.query('UPDATE usuarios_propiedades SET user_id = $1, acceso_portal = $2 WHERE id = $3', [tenantId, inqPermitirAcceso, tenantLink.rows[0].id]); 
+                    
+                    if (oldTenantId !== tenantId) {
+                        await pool.query(`
+                            DELETE FROM users 
+                            WHERE id = $1 
+                              AND NOT EXISTS (SELECT 1 FROM usuarios_propiedades WHERE user_id = $1)
+                              AND NOT EXISTS (SELECT 1 FROM condominios WHERE admin_user_id = $1)
+                        `, [oldTenantId]);
+                    }
+                }
                 else { await pool.query('INSERT INTO usuarios_propiedades (user_id, propiedad_id, rol, acceso_portal) VALUES ($1, $2, $3, $4)', [tenantId, propiedadId, 'Inquilino', inqPermitirAcceso]); }
             } else {
+                const tenantLinks = await pool.query<{ user_id: number }>('SELECT user_id FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
                 await pool.query('DELETE FROM usuarios_propiedades WHERE propiedad_id = $1 AND rol = $2', [propiedadId, 'Inquilino']);
+                
+                for (const row of tenantLinks.rows) {
+                    await pool.query(`
+                        DELETE FROM users 
+                        WHERE id = $1 
+                          AND NOT EXISTS (SELECT 1 FROM usuarios_propiedades WHERE user_id = $1)
+                          AND NOT EXISTS (SELECT 1 FROM condominios WHERE admin_user_id = $1)
+                    `, [row.user_id]);
+                }
             }
             await pool.query('COMMIT');
             res.json({ status: 'success', message: 'Inmueble actualizado correctamente' });
@@ -1265,9 +1304,22 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             await pool.query('BEGIN');
             await pool.query('DELETE FROM pagos WHERE propiedad_id = $1', [propiedadId]);
             await pool.query('DELETE FROM historial_saldos_inmuebles WHERE propiedad_id = $1', [propiedadId]);
+            
+            const usersToDelete = await pool.query<{ user_id: number }>('SELECT user_id FROM usuarios_propiedades WHERE propiedad_id = $1', [propiedadId]);
             await pool.query('DELETE FROM usuarios_propiedades WHERE propiedad_id = $1', [propiedadId]);
+            
             await pool.query('DELETE FROM propiedades_zonas WHERE propiedad_id = $1', [propiedadId]);
             await pool.query('DELETE FROM propiedades WHERE id = $1 AND condominio_id = $2', [propiedadId, condominioId]);
+            
+            for (const row of usersToDelete.rows) {
+                await pool.query(`
+                    DELETE FROM users 
+                    WHERE id = $1 
+                      AND NOT EXISTS (SELECT 1 FROM usuarios_propiedades WHERE user_id = $1)
+                      AND NOT EXISTS (SELECT 1 FROM condominios WHERE admin_user_id = $1)
+                `, [row.user_id]);
+            }
+            
             await pool.query('COMMIT');
 
             res.json({ status: 'success', message: 'Inmueble eliminado correctamente.' });
@@ -1281,7 +1333,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
     // 7. AJUSTAR SALDO MANUALMENTE
     app.post('/propiedades-admin/:id/ajustar-saldo', verifyToken, async (req: Request<PropiedadEstadoCuentaParams, unknown, AjustarSaldoBody>, res: Response, _next: NextFunction) => {
         const propiedadId = asString(req.params.id);
-        const { monto, tipo_ajuste, nota } = req.body;
+        const { monto, tipo_ajuste, nota, monto_bs, tasa_cambio, cuenta_bancaria_id, es_gasto_extra, gasto_extra_id } = req.body;
         const montoNum = parseFloat((monto || '0').toString().replace(',', '.')) || 0;
         if (montoNum <= 0) return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
 
@@ -1290,6 +1342,32 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             const operador = tipo_ajuste === 'CARGAR_DEUDA' ? '+' : '-';
             await pool.query(`UPDATE propiedades SET saldo_actual = saldo_actual ${operador} $1 WHERE id = $2`, [montoNum, propiedadId]);
             await pool.query('INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)', [propiedadId, tipo_ajuste, montoNum, nota || 'Ajuste manual del administrador']);
+            
+            if (tipo_ajuste === 'AGREGAR_FAVOR' && cuenta_bancaria_id && !es_gasto_extra) {
+                const fondosRes = await pool.query<{ id: number; moneda: string }>(
+                    'SELECT id, moneda FROM fondos WHERE cuenta_bancaria_id = $1 AND activo = true ORDER BY es_operativo DESC, id ASC',
+                    [cuenta_bancaria_id]
+                );
+                if (fondosRes.rows.length > 0) {
+                    const f = fondosRes.rows[0];
+                    let montoFondo = montoNum;
+                    if (f.moneda === 'Bs' || f.moneda === 'BS') {
+                        montoFondo = parseFloat(String(monto_bs || '0')) || montoNum * (parseFloat(String(tasa_cambio || '1')) || 1);
+                    }
+                    await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, f.id]);
+                    await pool.query(
+                        'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5)', 
+                        [f.id, 'INGRESO', montoFondo, parseFloat(String(tasa_cambio || '1')) || 1, nota || 'Ajuste manual a favor']
+                    );
+                }
+            } else if (tipo_ajuste === 'AGREGAR_FAVOR' && es_gasto_extra && gasto_extra_id) {
+                // Abono directo para rebajar la deuda del gasto extra
+                await pool.query(
+                    'UPDATE gastos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1 WHERE id = $2',
+                    [montoNum, gasto_extra_id]
+                );
+            }
+            
             await pool.query('COMMIT');
             res.json({ status: 'success', message: 'Saldo ajustado exitosamente' });
         } catch (err: unknown) {

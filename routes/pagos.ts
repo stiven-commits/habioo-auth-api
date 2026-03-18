@@ -10,6 +10,7 @@ interface OptionalPagosColumns {
     nota?: boolean;
     cedula_origen?: boolean;
     banco_origen?: boolean;
+    telefono_origen?: boolean;
     [key: string]: boolean | undefined;
 }
 
@@ -147,6 +148,7 @@ interface PagosAdminBody {
     nota?: string | null;
     cedula_origen?: string | null;
     banco_origen?: string | null;
+    telefono_origen?: string | null;
     moneda?: string | null;
     metodo?: string | null;
 }
@@ -654,7 +656,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
     // Ruta de administradores para registrar y aprobar pagos en cascada al instante.
     app.post('/pagos-admin', verifyToken, async (req: Request<{}, unknown, PagosAdminBody>, res: Response, _next: NextFunction) => {
-        const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, moneda, metodo } = req.body;
+        const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, telefono_origen, moneda, metodo } = req.body;
 
         try {
             const user = asAuthUser(req.user);
@@ -682,10 +684,12 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const optionalCols = await getPagosColumns();
             const bancoOrigenSafe = (banco_origen || '').trim();
             const cedulaOrigenSafe = (cedula_origen || '').trim();
+            const telefonoOrigenSafe = String(telefono_origen || '').replace(/\D/g, '').trim();
             const notaBase = (nota || '').trim();
             const notaOrigenPartes: string[] = [];
             if (bancoOrigenSafe) notaOrigenPartes.push(`Banco origen: ${bancoOrigenSafe}`);
             if (cedulaOrigenSafe) notaOrigenPartes.push(`Cedula origen: ${cedulaOrigenSafe}`);
+            if (telefonoOrigenSafe) notaOrigenPartes.push(`Telefono origen: ${telefonoOrigenSafe}`);
             const notaConOrigen = [notaBase, ...notaOrigenPartes].filter(Boolean).join(' | ');
             const insertColumns = [
                 'propiedad_id',
@@ -725,6 +729,10 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             if (optionalCols.banco_origen) {
                 insertColumns.push('banco_origen');
                 insertValues.push(bancoOrigenSafe || null);
+            }
+            if (optionalCols.telefono_origen) {
+                insertColumns.push('telefono_origen');
+                insertValues.push(telefonoOrigenSafe || null);
             }
 
             const placeholders = insertValues.map((_, i) => `$${i + 1}`).join(', ');
@@ -807,7 +815,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
     // Ruta de propietarios: registra el pago en estado PendienteAprobacion (no afecta saldos hasta aprobar).
     app.post('/pagos-propietario', verifyToken, async (req: Request<{}, unknown, PagosAdminBody>, res: Response, _next: NextFunction) => {
-        const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, moneda, recibo_id, metodo } = req.body as PagosAdminBody & { recibo_id?: number | string | null };
+        const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, telefono_origen, moneda, recibo_id, metodo } = req.body as PagosAdminBody & { recibo_id?: number | string | null };
 
         try {
             const user = asAuthUser(req.user);
@@ -833,10 +841,12 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const optionalCols = await getPagosColumns();
             const bancoOrigenSafe = (banco_origen || '').trim();
             const cedulaOrigenSafe = (cedula_origen || '').trim();
+            const telefonoOrigenSafe = String(telefono_origen || '').replace(/\D/g, '').trim();
             const notaBase = (nota || '').trim();
             const notaOrigenPartes: string[] = [];
             if (bancoOrigenSafe) notaOrigenPartes.push(`Banco origen: ${bancoOrigenSafe}`);
             if (cedulaOrigenSafe) notaOrigenPartes.push(`Cedula origen: ${cedulaOrigenSafe}`);
+            if (telefonoOrigenSafe) notaOrigenPartes.push(`Telefono origen: ${telefonoOrigenSafe}`);
             const notaConOrigen = [notaBase, ...notaOrigenPartes].filter(Boolean).join(' | ');
 
             const reciboIdNum = parseInt(String(recibo_id ?? ''), 10);
@@ -880,6 +890,10 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             if (optionalCols.banco_origen) {
                 insertColumns.push('banco_origen');
                 insertValues.push(bancoOrigenSafe || null);
+            }
+            if (optionalCols.telefono_origen) {
+                insertColumns.push('telefono_origen');
+                insertValues.push(telefonoOrigenSafe || null);
             }
 
             const placeholders = insertValues.map((_, i) => `$${i + 1}`).join(', ');
