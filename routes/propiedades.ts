@@ -127,7 +127,9 @@ interface PropiedadAdminBody {
     prop_nombre?: string;
     prop_cedula?: string;
     prop_email?: string | null;
+    prop_email_secundario?: string | null;
     prop_telefono?: string | null;
+    prop_telefono_secundario?: string | null;
     prop_password?: string;
     tiene_inquilino?: boolean;
     inq_nombre?: string;
@@ -154,7 +156,9 @@ interface PropiedadEditBody {
     prop_nombre?: string;
     prop_cedula?: string;
     prop_email?: string | null;
+    prop_email_secundario?: string | null;
     prop_telefono?: string | null;
+    prop_telefono_secundario?: string | null;
     prop_password?: string;
     tiene_inquilino?: boolean;
     inq_nombre?: string;
@@ -1006,7 +1010,9 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             prop_nombre,
             prop_cedula,
             prop_email,
+            prop_email_secundario,
             prop_telefono,
+            prop_telefono_secundario,
             prop_password,
             tiene_inquilino,
             inq_nombre,
@@ -1110,8 +1116,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 
                 if (!userId) {
                     const insertRes = await pool.query<IUserIdRow>(
-                        'INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-                        [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_telefono || null, prop_password || propCedulaNormalized]
+                        'INSERT INTO users (cedula, nombre, email, email_secundario, telefono, telefono_secundario, password) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+                        [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_email_secundario || null, prop_telefono || null, prop_telefono_secundario || null, prop_password || propCedulaNormalized]
                     );
                     userId = insertRes.rows[0].id;
                 }
@@ -1165,9 +1171,11 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
     // 5. EDITAR PROPIEDAD INDIVIDUAL
     app.put('/propiedades-admin/:id', verifyToken, async (req: Request<PropiedadEstadoCuentaParams, unknown, PropiedadEditBody>, res: Response, _next: NextFunction) => {
         const propiedadId = asString(req.params.id);
-        const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_telefono, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password, inq_permitir_acceso } = req.body;
+        const { identificador, alicuota, zona_id, prop_nombre, prop_cedula, prop_email, prop_email_secundario, prop_telefono, prop_telefono_secundario, prop_password, tiene_inquilino, inq_nombre, inq_cedula, inq_email, inq_telefono, inq_password, inq_permitir_acceso } = req.body;
 
         const ownerEmail = (prop_email || '').trim() || null;
+        const ownerEmailSec = (prop_email_secundario || '').trim() || null;
+        const ownerTelefonoSec = (prop_telefono_secundario || '').trim() || null;
         const tenantEmail = (inq_email || '').trim() || null;
         const identificadorNormalized = normalizeIdentifier(identificador);
         const propCedulaNormalized = normalizeDoc(prop_cedula);
@@ -1175,8 +1183,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         const inqCedulaNormalized = normalizeDoc(inq_cedula);
         const inqNombreNormalized = toTitleCase(inq_nombre);
         const alicuotaNum = parseFloat((alicuota || '0').toString().replace(',', '.')) || 0;
-        if (!isValidEmail(ownerEmail)) return res.status(400).json({ error: 'Email del propietario invÃ¡lido.' });
-        if (!isValidEmail(tenantEmail)) return res.status(400).json({ error: 'Email del inquilino invÃ¡lido.' });
+        if (!isValidEmail(ownerEmail)) return res.status(400).json({ error: 'Email del propietario inválido.' });
+        if (!isValidEmail(tenantEmail)) return res.status(400).json({ error: 'Email del inquilino inválido.' });
 
         try {
             await pool.query('BEGIN');
@@ -1186,7 +1194,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 let userRes = await pool.query<IUserIdRow>('SELECT id FROM users WHERE cedula = $1', [propCedulaNormalized]);
                 let userId: number | null = null;
                 if (userRes.rows.length === 0) {
-                    userRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, telefono, password) VALUES ($1, $2, $3, $4, $5) RETURNING id', [propCedulaNormalized, propNombreNormalized, ownerEmail, prop_telefono || null, prop_password || propCedulaNormalized]);
+                    userRes = await pool.query<IUserIdRow>('INSERT INTO users (cedula, nombre, email, email_secundario, telefono, telefono_secundario, password) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id', [propCedulaNormalized, propNombreNormalized, ownerEmail, ownerEmailSec, prop_telefono || null, ownerTelefonoSec, prop_password || propCedulaNormalized]);
                 } else {
                     const existingOwnerId = userRes.rows[0].id;
                     const propiedadIdNum = parseInt(propiedadId, 10) || 0;
@@ -1195,6 +1203,11 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                         propiedadIdNum,
                         { nombre: propNombreNormalized, email: ownerEmail, telefono: prop_telefono || null, password: prop_password || null },
                         false
+                    );
+                    // Actualizar campos secundarios adicionales
+                    await pool.query(
+                        'UPDATE users SET email_secundario = $1, telefono_secundario = $2 WHERE id = $3',
+                        [ownerEmailSec, ownerTelefonoSec, existingOwnerId]
                     );
                 }
                 userId = userRes.rows[0].id;

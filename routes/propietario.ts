@@ -976,7 +976,9 @@ router.get('/perfil', verifyToken, async (req: Request, res: Response<ApiRes<Pro
           u.nombre,
           u.cedula,
           u.email,
-          u.telefono
+          u.email_secundario,
+          u.telefono,
+          u.telefono_secundario
         FROM users u
         WHERE u.id = $1
         LIMIT 1
@@ -1004,10 +1006,12 @@ router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes>): 
       return;
     }
 
-    const body = req.body as { cedula?: unknown; email?: unknown; telefono?: unknown };
+    const body = req.body as { cedula?: unknown; email?: unknown; email_secundario?: unknown; telefono?: unknown; telefono_secundario?: unknown };
     const cedula = normalizeNullableText(body.cedula)?.toUpperCase() ?? null;
     const email = normalizeNullableText(body.email)?.toLowerCase() ?? null;
+    const emailSecundario = normalizeNullableText(body.email_secundario)?.toLowerCase() ?? null;
     const telefono = normalizeNullableText(body.telefono) ?? null;
+    const telefonoSecundario = normalizeNullableText(body.telefono_secundario) ?? null;
 
     if (!cedula) {
       res.status(400).json({ status: 'error', message: 'La cédula es obligatoria.' });
@@ -1021,8 +1025,16 @@ router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes>): 
       res.status(400).json({ status: 'error', message: 'Formato de correo inválido.' });
       return;
     }
+    if (emailSecundario && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailSecundario)) {
+      res.status(400).json({ status: 'error', message: 'Formato de correo secundario inválido.' });
+      return;
+    }
     if (telefono && !/^[0-9]{7,15}$/.test(telefono)) {
       res.status(400).json({ status: 'error', message: 'El teléfono debe contener solo números (7 a 15 dígitos).' });
+      return;
+    }
+    if (telefonoSecundario && !/^[0-9]{7,15}$/.test(telefonoSecundario)) {
+      res.status(400).json({ status: 'error', message: 'El teléfono alternativo debe contener solo números (7 a 15 dígitos).' });
       return;
     }
 
@@ -1031,10 +1043,12 @@ router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes>): 
         UPDATE users
         SET cedula = $1,
             email = $2,
-            telefono = $3
-        WHERE id = $4
+            email_secundario = $3,
+            telefono = $4,
+            telefono_secundario = $5
+        WHERE id = $6
       `,
-      [cedula, email, telefono, authUser.id],
+      [cedula, email, emailSecundario, telefono, telefonoSecundario, authUser.id],
     );
 
     if (updateRes.rowCount === 0) {
