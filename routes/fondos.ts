@@ -1,4 +1,4 @@
-﻿import type { Application, NextFunction, Request, Response } from 'express';
+import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 
 interface AuthUser {
@@ -154,6 +154,31 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 status: 'success',
                 message: visible ? 'Fondo visible para inmuebles.' : 'Fondo oculto para inmuebles.',
             });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ status: 'error', message: error.message });
+        }
+    });
+
+    app.put('/fondos/:id/operativo', verifyToken, async (req: Request<FondosDeleteParams>, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const fondoId = asString(req.params.id);
+
+            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            const condoId = condoRes.rows[0]?.id;
+
+            if (!condoId) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+
+            const fondoRes = await pool.query<IFondoRow>('SELECT cuenta_bancaria_id FROM fondos WHERE id = $1 AND condominio_id = $2', [fondoId, condoId]);
+            if (fondoRes.rows.length === 0) return res.status(404).json({ error: 'Fondo no encontrado.' });
+            
+            const cuentaBancariaId = fondoRes.rows[0].cuenta_bancaria_id;
+
+            await pool.query('UPDATE fondos SET es_operativo = false WHERE cuenta_bancaria_id = $1 AND condominio_id = $2', [cuentaBancariaId, condoId]);
+            await pool.query('UPDATE fondos SET es_operativo = true, porcentaje_asignacion = 0 WHERE id = $1 AND condominio_id = $2', [fondoId, condoId]);
+
+            return res.json({ status: 'success', message: 'Fondo establecido como principal.' });
         } catch (err: unknown) {
             const error = asError(err);
             return res.status(500).json({ status: 'error', message: error.message });
