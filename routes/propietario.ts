@@ -145,6 +145,30 @@ interface PropietarioPerfilRow {
   cedula: string | null;
   email: string | null;
   telefono: string | null;
+  email_secundario?: string | null;
+  telefono_secundario?: string | null;
+}
+
+interface PerfilRelacionUserRow {
+  id: number;
+  nombre: string | null;
+  cedula: string | null;
+  email: string | null;
+  telefono: string | null;
+  email_secundario: string | null;
+  telefono_secundario: string | null;
+}
+
+interface PerfilRolRow {
+  rol: string;
+}
+
+interface PerfilRelacionesData {
+  propiedad_id: number;
+  rol_actual: string | null;
+  propietario: PerfilRelacionUserRow | null;
+  residente: PerfilRelacionUserRow | null;
+  copropietarios: PerfilRelacionUserRow[];
 }
 
 interface CorteFondoRow {
@@ -994,6 +1018,112 @@ router.get('/perfil', verifyToken, async (req: Request, res: Response<ApiRes<Pro
     res.json({ status: 'success', data: result.rows[0] });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Error al obtener el perfil del propietario.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.get('/perfil-relaciones', verifyToken, async (req: Request, res: Response<ApiRes<PerfilRelacionesData>>): Promise<void> => {
+  try {
+    const authUser = getAuthUser(req);
+    if (!authUser) {
+      res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+      return;
+    }
+
+    const propiedadIdQuery = toPositiveInt((req.query as { propiedad_id?: unknown }).propiedad_id);
+    let propiedadId = propiedadIdQuery;
+
+    if (propiedadId) {
+      const hasAccess = await userHasPropiedadAccess(authUser.id, propiedadId);
+      if (!hasAccess) {
+        res.status(403).json({ status: 'error', message: 'No tienes acceso a ese inmueble.' });
+        return;
+      }
+    } else {
+      const defaultPropRes = await pool.query<{ propiedad_id: number }>(
+        `
+          SELECT up.propiedad_id
+          FROM usuarios_propiedades up
+          WHERE up.user_id = $1
+            AND COALESCE(up.acceso_portal, true) = true
+          ORDER BY
+            CASE
+              WHEN up.rol = 'Propietario' THEN 1
+              WHEN up.rol = 'Copropietario' THEN 2
+              WHEN up.rol = 'Inquilino' THEN 3
+              ELSE 9
+            END,
+            up.propiedad_id ASC
+          LIMIT 1
+        `,
+        [authUser.id]
+      );
+      propiedadId = defaultPropRes.rows[0]?.propiedad_id || null;
+      if (!propiedadId) {
+        res.status(404).json({ status: 'error', message: 'No se encontró un inmueble asociado al usuario.' });
+        return;
+      }
+    }
+
+    const [rolActualRes, propietarioRes, residenteRes, copropsRes] = await Promise.all([
+      pool.query<PerfilRolRow>(
+        `
+          SELECT up.rol
+          FROM usuarios_propiedades up
+          WHERE up.user_id = $1
+            AND up.propiedad_id = $2
+            AND COALESCE(up.acceso_portal, true) = true
+          LIMIT 1
+        `,
+        [authUser.id, propiedadId]
+      ),
+      pool.query<PerfilRelacionUserRow>(
+        `
+          SELECT u.id, u.nombre, u.cedula, u.email, u.telefono, u.email_secundario, u.telefono_secundario
+          FROM usuarios_propiedades up
+          INNER JOIN users u ON u.id = up.user_id
+          WHERE up.propiedad_id = $1
+            AND up.rol = 'Propietario'
+          LIMIT 1
+        `,
+        [propiedadId]
+      ),
+      pool.query<PerfilRelacionUserRow>(
+        `
+          SELECT u.id, u.nombre, u.cedula, u.email, u.telefono, u.email_secundario, u.telefono_secundario
+          FROM usuarios_propiedades up
+          INNER JOIN users u ON u.id = up.user_id
+          WHERE up.propiedad_id = $1
+            AND up.rol = 'Inquilino'
+          LIMIT 1
+        `,
+        [propiedadId]
+      ),
+      pool.query<PerfilRelacionUserRow>(
+        `
+          SELECT u.id, u.nombre, u.cedula, u.email, u.telefono, u.email_secundario, u.telefono_secundario
+          FROM usuarios_propiedades up
+          INNER JOIN users u ON u.id = up.user_id
+          WHERE up.propiedad_id = $1
+            AND up.rol = 'Copropietario'
+          ORDER BY u.nombre ASC NULLS LAST, u.cedula ASC NULLS LAST
+        `,
+        [propiedadId]
+      ),
+    ]);
+
+    res.json({
+      status: 'success',
+      data: {
+        propiedad_id: propiedadId,
+        rol_actual: rolActualRes.rows[0]?.rol || null,
+        propietario: propietarioRes.rows[0] || null,
+        residente: residenteRes.rows[0] || null,
+        copropietarios: copropsRes.rows,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error al obtener relaciones del inmueble.';
     res.status(500).json({ status: 'error', message });
   }
 });
