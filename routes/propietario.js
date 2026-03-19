@@ -1,0 +1,913 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const { pool } = require('../config/db');
+const { verifyToken } = require('../middleware/verifyToken');
+const router = express.Router();
+const getAuthUser = (req) => {
+    const authUser = req.user;
+    if (!authUser || typeof authUser.id !== 'number')
+        return null;
+    return authUser;
+};
+const toPositiveInt = (value) => {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0)
+        return null;
+    return parsed;
+};
+const normalizeNullableText = (value) => {
+    if (value === null || value === undefined)
+        return null;
+    const str = String(value).trim();
+    return str ? str : null;
+};
+const userHasCondominioAccess = async (userId, condominioId) => {
+    const result = await pool.query(`
+      SELECT 1 AS exists
+      FROM usuarios_propiedades up
+      INNER JOIN propiedades p ON p.id = up.propiedad_id
+      WHERE up.user_id = $1
+        AND p.condominio_id = $2
+        AND COALESCE(up.acceso_portal, true) = true
+      LIMIT 1
+    `, [userId, condominioId]);
+    return result.rows.length > 0;
+};
+const userHasPropiedadAccess = async (userId, propiedadId) => {
+    const result = await pool.query(`
+      SELECT 1 AS exists
+      FROM usuarios_propiedades up
+      WHERE up.user_id = $1
+        AND up.propiedad_id = $2
+        AND COALESCE(up.acceso_portal, true) = true
+      LIMIT 1
+    `, [userId, propiedadId]);
+    return result.rows.length > 0;
+};
+router.get('/mis-propiedades', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const result = await pool.query(`
+        SELECT
+          p.id AS id_propiedad,
+          p.identificador,
+          COALESCE(c.nombre_legal, c.nombre, 'Condominio') AS nombre_condominio,
+          p.condominio_id AS id_condominio,
+          COALESCE(p.saldo_actual, 0) AS saldo_actual
+        FROM usuarios_propiedades up
+        INNER JOIN propiedades p ON p.id = up.propiedad_id
+        INNER JOIN condominios c ON c.id = p.condominio_id
+        WHERE up.user_id = $1
+          AND COALESCE(up.acceso_portal, true) = true
+        ORDER BY p.condominio_id ASC, p.identificador ASC
+      `, [authUser.id]);
+        res.json({ status: 'success', data: result.rows });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener propiedades.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/gastos/:condominio_id', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const condominioId = toPositiveInt(req.params.condominio_id);
+        if (!condominioId) {
+            res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+            return;
+        }
+        const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+        if (!hasAccess) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para ver gastos de este condominio.' });
+            return;
+        }
+        const result = await pool.query(`
+        SELECT
+          g.id,
+          g.condominio_id,
+          g.concepto,
+          COALESCE(g.monto_bs, 0) AS monto_bs,
+          COALESCE(g.monto_usd, 0) AS monto_usd,
+          COALESCE(g.total_cuotas, 1) AS total_cuotas,
+          g.fecha_gasto,
+          g.nota,
+          g.clasificacion
+        FROM gastos g
+        WHERE g.condominio_id = $1
+          AND COALESCE(g.tipo, 'Comun') = 'Comun'
+        ORDER BY g.fecha_gasto DESC, g.id DESC
+      `, [condominioId]);
+        res.json({ status: 'success', data: result.rows });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener gastos.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/mis-recibos/:propiedad_id', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const propiedadId = toPositiveInt(req.params.propiedad_id);
+        if (!propiedadId) {
+            res.status(400).json({ status: 'error', message: 'propiedad_id inválido.' });
+            return;
+        }
+        const hasAccess = await userHasPropiedadAccess(authUser.id, propiedadId);
+        if (!hasAccess) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para ver recibos de este inmueble.' });
+            return;
+        }
+        const result = await pool.query(`
+        SELECT
+          r.id,
+          r.propiedad_id,
+          r.mes_cobro,
+          COALESCE(r.monto_usd, 0) AS monto_usd,
+          COALESCE(r.monto_pagado_usd, 0) AS monto_pagado_usd,
+          r.estado,
+          r.fecha_emision,
+          r.fecha_vencimiento
+        FROM recibos r
+        WHERE r.propiedad_id = $1
+        ORDER BY r.fecha_emision DESC, r.id DESC
+      `, [propiedadId]);
+        res.json({ status: 'success', data: result.rows });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener recibos.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const propiedadId = toPositiveInt(req.params.propiedad_id);
+        if (!propiedadId) {
+            res.status(400).json({ status: 'error', message: 'propiedad_id inválido.' });
+            return;
+        }
+        const hasAccess = await userHasPropiedadAccess(authUser.id, propiedadId);
+        if (!hasAccess) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para ver estado de cuenta de este inmueble.' });
+            return;
+        }
+        const recibos = await pool.query(`
+        SELECT
+          'RECIBO' AS tipo,
+          r.id AS ref_id,
+          CASE
+            WHEN COALESCE(r.n8n_pdf_url, '') LIKE 'IMPORTACION_SILENCIOSA:%'
+              THEN regexp_replace(COALESCE(r.n8n_pdf_url, ''), '^IMPORTACION_SILENCIOSA:\\s*', '')
+            WHEN r.estado = 'Pagado' THEN 'Recibo: ' || r.mes_cobro
+            ELSE 'Aviso de Cobro: ' || r.mes_cobro
+          END AS concepto,
+          COALESCE(r.monto_usd, 0) AS cargo,
+          0 AS abono,
+          NULL::numeric AS monto_bs,
+          NULL::numeric AS tasa_cambio,
+          r.estado AS estado_recibo,
+          r.fecha_emision AS fecha_operacion,
+          r.fecha_emision AS fecha_registro
+        FROM recibos r
+        WHERE r.propiedad_id = $1
+      `, [propiedadId]);
+        const pagos = await pool.query(`
+        SELECT
+          'PAGO' AS tipo,
+          p.id AS ref_id,
+          'Pago Ref: ' || COALESCE(p.referencia, p.id::text) AS concepto,
+          0 AS cargo,
+          COALESCE(p.monto_usd, 0) AS abono,
+          COALESCE(p.monto_origen, 0) AS monto_bs,
+          p.tasa_cambio,
+          NULL::text AS estado_recibo,
+          p.fecha_pago AS fecha_operacion,
+          COALESCE(p.created_at, p.fecha_pago) AS fecha_registro
+        FROM pagos p
+        WHERE p.propiedad_id = $1
+          AND p.estado = 'Validado'
+      `, [propiedadId]);
+        const ajustes = await pool.query(`
+        SELECT
+          'AJUSTE' AS tipo,
+          h.id AS ref_id,
+          COALESCE(h.nota, 'Ajuste manual') AS concepto,
+          CASE
+            WHEN h.tipo = 'CARGAR_DEUDA' OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
+              THEN COALESCE(h.monto, 0)
+            ELSE 0
+          END AS cargo,
+          CASE
+            WHEN h.tipo = 'AGREGAR_FAVOR' OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+              THEN COALESCE(h.monto, 0)
+            ELSE 0
+          END AS abono,
+          NULL::numeric AS monto_bs,
+          NULL::numeric AS tasa_cambio,
+          NULL::text AS estado_recibo,
+          h.fecha AS fecha_operacion,
+          h.fecha AS fecha_registro
+        FROM historial_saldos_inmuebles h
+        WHERE h.propiedad_id = $1
+      `, [propiedadId]);
+        const movimientos = [...recibos.rows, ...pagos.rows, ...ajustes.rows]
+            .sort((a, b) => new Date(a.fecha_registro).getTime() - new Date(b.fecha_registro).getTime());
+        res.json({ status: 'success', data: movimientos });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener estado de cuenta del inmueble.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/estado-cuenta/:condominio_id', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const condominioId = toPositiveInt(req.params.condominio_id);
+        if (!condominioId) {
+            res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+            return;
+        }
+        const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+        if (!hasAccess) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para ver estado de cuenta de este condominio.' });
+            return;
+        }
+        const cuentaId = toPositiveInt(req.query.cuenta_id);
+        let cuentaFilterSql = '';
+        const params = [condominioId];
+        if (cuentaId) {
+            const cuentaAccess = await pool.query(`
+          SELECT cb.id
+          FROM cuentas_bancarias cb
+          WHERE cb.id = $1
+            AND cb.condominio_id = $2
+            AND COALESCE(cb.activo, true) = true
+          LIMIT 1
+        `, [cuentaId, condominioId]);
+            if (cuentaAccess.rows.length === 0) {
+                res.status(403).json({ status: 'error', message: 'No autorizado para ver esa cuenta bancaria.' });
+                return;
+            }
+            params.push(cuentaId);
+            cuentaFilterSql = ` AND cb.id = $${params.length} `;
+        }
+        const result = await pool.query(`
+        WITH movimientos_base AS (
+          SELECT
+            mf.id,
+            mf.fecha,
+            mf.tipo,
+            COALESCE(mf.monto, 0) AS monto,
+            mf.tasa_cambio,
+            mf.nota,
+            CASE
+              WHEN p.id IS NOT NULL
+                THEN ('Pago de Recibo #' || p.id::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A'))
+              ELSE COALESCE(mf.nota, f.nombre, 'Movimiento')
+            END AS concepto,
+            COALESCE(p.referencia, NULLIF(mf.referencia_id::text, '')) AS referencia,
+            mf.referencia_id,
+            f.id AS fondo_id,
+            f.nombre AS fondo_nombre,
+            f.moneda AS fondo_moneda,
+            cb.id AS cuenta_bancaria_id,
+            cb.nombre_banco AS banco_nombre,
+            cb.apodo AS banco_apodo,
+            p.banco_origen,
+            p.cedula_origen
+          FROM movimientos_fondos mf
+          INNER JOIN fondos f ON f.id = mf.fondo_id
+          LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+          LEFT JOIN pagos p ON p.id = mf.referencia_id
+          LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
+          WHERE f.condominio_id = $1
+            AND COALESCE(f.visible_propietarios, true) = true
+            ${cuentaFilterSql}
+        ),
+        transferencias_salida AS (
+          SELECT
+            (1000000000 + t.id) AS id,
+            t.fecha,
+            'EGRESO'::text AS tipo,
+            COALESCE(t.monto_origen, 0) AS monto,
+            t.tasa_cambio,
+            t.nota,
+            ('Transferencia enviada a ' || COALESCE(cb_dest.nombre_banco, 'Cuenta destino') || ' - Fondo: ' || COALESCE(f_dest.nombre, 'N/A')) AS concepto,
+            t.referencia,
+            NULL::int AS referencia_id,
+            f_orig.id AS fondo_id,
+            f_orig.nombre AS fondo_nombre,
+            f_orig.moneda AS fondo_moneda,
+            cb_orig.id AS cuenta_bancaria_id,
+            cb_orig.nombre_banco AS banco_nombre,
+            cb_orig.apodo AS banco_apodo,
+            NULL::text AS banco_origen,
+            NULL::text AS cedula_origen
+          FROM transferencias t
+          INNER JOIN fondos f_orig ON f_orig.id = t.fondo_origen_id
+          INNER JOIN fondos f_dest ON f_dest.id = t.fondo_destino_id
+          LEFT JOIN cuentas_bancarias cb_orig ON cb_orig.id = f_orig.cuenta_bancaria_id
+          LEFT JOIN cuentas_bancarias cb_dest ON cb_dest.id = f_dest.cuenta_bancaria_id
+          WHERE t.condominio_id = $1
+            AND COALESCE(f_orig.visible_propietarios, true) = true
+            ${cuentaFilterSql.replace(/cb\./g, 'cb_orig.')}
+        )
+        SELECT *
+        FROM (
+          SELECT * FROM movimientos_base
+          UNION ALL
+          SELECT * FROM transferencias_salida
+        ) mov
+        ORDER BY mov.fecha DESC, mov.id DESC
+      `, params);
+        res.json({ status: 'success', data: result.rows });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener estado de cuenta.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/cuentas/:condominio_id', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const condominioId = toPositiveInt(req.params.condominio_id);
+        if (!condominioId) {
+            res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+            return;
+        }
+        const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+        if (!hasAccess) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para ver cuentas de este condominio.' });
+            return;
+        }
+        const result = await pool.query(`
+        SELECT
+          cb.id,
+          cb.nombre_banco,
+          cb.apodo,
+          cb.tipo,
+          cb.es_predeterminada,
+          cb.acepta_transferencia,
+          cb.acepta_pago_movil,
+          cb.pago_movil_telefono,
+          cb.pago_movil_cedula_rif
+        FROM cuentas_bancarias cb
+        INNER JOIN fondos f ON f.cuenta_bancaria_id = cb.id
+        WHERE cb.condominio_id = $1
+          AND COALESCE(cb.activo, true) = true
+          AND COALESCE(f.activo, true) = true
+          AND COALESCE(f.visible_propietarios, true) = true
+        GROUP BY
+          cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada,
+          cb.acepta_transferencia, cb.acepta_pago_movil, cb.pago_movil_telefono, cb.pago_movil_cedula_rif
+        ORDER BY
+          CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,
+          cb.id ASC
+      `, [condominioId]);
+        res.json({ status: 'success', data: result.rows });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener cuentas bancarias.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/fondos-principal/:condominio_id', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const condominioId = toPositiveInt(req.params.condominio_id);
+        if (!condominioId) {
+            res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+            return;
+        }
+        const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+        if (!hasAccess) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para ver fondos de este condominio.' });
+            return;
+        }
+        const cuentaPrincipal = await pool.query(`
+        SELECT
+          cb.id,
+          cb.nombre_banco,
+          cb.apodo,
+          cb.tipo,
+          cb.es_predeterminada,
+          cb.acepta_transferencia,
+          cb.acepta_pago_movil,
+          cb.pago_movil_telefono,
+          cb.pago_movil_cedula_rif
+        FROM cuentas_bancarias cb
+        INNER JOIN fondos f ON f.cuenta_bancaria_id = cb.id
+        WHERE cb.condominio_id = $1
+          AND COALESCE(cb.activo, true) = true
+          AND COALESCE(f.activo, true) = true
+        GROUP BY
+          cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada,
+          cb.acepta_transferencia, cb.acepta_pago_movil, cb.pago_movil_telefono, cb.pago_movil_cedula_rif
+        ORDER BY
+          CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,
+          cb.id ASC
+        LIMIT 1
+      `, [condominioId]);
+        if (cuentaPrincipal.rows.length === 0) {
+            res.json({ status: 'success', data: [] });
+            return;
+        }
+        const cuentaId = cuentaPrincipal.rows[0]?.id;
+        const fondos = await pool.query(`
+        SELECT
+          f.id,
+          f.cuenta_bancaria_id,
+          COALESCE(f.nombre, 'Fondo') AS nombre,
+          f.moneda,
+          COALESCE(f.saldo_actual, 0) AS saldo_actual,
+          COALESCE(f.visible_propietarios, true) AS visible_propietarios
+        FROM fondos f
+        WHERE f.condominio_id = $1
+          AND f.cuenta_bancaria_id = $2
+          AND COALESCE(f.activo, true) = true
+          AND COALESCE(f.visible_propietarios, true) = true
+        ORDER BY f.id ASC
+      `, [condominioId, cuentaId]);
+        res.json({ status: 'success', data: fondos.rows });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener fondos principales.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/fondos/:condominio_id', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const condominioId = toPositiveInt(req.params.condominio_id);
+        if (!condominioId) {
+            res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+            return;
+        }
+        const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+        if (!hasAccess) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para ver fondos de este condominio.' });
+            return;
+        }
+        const fondos = await pool.query(`
+        SELECT
+          f.id,
+          f.cuenta_bancaria_id,
+          COALESCE(f.nombre, 'Fondo') AS nombre,
+          f.moneda,
+          COALESCE(f.saldo_actual, 0) AS saldo_actual,
+          COALESCE(f.visible_propietarios, true) AS visible_propietarios,
+          cb.nombre_banco,
+          cb.apodo
+        FROM fondos f
+        LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+        WHERE f.condominio_id = $1
+          AND COALESCE(f.visible_propietarios, true) = true
+          AND COALESCE(f.activo, true) = true
+        ORDER BY f.id ASC
+      `, [condominioId]);
+        res.json({ status: 'success', data: fondos.rows });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener fondos.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/estado-cuenta-cortes/:condominio_id', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const condominioId = toPositiveInt(req.params.condominio_id);
+        if (!condominioId) {
+            res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+            return;
+        }
+        const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+        if (!hasAccess) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para ver cortes de este condominio.' });
+            return;
+        }
+        const anio = toPositiveInt(req.query.anio);
+        const mes = toPositiveInt(req.query.mes);
+        const cuentaId = toPositiveInt(req.query.cuenta_id);
+        const params = [condominioId];
+        let whereExtra = '';
+        if (anio) {
+            params.push(anio);
+            whereExtra += ` AND cef.anio = $${params.length}`;
+        }
+        if (mes) {
+            params.push(mes);
+            whereExtra += ` AND cef.mes = $${params.length}`;
+        }
+        if (cuentaId) {
+            params.push(cuentaId);
+            whereExtra += ` AND cef.cuenta_bancaria_id = $${params.length}`;
+        }
+        const periodos = await pool.query(`
+      SELECT DISTINCT cef.anio, cef.mes
+      FROM cortes_estado_cuenta_fondos cef
+      WHERE cef.condominio_id = $1
+        AND COALESCE(cef.visible_propietarios, true) = true
+      ORDER BY cef.anio DESC, cef.mes DESC
+      `, [condominioId]);
+        const cortes = await pool.query(`
+      SELECT
+        cef.id,
+        cef.condominio_id,
+        cef.anio,
+        cef.mes,
+        cef.fondo_id,
+        cef.cuenta_bancaria_id,
+        cef.nombre_fondo,
+        cef.nombre_banco,
+        cef.apodo_cuenta,
+        cef.moneda,
+        COALESCE(cef.saldo_actual, 0) AS saldo_actual,
+        COALESCE(cef.saldo_bs, 0) AS saldo_bs,
+        COALESCE(cef.saldo_usd, 0) AS saldo_usd,
+        cef.tasa_referencia,
+        COALESCE(cef.visible_propietarios, true) AS visible_propietarios,
+        cef.created_at
+      FROM cortes_estado_cuenta_fondos cef
+      WHERE cef.condominio_id = $1
+        AND COALESCE(cef.visible_propietarios, true) = true
+        ${whereExtra}
+      ORDER BY cef.anio DESC, cef.mes DESC, cef.nombre_fondo ASC
+      `, params);
+        res.json({
+            status: 'success',
+            data: {
+                cortes: cortes.rows,
+                periodos: periodos.rows,
+            },
+        });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener cortes del estado de cuenta.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/cuenta-principal/:condominio_id', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const condominioId = toPositiveInt(req.params.condominio_id);
+        if (!condominioId) {
+            res.status(400).json({ status: 'error', message: 'condominio_id inválido.' });
+            return;
+        }
+        const hasAccess = await userHasCondominioAccess(authUser.id, condominioId);
+        if (!hasAccess) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para ver cuentas de este condominio.' });
+            return;
+        }
+        const result = await pool.query(`
+        SELECT
+          cb.id,
+          cb.nombre_banco,
+          cb.apodo,
+          cb.tipo,
+          cb.es_predeterminada,
+          cb.acepta_transferencia,
+          cb.acepta_pago_movil,
+          cb.pago_movil_telefono,
+          cb.pago_movil_cedula_rif
+        FROM cuentas_bancarias cb
+        INNER JOIN fondos f ON f.cuenta_bancaria_id = cb.id
+        WHERE cb.condominio_id = $1
+          AND COALESCE(cb.activo, true) = true
+          AND COALESCE(f.activo, true) = true
+          AND COALESCE(f.visible_propietarios, true) = true
+        GROUP BY
+          cb.id, cb.nombre_banco, cb.apodo, cb.tipo, cb.es_predeterminada,
+          cb.acepta_transferencia, cb.acepta_pago_movil, cb.pago_movil_telefono, cb.pago_movil_cedula_rif
+        ORDER BY
+          CASE WHEN COALESCE(cb.es_predeterminada, false) THEN 0 ELSE 1 END,
+          cb.id ASC
+        LIMIT 1
+      `, [condominioId]);
+        if (result.rows.length === 0) {
+            res.status(404).json({ status: 'error', message: 'No hay cuenta principal activa para este condominio.' });
+            return;
+        }
+        res.json({ status: 'success', data: result.rows[0] });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener cuenta principal.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/notificaciones', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const propiedadIdFilter = toPositiveInt(req.query.propiedad_id);
+        let filterSql = '';
+        const params = [authUser.id];
+        if (propiedadIdFilter) {
+            params.push(propiedadIdFilter);
+            filterSql = ` AND p.id = $${params.length} `;
+        }
+        const result = await pool.query(`
+        SELECT
+          pa.id,
+          pa.propiedad_id,
+          pa.recibo_id,
+          pa.referencia,
+          COALESCE(pa.monto_origen, 0) AS monto_origen,
+          COALESCE(pa.monto_usd, 0) AS monto_usd,
+          pa.estado,
+          pa.fecha_pago,
+          pa.created_at,
+          pa.nota,
+          p.identificador,
+          COALESCE(c.nombre_legal, c.nombre, 'Condominio') AS nombre_condominio
+        FROM pagos pa
+        INNER JOIN propiedades p ON p.id = pa.propiedad_id
+        INNER JOIN condominios c ON c.id = p.condominio_id
+        INNER JOIN usuarios_propiedades up ON up.propiedad_id = p.id
+        WHERE up.user_id = $1
+          AND COALESCE(up.acceso_portal, true) = true
+          AND pa.estado IN ('PendienteAprobacion', 'Rechazado', 'Validado')
+          ${filterSql}
+        ORDER BY COALESCE(pa.created_at, pa.fecha_pago) DESC, pa.id DESC
+        LIMIT 200
+      `, params);
+        res.json({ status: 'success', data: result.rows });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener notificaciones.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/perfil', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const result = await pool.query(`
+        SELECT
+          u.id,
+          u.nombre,
+          u.cedula,
+          u.email,
+          u.email_secundario,
+          u.telefono,
+          u.telefono_secundario
+        FROM users u
+        WHERE u.id = $1
+        LIMIT 1
+      `, [authUser.id]);
+        if (result.rows.length === 0) {
+            res.status(404).json({ status: 'error', message: 'Usuario no encontrado.' });
+            return;
+        }
+        res.json({ status: 'success', data: result.rows[0] });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener el perfil del propietario.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.get('/perfil-relaciones', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const propiedadIdQuery = toPositiveInt(req.query.propiedad_id);
+        let propiedadId = propiedadIdQuery;
+        if (propiedadId) {
+            const hasAccess = await userHasPropiedadAccess(authUser.id, propiedadId);
+            if (!hasAccess) {
+                res.status(403).json({ status: 'error', message: 'No tienes acceso a ese inmueble.' });
+                return;
+            }
+        }
+        else {
+            const defaultPropRes = await pool.query(`
+          SELECT up.propiedad_id
+          FROM usuarios_propiedades up
+          WHERE up.user_id = $1
+            AND COALESCE(up.acceso_portal, true) = true
+          ORDER BY
+            CASE
+              WHEN up.rol = 'Propietario' THEN 1
+              WHEN up.rol = 'Copropietario' THEN 2
+              WHEN up.rol = 'Inquilino' THEN 3
+              ELSE 9
+            END,
+            up.propiedad_id ASC
+          LIMIT 1
+        `, [authUser.id]);
+            propiedadId = defaultPropRes.rows[0]?.propiedad_id || null;
+            if (!propiedadId) {
+                res.status(404).json({ status: 'error', message: 'No se encontró un inmueble asociado al usuario.' });
+                return;
+            }
+        }
+        const [rolActualRes, propietarioRes, residenteRes, copropsRes] = await Promise.all([
+            pool.query(`
+          SELECT up.rol
+          FROM usuarios_propiedades up
+          WHERE up.user_id = $1
+            AND up.propiedad_id = $2
+            AND COALESCE(up.acceso_portal, true) = true
+          LIMIT 1
+        `, [authUser.id, propiedadId]),
+            pool.query(`
+          SELECT u.id, u.nombre, u.cedula, u.email, u.telefono, u.email_secundario, u.telefono_secundario
+          FROM usuarios_propiedades up
+          INNER JOIN users u ON u.id = up.user_id
+          WHERE up.propiedad_id = $1
+            AND up.rol = 'Propietario'
+          LIMIT 1
+        `, [propiedadId]),
+            pool.query(`
+          SELECT u.id, u.nombre, u.cedula, u.email, u.telefono, u.email_secundario, u.telefono_secundario
+          FROM usuarios_propiedades up
+          INNER JOIN users u ON u.id = up.user_id
+          WHERE up.propiedad_id = $1
+            AND up.rol = 'Inquilino'
+          LIMIT 1
+        `, [propiedadId]),
+            pool.query(`
+          SELECT u.id, u.nombre, u.cedula, u.email, u.telefono, u.email_secundario, u.telefono_secundario
+          FROM usuarios_propiedades up
+          INNER JOIN users u ON u.id = up.user_id
+          WHERE up.propiedad_id = $1
+            AND up.rol = 'Copropietario'
+          ORDER BY u.nombre ASC NULLS LAST, u.cedula ASC NULLS LAST
+        `, [propiedadId]),
+        ]);
+        res.json({
+            status: 'success',
+            data: {
+                propiedad_id: propiedadId,
+                rol_actual: rolActualRes.rows[0]?.rol || null,
+                propietario: propietarioRes.rows[0] || null,
+                residente: residenteRes.rows[0] || null,
+                copropietarios: copropsRes.rows,
+            },
+        });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al obtener relaciones del inmueble.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.put('/perfil', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const body = req.body;
+        const cedula = normalizeNullableText(body.cedula)?.toUpperCase() ?? null;
+        const email = normalizeNullableText(body.email)?.toLowerCase() ?? null;
+        const emailSecundario = normalizeNullableText(body.email_secundario)?.toLowerCase() ?? null;
+        const telefono = normalizeNullableText(body.telefono) ?? null;
+        const telefonoSecundario = normalizeNullableText(body.telefono_secundario) ?? null;
+        if (!cedula) {
+            res.status(400).json({ status: 'error', message: 'La cédula es obligatoria.' });
+            return;
+        }
+        if (!/^[VEJG][0-9]{5,9}$/i.test(cedula)) {
+            res.status(400).json({ status: 'error', message: 'Formato de cédula inválido. Use V, E, J o G seguido de números.' });
+            return;
+        }
+        if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            res.status(400).json({ status: 'error', message: 'Formato de correo inválido.' });
+            return;
+        }
+        if (emailSecundario && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailSecundario)) {
+            res.status(400).json({ status: 'error', message: 'Formato de correo secundario inválido.' });
+            return;
+        }
+        if (telefono && !/^[0-9]{7,15}$/.test(telefono)) {
+            res.status(400).json({ status: 'error', message: 'El teléfono debe contener solo números (7 a 15 dígitos).' });
+            return;
+        }
+        if (telefonoSecundario && !/^[0-9]{7,15}$/.test(telefonoSecundario)) {
+            res.status(400).json({ status: 'error', message: 'El teléfono alternativo debe contener solo números (7 a 15 dígitos).' });
+            return;
+        }
+        const cedulaConflict = await pool.query('SELECT id FROM users WHERE cedula = $1 AND id <> $2 LIMIT 1', [cedula, authUser.id]);
+        if (cedulaConflict.rows.length > 0) {
+            res.status(409).json({ status: 'error', message: 'La cédula ya está registrada por otro usuario.' });
+            return;
+        }
+        if (email) {
+            const emailConflict = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id <> $2 LIMIT 1', [email, authUser.id]);
+            if (emailConflict.rows.length > 0) {
+                res.status(409).json({ status: 'error', message: 'El correo ya está registrado por otro usuario.' });
+                return;
+            }
+        }
+        const updateRes = await pool.query(`
+        UPDATE users
+        SET cedula = $1,
+            email = $2,
+            email_secundario = $3,
+            telefono = $4,
+            telefono_secundario = $5
+        WHERE id = $6
+        RETURNING id, nombre, cedula, email, email_secundario, telefono, telefono_secundario
+      `, [cedula, email, emailSecundario, telefono, telefonoSecundario, authUser.id]);
+        if (updateRes.rowCount === 0) {
+            res.status(404).json({ status: 'error', message: 'Usuario no encontrado.' });
+            return;
+        }
+        res.json({ status: 'success', message: 'Perfil actualizado correctamente.', data: updateRes.rows[0] });
+    }
+    catch (error) {
+        if (typeof error === 'object' && error && 'code' in error) {
+            const code = String(error.code || '');
+            if (code === '23505') {
+                res.status(409).json({ status: 'error', message: 'La cédula o el correo ya están registrados por otro usuario.' });
+                return;
+            }
+        }
+        const message = error instanceof Error ? error.message : 'Error al actualizar el perfil del propietario.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+router.put('/perfil/password', verifyToken, async (req, res) => {
+    try {
+        const authUser = getAuthUser(req);
+        if (!authUser) {
+            res.status(401).json({ status: 'error', message: 'Usuario no autenticado.' });
+            return;
+        }
+        const body = req.body;
+        const nuevaPassword = String(body.nueva_password ?? '').trim();
+        if (!nuevaPassword) {
+            res.status(400).json({ status: 'error', message: 'Debe enviar nueva_password.' });
+            return;
+        }
+        if (nuevaPassword.length < 6) {
+            res.status(400).json({ status: 'error', message: 'La clave debe tener al menos 6 caracteres.' });
+            return;
+        }
+        const hashedPassword = await bcrypt.hash(nuevaPassword, 10);
+        const updateRes = await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, authUser.id]);
+        if (updateRes.rowCount === 0) {
+            res.status(404).json({ status: 'error', message: 'Usuario no encontrado.' });
+            return;
+        }
+        res.json({ status: 'success', message: 'Clave actualizada correctamente.' });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Error al actualizar la clave del propietario.';
+        res.status(500).json({ status: 'error', message });
+    }
+});
+module.exports = router;
+//# sourceMappingURL=propietario.js.map

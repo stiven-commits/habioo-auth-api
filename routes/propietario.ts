@@ -1132,7 +1132,7 @@ router.get('/perfil-relaciones', verifyToken, async (req: Request, res: Response
   }
 });
 
-router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes>): Promise<void> => {
+router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes<PropietarioPerfilRow>>): Promise<void> => {
   try {
     const authUser = getAuthUser(req);
     if (!authUser) {
@@ -1192,7 +1192,7 @@ router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes>): 
       }
     }
 
-    const updateRes = await pool.query(
+    const updateRes = await pool.query<PropietarioPerfilRow>(
       `
         UPDATE users
         SET cedula = $1,
@@ -1201,6 +1201,7 @@ router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes>): 
             telefono = $4,
             telefono_secundario = $5
         WHERE id = $6
+        RETURNING id, nombre, cedula, email, email_secundario, telefono, telefono_secundario
       `,
       [cedula, email, emailSecundario, telefono, telefonoSecundario, authUser.id],
     );
@@ -1210,7 +1211,7 @@ router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes>): 
       return;
     }
 
-    res.json({ status: 'success', message: 'Perfil actualizado correctamente.' });
+    res.json({ status: 'success', message: 'Perfil actualizado correctamente.', data: updateRes.rows[0] });
   } catch (error) {
     if (typeof error === 'object' && error && 'code' in error) {
       const code = String((error as { code?: string }).code || '');
