@@ -29,6 +29,32 @@ interface ITotalDeudaRow {
     total_deuda: string | null;
 }
 
+interface IResumenSumRow {
+    total: string | null;
+}
+
+interface IMonthlySumRow {
+    mes: string;
+    total: string | null;
+}
+
+interface IGastoRubroRow {
+    name: string;
+    value: string | null;
+}
+
+interface IUltimoPagoDashboardRow {
+    monto_usd: string | number | null;
+    metodo: string | null;
+    fecha_pago: string | Date | null;
+    estado: string | null;
+    identificador: string;
+}
+
+interface ICountDashboardRow {
+    total: string | number;
+}
+
 interface ICuentaPorCobrarRow extends Record<string, unknown> {
     apto: string;
 }
@@ -140,6 +166,239 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
         } catch (err: unknown) {
             const error = asError(err);
             res.status(500).json({ error: error.message });
+        }
+    });
+
+    const adminResumenHandler = async (req: Request, res: Response): Promise<Response | void> => {
+        try {
+            const user = asAuthUser(req.user);
+            const condoRes = await pool.query<IIdRow>(
+                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                [user.id],
+            );
+
+            if (condoRes.rows.length === 0) {
+                return res.status(403).json({ status: 'error', message: 'No autorizado para consultar resumen administrativo.' });
+            }
+
+            const condominioId = condoRes.rows[0].id;
+
+            const [liquidezRes, porCobrarRes, cuentasPorPagarRes, egresosMesRes] = await Promise.all([
+                pool.query<IResumenSumRow>(
+                    `SELECT COALESCE(SUM(f.saldo_actual), 0)::text AS total
+                     FROM fondos f
+                     WHERE f.condominio_id = $1`,
+                    [condominioId],
+                ),
+                pool.query<IResumenSumRow>(
+                    `SELECT COALESCE(SUM(GREATEST(r.monto_usd - COALESCE(r.monto_pagado_usd, 0), 0)), 0)::text AS total
+                     FROM recibos r
+                     INNER JOIN propiedades p ON p.id = r.propiedad_id
+                     WHERE p.condominio_id = $1
+                       AND r.estado IN ('Aviso de Cobro', 'Pendiente')`,
+                    [condominioId],
+                ),
+                pool.query<IResumenSumRow>(
+                    `SELECT COALESCE(SUM(gc.monto_cuota_usd), 0)::text AS total
+                     FROM gastos_cuotas gc
+                     INNER JOIN gastos g ON g.id = gc.gasto_id
+                     WHERE g.condominio_id = $1
+                       AND gc.estado = 'Pendiente'`,
+                    [condominioId],
+                ),
+                pool.query<IResumenSumRow>(
+                    `SELECT COALESCE(SUM(pp.monto_usd), 0)::text AS total
+                     FROM pagos_proveedores pp
+                     JOIN gastos g ON pp.gasto_id = g.id
+                     WHERE g.condominio_id = $1
+                       AND EXTRACT(MONTH FROM pp.fecha_pago) = EXTRACT(MONTH FROM CURRENT_DATE)
+                       AND EXTRACT(YEAR FROM pp.fecha_pago) = EXTRACT(YEAR FROM CURRENT_DATE)`,
+                    [condominioId],
+                ),
+            ]);
+
+            const toNumber = (value: string | null | undefined): number => {
+                const parsed = parseFloat(String(value ?? '0'));
+                return Number.isFinite(parsed) ? parsed : 0;
+            };
+
+            return res.json({
+                status: 'success',
+                data: {
+                    liquidez: toNumber(liquidezRes.rows[0]?.total),
+                    por_cobrar: toNumber(porCobrarRes.rows[0]?.total),
+                    cuentas_por_pagar: toNumber(cuentasPorPagarRes.rows[0]?.total),
+                    egresos_mes: toNumber(egresosMesRes.rows[0]?.total),
+                },
+            });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ status: 'error', message: error.message });
+        }
+    };
+
+    app.get('/admin-resumen', verifyToken, (req: Request, res: Response) => {
+        void adminResumenHandler(req, res);
+    });
+    app.get('/api/dashboard/admin-resumen', verifyToken, (req: Request, res: Response) => {
+        void adminResumenHandler(req, res);
+    });
+
+    app.get('/admin-graficos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const condoRes = await pool.query<IIdRow>(
+                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                [user.id],
+            );
+            if (condoRes.rows.length === 0) {
+                return res.status(403).json({ status: 'error', message: 'No autorizado para consultar graficos administrativos.' });
+            }
+            const condominioId = condoRes.rows[0].id;
+
+            const [ingresosRes, egresosRes, gastosRubrosRes] = await Promise.all([
+                pool.query<IMonthlySumRow>(
+                    `SELECT to_char(date_trunc('month', p.fecha_pago::timestamp), 'YYYY-MM') AS mes,
+                            COALESCE(SUM(p.monto_usd), 0)::text AS total
+                     FROM pagos p
+                     INNER JOIN propiedades pr ON pr.id = p.propiedad_id
+                     WHERE pr.condominio_id = $1
+                       AND date_trunc('month', p.fecha_pago::timestamp) >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+                       AND date_trunc('month', p.fecha_pago::timestamp) <= date_trunc('month', CURRENT_DATE)
+                     GROUP BY 1
+                     ORDER BY 1 ASC`,
+                    [condominioId],
+                ),
+                pool.query<IMonthlySumRow>(
+                    `SELECT to_char(date_trunc('month', pp.fecha_pago::timestamp), 'YYYY-MM') AS mes,
+                            COALESCE(SUM(pp.monto_usd), 0)::text AS total
+                     FROM pagos_proveedores pp
+                     INNER JOIN gastos g ON g.id = pp.gasto_id
+                     WHERE g.condominio_id = $1
+                       AND date_trunc('month', pp.fecha_pago::timestamp) >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+                       AND date_trunc('month', pp.fecha_pago::timestamp) <= date_trunc('month', CURRENT_DATE)
+                     GROUP BY 1
+                     ORDER BY 1 ASC`,
+                    [condominioId],
+                ),
+                pool.query<IGastoRubroRow>(
+                    `SELECT COALESCE(NULLIF(BTRIM(pr.rubro), ''), 'Otros') AS name,
+                            COALESCE(SUM(g.monto_usd), 0)::text AS value
+                     FROM gastos g
+                     LEFT JOIN proveedores pr ON pr.id = g.proveedor_id
+                     WHERE g.condominio_id = $1
+                       AND date_trunc('month', g.fecha_gasto::timestamp) = date_trunc('month', CURRENT_DATE)
+                     GROUP BY 1
+                     ORDER BY SUM(g.monto_usd) DESC`,
+                    [condominioId],
+                ),
+            ]);
+
+            const toNumber = (value: string | null | undefined): number => {
+                const parsed = parseFloat(String(value ?? '0'));
+                return Number.isFinite(parsed) ? parsed : 0;
+            };
+
+            const monthNames: string[] = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+            const ingresosMap = new Map<string, number>(
+                ingresosRes.rows.map((row) => [row.mes, toNumber(row.total)]),
+            );
+            const egresosMap = new Map<string, number>(
+                egresosRes.rows.map((row) => [row.mes, toNumber(row.total)]),
+            );
+
+            const monthKeys: string[] = Array.from({ length: 6 }, (_v, idx) => {
+                const d = new Date();
+                d.setDate(1);
+                d.setMonth(d.getMonth() - (5 - idx));
+                const y = d.getFullYear();
+                const m = String(d.getMonth() + 1).padStart(2, '0');
+                return `${y}-${m}`;
+            });
+
+            const dataBalance = monthKeys.map((key) => {
+                const [, monthPart] = key.split('-');
+                const monthIdx = Number(monthPart) - 1;
+                return {
+                    mes: monthNames[monthIdx] || key,
+                    ingresos: ingresosMap.get(key) || 0,
+                    egresos: egresosMap.get(key) || 0,
+                };
+            });
+
+            const dataGastos = gastosRubrosRes.rows.map((row) => ({
+                name: row.name || 'Otros',
+                value: toNumber(row.value),
+            }));
+
+            return res.json({ status: 'success', dataBalance, dataGastos });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ status: 'error', message: error.message });
+        }
+    });
+
+    app.get('/admin-movimientos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const condoRes = await pool.query<IIdRow>(
+                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                [user.id],
+            );
+            if (condoRes.rows.length === 0) {
+                return res.status(403).json({ status: 'error', message: 'No autorizado para consultar movimientos administrativos.' });
+            }
+            const condominioId = condoRes.rows[0].id;
+
+            const [ultimosPagosRes, pagosPendientesRes, gastosPendientesRes] = await Promise.all([
+                pool.query<IUltimoPagoDashboardRow>(
+                    `SELECT
+                        p.monto_usd,
+                        p.metodo,
+                        p.fecha_pago,
+                        p.estado,
+                        pr.identificador
+                     FROM pagos p
+                     INNER JOIN propiedades pr ON pr.id = p.propiedad_id
+                     WHERE pr.condominio_id = $1
+                     ORDER BY p.created_at DESC
+                     LIMIT 5`,
+                    [condominioId],
+                ),
+                pool.query<ICountDashboardRow>(
+                    `SELECT COUNT(*)::int AS total
+                     FROM pagos p
+                     INNER JOIN propiedades pr ON pr.id = p.propiedad_id
+                     WHERE pr.condominio_id = $1
+                       AND p.estado = 'Pendiente'`,
+                    [condominioId],
+                ),
+                pool.query<ICountDashboardRow>(
+                    `SELECT COUNT(*)::int AS total
+                     FROM gastos_cuotas gc
+                     INNER JOIN gastos g ON g.id = gc.gasto_id
+                     WHERE g.condominio_id = $1
+                       AND gc.estado = 'Pendiente'`,
+                    [condominioId],
+                ),
+            ]);
+
+            const pagosPendientes = Number(pagosPendientesRes.rows[0]?.total || 0);
+            const gastosPendientes = Number(gastosPendientesRes.rows[0]?.total || 0);
+
+            return res.json({
+                status: 'success',
+                data: {
+                    ultimosPagos: ultimosPagosRes.rows,
+                    alertas: {
+                        pagosPendientes,
+                        gastosPendientes,
+                    },
+                },
+            });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ status: 'error', message: error.message });
         }
     });
 
