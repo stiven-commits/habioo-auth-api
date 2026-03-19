@@ -163,6 +163,10 @@ interface PerfilRolRow {
   rol: string;
 }
 
+interface UserIdRow {
+  id: number;
+}
+
 interface PerfilRelacionesData {
   propiedad_id: number;
   rol_actual: string | null;
@@ -1166,6 +1170,26 @@ router.put('/perfil', verifyToken, async (req: Request, res: Response<ApiRes>): 
     if (telefonoSecundario && !/^[0-9]{7,15}$/.test(telefonoSecundario)) {
       res.status(400).json({ status: 'error', message: 'El teléfono alternativo debe contener solo números (7 a 15 dígitos).' });
       return;
+    }
+
+    const cedulaConflict = await pool.query<UserIdRow>(
+      'SELECT id FROM users WHERE cedula = $1 AND id <> $2 LIMIT 1',
+      [cedula, authUser.id]
+    );
+    if (cedulaConflict.rows.length > 0) {
+      res.status(409).json({ status: 'error', message: 'La cédula ya está registrada por otro usuario.' });
+      return;
+    }
+
+    if (email) {
+      const emailConflict = await pool.query<UserIdRow>(
+        'SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id <> $2 LIMIT 1',
+        [email, authUser.id]
+      );
+      if (emailConflict.rows.length > 0) {
+        res.status(409).json({ status: 'error', message: 'El correo ya está registrado por otro usuario.' });
+        return;
+      }
     }
 
     const updateRes = await pool.query(
