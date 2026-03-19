@@ -59,6 +59,10 @@ interface ZonasRoutesRegistrar {
     (app: Application, deps: { pool: Pool; verifyToken: VerifyTokenMiddleware }): void;
 }
 
+interface EncuestasRoutesRegistrar {
+    (app: Application, deps: { pool: Pool; verifyToken: VerifyTokenMiddleware }): void;
+}
+
 interface RecibosRoutesRegistrar {
     (app: Application, deps: { pool: Pool; verifyToken: VerifyTokenMiddleware }): void;
 }
@@ -103,6 +107,7 @@ const { registerRecibosRoutes }: { registerRecibosRoutes: RecibosRoutesRegistrar
 const { registerFondosRoutes }: { registerFondosRoutes: FondosRoutesRegistrar } = require('./routes/fondos');
 const { registerPagosRoutes }: { registerPagosRoutes: PagosRoutesRegistrar } = require('./routes/pagos');
 const { registerDashboardRoutes }: { registerDashboardRoutes: DashboardRoutesRegistrar } = require('./routes/dashboard');
+const { registerEncuestasRoutes }: { registerEncuestasRoutes: EncuestasRoutesRegistrar } = require('./routes/encuestas');
 const perfilRoutes: import('express').Router = require('./routes/perfil');
 const propietarioRoutes: import('express').Router = require('./routes/propietario');
 
@@ -131,6 +136,7 @@ registerRecibosRoutes(app, { pool, verifyToken });
 registerFondosRoutes(app, { pool, verifyToken, parseLocaleNumber });
 registerPagosRoutes(app, { pool, verifyToken, parseLocaleNumber, getPagosOptionalColumns });
 registerDashboardRoutes(app, { pool, verifyToken });
+registerEncuestasRoutes(app, { pool, verifyToken });
 app.use('/api/perfil', perfilRoutes);
 app.use('/api/propietario', propietarioRoutes);
 

@@ -1,3 +1,0 @@
-ALTER TABLE pagos
-ADD COLUMN IF NOT EXISTS telefono_origen VARCHAR(20);
-
