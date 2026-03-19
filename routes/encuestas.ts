@@ -96,6 +96,10 @@ interface EncuestaEstadoRow {
     fecha_fin: string;
 }
 
+interface CondominioMetodoRow {
+    metodo_division: string;
+}
+
 // ─── Helper de tipado seguro de req.user ──────────────────────────────────────
 
 const asAuthUser = (value: unknown): AuthUser => {
@@ -341,18 +345,40 @@ const registerEncuestasRoutes = (
                 }
                 const encuesta = eRes.rows[0];
 
-                // Conteo por opción: común para ambos roles
-                const conteoRes = await pool.query<ConteoPorOpcion>(
-                    `SELECT ev.opcion_id,
-                            eo.texto          AS opcion_texto,
-                            COUNT(ev.id)::int AS total
-                     FROM encuesta_votos ev
-                     LEFT JOIN encuesta_opciones eo ON eo.id = ev.opcion_id
-                     WHERE ev.encuesta_id = $1
-                     GROUP BY ev.opcion_id, eo.texto
-                     ORDER BY total DESC`,
+                // Obtener método de distribución del condominio
+                const condoRes = await pool.query<CondominioMetodoRow>(
+                    `SELECT metodo_division
+                     FROM condominios
+                     WHERE id = (SELECT condominio_id FROM encuestas WHERE id = $1)`,
                     [id],
                 );
+                const metodo_division = condoRes.rows[0]?.metodo_division ?? 'Partes Iguales';
+
+                // Conteo por opción: ponderado por alícuota o por unidad según método
+                const conteoRes = await (metodo_division === 'Alicuota'
+                    ? pool.query<ConteoPorOpcion>(
+                        `SELECT ev.opcion_id,
+                                eo.texto                                              AS opcion_texto,
+                                ROUND(COALESCE(SUM(p.alicuota::numeric), 0), 4)::float AS total
+                         FROM encuesta_votos ev
+                         LEFT JOIN encuesta_opciones eo ON eo.id = ev.opcion_id
+                         LEFT JOIN propiedades p        ON p.id  = ev.propiedad_id
+                         WHERE ev.encuesta_id = $1
+                         GROUP BY ev.opcion_id, eo.texto
+                         ORDER BY total DESC`,
+                        [id],
+                    )
+                    : pool.query<ConteoPorOpcion>(
+                        `SELECT ev.opcion_id,
+                                eo.texto          AS opcion_texto,
+                                COUNT(ev.id)::int AS total
+                         FROM encuesta_votos ev
+                         LEFT JOIN encuesta_opciones eo ON eo.id = ev.opcion_id
+                         WHERE ev.encuesta_id = $1
+                         GROUP BY ev.opcion_id, eo.texto
+                         ORDER BY total DESC`,
+                        [id],
+                    ));
 
                 if (authUser.is_admin) {
                     // Detalle completo: nombres, identificadores y respuestas
@@ -372,10 +398,11 @@ const registerEncuestasRoutes = (
                     );
 
                     res.json({
-                        status:  'success',
+                        status:           'success',
+                        metodo_division,
                         encuesta,
-                        conteo:  conteoRes.rows,
-                        detalle: detalleRes.rows,
+                        conteo:           conteoRes.rows,
+                        detalle:          detalleRes.rows,
                     });
                 } else {
                     // Solo conteo + textos abiertos anónimos (sin nombres ni identificadores)
@@ -389,6 +416,7 @@ const registerEncuestasRoutes = (
 
                     res.json({
                         status:              'success',
+                        metodo_division,
                         encuesta:            { id: encuesta.id, titulo: encuesta.titulo, tipo: encuesta.tipo },
                         conteo:              conteoRes.rows,
                         respuestas_abiertas: textosRes.rows.map((r) => r.respuesta_texto),
