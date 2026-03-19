@@ -104,13 +104,23 @@ interface PagoProveedorBody {
 
 interface TransferenciaBody {
     fondo_origen_id: unknown;
-    fondo_destino_id: unknown;
+    fondo_destino_id?: unknown;
+    cuenta_destino_id?: unknown;
     monto_origen: unknown;
     tasa_cambio?: unknown;
     monto_destino: unknown;
     referencia: string | null;
     fecha: string | Date;
     nota: string | null;
+}
+
+interface IFondoTransferRow {
+    id: number;
+    cuenta_bancaria_id: number;
+    condominio_id: number;
+    moneda: string;
+    porcentaje_asignacion: number | string;
+    es_operativo: boolean;
 }
 
 const asAuthUser = (value: unknown): AuthUser => {
@@ -829,12 +839,11 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 
     // ðŸ”„ REGISTRAR TRANSFERENCIA ENTRE FONDOS/CUENTAS
     app.post('/transferencias', verifyToken, async (req: Request<{}, unknown, TransferenciaBody>, res: Response, _next: NextFunction) => {
-        const { fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota } = req.body;
+        const { fondo_origen_id, fondo_destino_id, cuenta_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota } = req.body;
 
         try {
             const user = asAuthUser(req.user);
             const fondoOrigenIdSafe = asPositiveInt(fondo_origen_id, 'fondo_origen_id');
-            const fondoDestinoIdSafe = asPositiveInt(fondo_destino_id, 'fondo_destino_id');
             const montoOrigenSafe = asDecimal(monto_origen, 'monto_origen');
             const montoDestinoSafe = asDecimal(monto_destino, 'monto_destino');
             const tasaCambioSafe = (tasa_cambio === null || tasa_cambio === undefined || String(tasa_cambio).trim() === '')
@@ -845,22 +854,104 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const fechaSafe = toIsoDate(fecha, 'fecha');
             const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const condoId = condoRes.rows[0].id;
+            const hasCuentaDestino = cuenta_destino_id !== undefined && cuenta_destino_id !== null && String(cuenta_destino_id).trim() !== '';
+            const hasFondoDestino = fondo_destino_id !== undefined && fondo_destino_id !== null && String(fondo_destino_id).trim() !== '';
 
             await pool.query('BEGIN');
 
-            // 1. Guardamos el registro de la transferencia
-            await pool.query(
-                `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-                [condoId, fondoOrigenIdSafe, fondoDestinoIdSafe, montoOrigenSafe, tasaCambioSafe, montoDestinoSafe, referenciaSafe, fechaSafe, notaSafe]
+            const origenRes = await pool.query<IFondoTransferRow>(
+                'SELECT id, cuenta_bancaria_id, condominio_id, moneda, porcentaje_asignacion, es_operativo FROM fondos WHERE id = $1 AND condominio_id = $2 AND activo = true LIMIT 1',
+                [fondoOrigenIdSafe, condoId]
             );
+            if (origenRes.rows.length === 0) {
+                throw new Error('Fondo de origen no encontrado o no pertenece al condominio.');
+            }
+            const fondoOrigen = origenRes.rows[0];
 
-            // 2. Restamos el dinero del fondo de Origen
-            await pool.query(`UPDATE fondos SET saldo_actual = saldo_actual - $1 WHERE id = $2`, [montoOrigenSafe, fondoOrigenIdSafe]);
+            const sourceBalanceRes = await pool.query<{ saldo_actual: number | string }>(
+                'SELECT saldo_actual FROM fondos WHERE id = $1 AND condominio_id = $2 LIMIT 1',
+                [fondoOrigenIdSafe, condoId]
+            );
+            const saldoOrigen = parseFloat(String(sourceBalanceRes.rows[0]?.saldo_actual ?? 0)) || 0;
+            if (montoOrigenSafe <= 0 || montoDestinoSafe <= 0) {
+                throw new Error('El monto de transferencia debe ser mayor a 0.');
+            }
+            if (saldoOrigen < montoOrigenSafe) {
+                throw new Error('El fondo de origen no tiene saldo suficiente.');
+            }
+            if (!hasCuentaDestino && !hasFondoDestino) {
+                throw new Error('Debe seleccionar un fondo destino o una cuenta destino.');
+            }
+            if (hasCuentaDestino && hasFondoDestino) {
+                throw new Error('Seleccione solo un tipo de destino: fondo o cuenta.');
+            }
 
-            // 3. Sumamos el dinero al fondo de Destino
-            // (Nota: monto_origen y monto_destino pueden ser distintos si estÃ¡s pasando de Bs a USD)
-            await pool.query(`UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2`, [montoDestinoSafe, fondoDestinoIdSafe]);
+            await pool.query('UPDATE fondos SET saldo_actual = saldo_actual - $1 WHERE id = $2', [montoOrigenSafe, fondoOrigenIdSafe]);
+
+            if (hasCuentaDestino) {
+                const cuentaDestinoIdSafe = asPositiveInt(cuenta_destino_id, 'cuenta_destino_id');
+                const destinoFundsRes = await pool.query<IFondoTransferRow>(
+                    `SELECT id, cuenta_bancaria_id, condominio_id, moneda, porcentaje_asignacion, es_operativo
+                     FROM fondos
+                     WHERE cuenta_bancaria_id = $1
+                       AND condominio_id = $2
+                       AND activo = true
+                       AND moneda = $3
+                     ORDER BY es_operativo DESC, id ASC`,
+                    [cuentaDestinoIdSafe, condoId, fondoOrigen.moneda]
+                );
+                const destinoFunds = destinoFundsRes.rows.filter((f) => f.id !== fondoOrigenIdSafe);
+                if (destinoFunds.length === 0) {
+                    throw new Error(`La cuenta destino no tiene fondos activos en moneda ${fondoOrigen.moneda}.`);
+                }
+
+                const noOperativos = destinoFunds.filter((f) => !f.es_operativo);
+                const fondoPrincipal = destinoFunds.find((f) => !!f.es_operativo) || destinoFunds[0];
+
+                const distribuciones = noOperativos.map((f) => {
+                    const pct = parseFloat(String(f.porcentaje_asignacion || 0)) || 0;
+                    const amount = parseFloat(((montoDestinoSafe * pct) / 100).toFixed(2));
+                    return { fondoId: f.id, monto: amount };
+                });
+                const usado = parseFloat(distribuciones.reduce((a, d) => a + d.monto, 0).toFixed(2));
+                const resto = parseFloat((montoDestinoSafe - usado).toFixed(2));
+                if (resto !== 0) {
+                    const idx = distribuciones.findIndex((d) => d.fondoId === fondoPrincipal.id);
+                    if (idx >= 0) {
+                        distribuciones[idx].monto = parseFloat((distribuciones[idx].monto + resto).toFixed(2));
+                    } else {
+                        distribuciones.push({ fondoId: fondoPrincipal.id, monto: resto });
+                    }
+                }
+
+                for (const dist of distribuciones) {
+                    if (dist.monto <= 0) continue;
+                    await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [dist.monto, dist.fondoId]);
+                    await pool.query(
+                        `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                        [
+                            condoId,
+                            fondoOrigenIdSafe,
+                            dist.fondoId,
+                            montoOrigenSafe,
+                            tasaCambioSafe,
+                            dist.monto,
+                            referenciaSafe,
+                            fechaSafe,
+                            `${notaSafe || ''}${notaSafe ? ' | ' : ''}Distribución automática por cuenta destino`,
+                        ]
+                    );
+                }
+            } else {
+                const fondoDestinoIdSafe = asPositiveInt(fondo_destino_id, 'fondo_destino_id');
+                await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [montoDestinoSafe, fondoDestinoIdSafe]);
+                await pool.query(
+                    `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                    [condoId, fondoOrigenIdSafe, fondoDestinoIdSafe, montoOrigenSafe, tasaCambioSafe, montoDestinoSafe, referenciaSafe, fechaSafe, notaSafe]
+                );
+            }
 
             await pool.query('COMMIT');
             res.json({ status: 'success', message: 'Transferencia procesada exitosamente.' });

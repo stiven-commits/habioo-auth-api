@@ -208,26 +208,32 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
         }
     });
 
-    app.delete('/fondos/:id', verifyToken, async (req: Request<FondosDeleteParams>, res: Response, _next: NextFunction) => {
+    app.delete('/fondos/:id', verifyToken, async (req: Request<FondosDeleteParams, unknown, DeleteFondoBody>, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
             const fondoId = asString(req.params.id);
+            const destinoIdRaw = req.body?.destino_id;
+            const destinoId = destinoIdRaw !== undefined && destinoIdRaw !== null && String(destinoIdRaw).trim() !== ''
+                ? parseInt(String(destinoIdRaw), 10)
+                : null;
 
             const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const condoId = condoRes.rows[0].id;
 
             const fondoRes = await pool.query<IFondoRow>(
-                'SELECT id FROM fondos WHERE id = $1 AND condominio_id = $2',
+                'SELECT id, moneda, saldo_actual FROM fondos WHERE id = $1 AND condominio_id = $2',
                 [fondoId, condoId],
             );
             if (fondoRes.rows.length === 0) {
                 return res.status(404).json({ error: 'Fondo no encontrado.' });
             }
+            const fondoActual = fondoRes.rows[0];
+            const saldoActual = parseFloat(String(fondoActual.saldo_actual || 0)) || 0;
 
             const usageRes = await pool.query<IFondoUsageCountRow>(
                 `
                 SELECT
-                    (SELECT COUNT(*)::text FROM movimientos_fondos WHERE fondo_id = $1) AS movimientos_fondos,
+                    (SELECT COUNT(*)::text FROM movimientos_fondos WHERE fondo_id = $1 AND tipo <> 'AJUSTE_INICIAL') AS movimientos_fondos,
                     (SELECT COUNT(*)::text FROM gastos_pagos_fondos WHERE fondo_id = $1) AS gastos_pagos_fondos,
                     (SELECT COUNT(*)::text FROM pagos_proveedores WHERE fondo_id = $1) AS pagos_proveedores,
                     (SELECT COUNT(*)::text FROM transferencias WHERE fondo_origen_id = $1 OR fondo_destino_id = $1) AS transferencias
@@ -244,15 +250,35 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
             if (totalAsociados > 0) {
                 return res.status(400).json({
-                    error: 'No se puede eliminar el fondo porque ya tiene movimientos asociados. Si ya no lo usará, considere ajustar su porcentaje a 0.',
+                    error: 'No se puede eliminar el fondo porque ya tiene movimientos bancarios asociados.',
                 });
             }
 
+            await pool.query('BEGIN');
+
+            if (saldoActual > 0 && destinoId) {
+                const destinoRes = await pool.query<IFondoRow>(
+                    'SELECT id, moneda FROM fondos WHERE id = $1 AND condominio_id = $2 AND activo = true LIMIT 1',
+                    [destinoId, condoId]
+                );
+                if (destinoRes.rows.length === 0) {
+                    await pool.query('ROLLBACK');
+                    return res.status(400).json({ error: 'El fondo destino no existe o no pertenece al condominio.' });
+                }
+                if (String(destinoRes.rows[0].moneda || '').toUpperCase() !== String(fondoActual.moneda || '').toUpperCase()) {
+                    await pool.query('ROLLBACK');
+                    return res.status(400).json({ error: 'El fondo destino debe tener la misma moneda.' });
+                }
+                await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [saldoActual, destinoId]);
+            }
+
             await pool.query('DELETE FROM fondos WHERE id = $1 AND condominio_id = $2', [fondoId, condoId]);
+            await pool.query('COMMIT');
 
             return res.status(200).json({ status: 'success', message: 'Fondo eliminado correctamente.' });
         } catch (err: unknown) {
             const error = asError(err);
+            try { await pool.query('ROLLBACK'); } catch (_rollbackError) { /* noop */ }
             res.status(500).json({ error: error.message });
         }
     });
