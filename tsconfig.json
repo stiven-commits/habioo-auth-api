@@ -42,6 +42,9 @@
     "moduleDetection": "force",
     "skipLibCheck": true,
   },
+  "ts-node": {
+    "files": true
+  },
   "include": ["**/*.ts", "**/*.d.ts"],
   "exclude": ["node_modules"]
 }
