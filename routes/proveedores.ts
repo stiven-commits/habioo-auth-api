@@ -116,7 +116,7 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
         const { identificador, nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro } = req.body;
         const emailFmt = String(email || '').trim().toLowerCase();
         const emailDb = emailFmt || null;
-        if (emailFmt && !isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrÃ³nico invÃ¡lido.' });
+        if (emailFmt && !isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrónico inválido.' });
         try {
             const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const condoId = c.rows[0].id;
@@ -145,13 +145,13 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
         }
     });
 
-    // ðŸ’¡ 2. NUEVA RUTA: CARGA MASIVA DE PROVEEDORES POR LOTE (EXCEL)
+    // 2. NUEVA RUTA: CARGA MASIVA DE PROVEEDORES POR LOTE (EXCEL)
     app.post('/proveedores/lote', verifyToken, async (req: Request<{}, unknown, ProveedorLoteBody>, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
         const { proveedores } = req.body;
 
         if (!proveedores || !Array.isArray(proveedores) || proveedores.length === 0) {
-            return res.status(400).json({ error: 'No se enviaron datos vÃ¡lidos.' });
+            return res.status(400).json({ error: 'No se enviaron datos válidos.' });
         }
 
         try {
@@ -163,14 +163,14 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
                 const rifFmt = (item.identificador || '').toUpperCase().replace(/[^VEJPG0-9]/g, '');
                 const emailFmt = String(item.email || '').trim().toLowerCase();
                 const emailDb = emailFmt || null;
-                if (emailFmt && !isValidEmail(emailFmt)) throw new Error(`Correo invÃ¡lido para el proveedor con RIF ${rifFmt || '(sin RIF)'}.`);
+                if (emailFmt && !isValidEmail(emailFmt)) throw new Error(`Correo inválido para el proveedor con RIF ${rifFmt || '(sin RIF)'}.`);
 
                 const exist = await pool.query<IProveedorExistRow>('SELECT id, activo FROM proveedores WHERE identificador = $1 AND condominio_id = $2', [rifFmt, condoId]);
 
                 if (exist.rows.length > 0) {
                     if (exist.rows[0].activo) {
-                        // Si un RIF ya existe y estÃ¡ activo, rompemos la transacciÃ³n completa
-                        throw new Error(`El proveedor con RIF ${rifFmt} ya estÃ¡ registrado y activo en el directorio.`);
+                        // Si un RIF ya existe y está activo, rompemos la transacción completa
+                        throw new Error(`El proveedor con RIF ${rifFmt} ya está registrado y activo en el directorio.`);
                     } else {
                         // Si estaba eliminado, lo reactivamos
                         await pool.query(
@@ -202,7 +202,7 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
         const { nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro } = req.body;
         const emailFmt = String(email || '').trim().toLowerCase();
         const emailDb = emailFmt || null;
-        if (emailFmt && !isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrÃ³nico invÃ¡lido.' });
+        if (emailFmt && !isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrónico inválido.' });
         try {
             await pool.query(
                 'UPDATE proveedores SET nombre=$1, email=$2, telefono1=$3, telefono2=$4, direccion=$5, estado_venezuela=$6, rubro=$7 WHERE id=$8',
@@ -215,7 +215,7 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
         }
     });
 
-    // 4. ELIMINAR PROVEEDOR (BORRADO LÃ“GICO)
+    // 4. ELIMINAR PROVEEDOR (BORRADO LÓGICO)
     app.delete('/proveedores/:id', verifyToken, async (req: Request<ProveedorParams>, res: Response, _next: NextFunction) => {
         try {
             const proveedorId = asString(req.params.id);
