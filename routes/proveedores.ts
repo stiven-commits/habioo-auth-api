@@ -115,7 +115,8 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
         const user = asAuthUser(req.user);
         const { identificador, nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro } = req.body;
         const emailFmt = String(email || '').trim().toLowerCase();
-        if (!isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrÃ³nico invÃ¡lido.' });
+        const emailDb = emailFmt || null;
+        if (emailFmt && !isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrÃ³nico invÃ¡lido.' });
         try {
             const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const condoId = c.rows[0].id;
@@ -127,7 +128,7 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
                 else {
                     await pool.query(
                         'UPDATE proveedores SET nombre=$1, email=$2, telefono1=$3, telefono2=$4, direccion=$5, estado_venezuela=$6, rubro=$7, activo=true WHERE id=$8',
-                        [nombre, emailFmt, telefono1, telefono2, direccion, estado_venezuela, rubro || null, exist.rows[0].id]
+                        [nombre, emailDb, telefono1, telefono2, direccion, estado_venezuela, rubro || null, exist.rows[0].id]
                     );
                     return res.json({ status: 'success', message: 'El proveedor estaba oculto, ha sido reactivado y actualizado.' });
                 }
@@ -135,7 +136,7 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
 
             await pool.query(
                 'INSERT INTO proveedores (condominio_id, identificador, nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
-                [condoId, identificador, nombre, emailFmt, telefono1, telefono2, direccion, estado_venezuela, rubro || null]
+                [condoId, identificador, nombre, emailDb, telefono1, telefono2, direccion, estado_venezuela, rubro || null]
             );
             res.json({ status: 'success', message: 'Proveedor registrado exitosamente.' });
         } catch (err: unknown) {
@@ -161,7 +162,8 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
             for (const item of proveedores) {
                 const rifFmt = (item.identificador || '').toUpperCase().replace(/[^VEJPG0-9]/g, '');
                 const emailFmt = String(item.email || '').trim().toLowerCase();
-                if (!isValidEmail(emailFmt)) throw new Error(`Correo invÃ¡lido para el proveedor con RIF ${rifFmt || '(sin RIF)'}.`);
+                const emailDb = emailFmt || null;
+                if (emailFmt && !isValidEmail(emailFmt)) throw new Error(`Correo invÃ¡lido para el proveedor con RIF ${rifFmt || '(sin RIF)'}.`);
 
                 const exist = await pool.query<IProveedorExistRow>('SELECT id, activo FROM proveedores WHERE identificador = $1 AND condominio_id = $2', [rifFmt, condoId]);
 
@@ -173,14 +175,14 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
                         // Si estaba eliminado, lo reactivamos
                         await pool.query(
                             'UPDATE proveedores SET nombre=$1, email=$2, telefono1=$3, telefono2=$4, direccion=$5, estado_venezuela=$6, rubro=$7, activo=true WHERE id=$8',
-                            [item.nombre, emailFmt, item.telefono1, item.telefono2 || null, item.direccion, item.estado_venezuela, item.rubro || null, exist.rows[0].id]
+                            [item.nombre, emailDb, item.telefono1, item.telefono2 || null, item.direccion, item.estado_venezuela, item.rubro || null, exist.rows[0].id]
                         );
                     }
                 } else {
                     // Si no existe, lo insertamos
                     await pool.query(
                         'INSERT INTO proveedores (condominio_id, identificador, nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
-                        [condoId, rifFmt, item.nombre, emailFmt, item.telefono1, item.telefono2 || null, item.direccion, item.estado_venezuela, item.rubro || null]
+                        [condoId, rifFmt, item.nombre, emailDb, item.telefono1, item.telefono2 || null, item.direccion, item.estado_venezuela, item.rubro || null]
                     );
                 }
             }
@@ -199,11 +201,12 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
         const proveedorId = asString(req.params.id);
         const { nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro } = req.body;
         const emailFmt = String(email || '').trim().toLowerCase();
-        if (!isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrÃ³nico invÃ¡lido.' });
+        const emailDb = emailFmt || null;
+        if (emailFmt && !isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrÃ³nico invÃ¡lido.' });
         try {
             await pool.query(
                 'UPDATE proveedores SET nombre=$1, email=$2, telefono1=$3, telefono2=$4, direccion=$5, estado_venezuela=$6, rubro=$7 WHERE id=$8',
-                [nombre, emailFmt, telefono1, telefono2, direccion, estado_venezuela, rubro || null, proveedorId]
+                [nombre, emailDb, telefono1, telefono2, direccion, estado_venezuela, rubro || null, proveedorId]
             );
             res.json({ status: 'success', message: 'Proveedor actualizado correctamente.' });
         } catch (err: unknown) {
