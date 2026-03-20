@@ -1,21 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
+import type { AuthenticatedUser } from '../types/auth';
 const jwt: typeof import('jsonwebtoken') = require('jsonwebtoken');
-
-interface AuthUserPayload {
-    id: number;
-    cedula: string;
-    nombre: string;
-    condominio_id?: number;
-    is_admin?: boolean;
-}
-
-declare global {
-    namespace Express {
-        interface Request {
-            user?: AuthUserPayload;
-        }
-    }
-}
 
 const verifyToken = (req: Request, res: Response, next: NextFunction): void => {
     const authHeader = req.headers['authorization'];
@@ -31,7 +16,7 @@ const verifyToken = (req: Request, res: Response, next: NextFunction): void => {
             return;
         }
 
-        req.user = jwt.verify(token, process.env.JWT_SECRET as string) as AuthUserPayload;
+        req.user = jwt.verify(token, process.env.JWT_SECRET as string) as AuthenticatedUser;
         next();
     } catch (_err: unknown) {
         res.status(401).json({ status: 'error', message: 'Token invalido.' });
