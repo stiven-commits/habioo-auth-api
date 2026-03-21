@@ -42,7 +42,7 @@ interface ICondominioConfigRow {
 
 interface ICondominioMesRow {
     id: number;
-    mes_actual: string;
+    mes_actual: string | null;
 }
 
 interface IInsertedIdRow {
@@ -164,6 +164,7 @@ interface IBcvApiResponse {
 interface CreateGastoBody {
     proveedor_id: string | number;
     concepto: string;
+    numero_documento?: string | null;
     monto_bs: unknown;
     tasa_cambio: unknown;
     total_cuotas: string | number;
@@ -212,6 +213,8 @@ const asError = (value: unknown): Error => {
 };
 
 const toNumber = (value: string | number | null | undefined): number => parseFloat(String(value ?? 0)) || 0;
+const getCurrentYyyyMm = (): string => new Date().toISOString().slice(0, 7);
+const asYyyyMmOrCurrent = (value: unknown): string => (/^\d{4}-\d{2}$/.test(String(value || '').trim()) ? String(value).trim() : getCurrentYyyyMm());
 
 const fetchBcvRateToday = async (): Promise<number> => {
     const response = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
@@ -255,7 +258,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         const user = asAuthUser(req.user);
         if (!user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
 
-        const { proveedor_id, concepto, monto_bs, tasa_cambio, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto } = req.body;
+        const { proveedor_id, concepto, numero_documento, monto_bs, tasa_cambio, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto } = req.body;
 
         try {
             let facturaGuardada: string | null = null;
@@ -283,8 +286,11 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const fechaGastoSafe = toIsoDateOrNull(fecha_gasto);
 
             const condoRes = await pool.query<ICondominioMesRow>('SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            if (condoRes.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para el administrador.' });
+            }
             const condominio_id = condoRes.rows[0].id;
-            const mes_actual = condoRes.rows[0].mes_actual;
+            const mes_actual = asYyyyMmOrCurrent(condoRes.rows[0].mes_actual);
 
             const monto_usd = (m_bs / t_c).toFixed(2);
             const monto_cuota_usd = (parseFloat(monto_usd) / parseInt(String(total_cuotas), 10)).toFixed(2);
@@ -296,13 +302,18 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const dbClasificacion = String(clasificacion || '').trim().toLowerCase() === 'fijo' ? 'Fijo' : 'Variable';
             const zId = dbTipo === 'Zona' || dbTipo === 'No Comun' ? (zona_id || null) : null;
             const pId = dbTipo === 'Individual' ? (propiedad_id || null) : null;
+            const numeroDocSafe = String(numero_documento || '').trim();
+            const notaSafe = String(nota || '').trim();
+            const notaFinal = numeroDocSafe
+                ? (notaSafe ? `Nro. recibo/factura: ${numeroDocSafe} | ${notaSafe}` : `Nro. recibo/factura: ${numeroDocSafe}`)
+                : (notaSafe || null);
 
             const result = await pool.query<IInsertedIdRow>(
                 `
             INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, factura_img, imagenes)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id
         `,
-                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, nota, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados]
+                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, notaFinal, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados]
             );
 
             for (let i = 1; i <= Number(total_cuotas); i += 1) {
