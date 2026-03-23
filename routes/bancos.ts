@@ -545,6 +545,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const pagoCedulaOrigenExpr = hasCol('pagos', 'cedula_origen')
                 ? `COALESCE(NULLIF(BTRIM(p.cedula_origen), ''), ${pagoCedulaDesdeNotaExpr})`
                 : pagoCedulaDesdeNotaExpr;
+            const pagoReciboIdExpr = hasCol('pagos', 'recibo_id')
+                ? 'p.recibo_id'
+                : 'NULL::int';
 
             const query = `
                 WITH pp_gasto_rank AS (
@@ -572,7 +575,13 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         ) AS referencia,
                         CASE
                             WHEN p.id IS NOT NULL
-                                THEN ('Pago de Recibo #' || p.id::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A') || ' - Fondo: ' || COALESCE(f.nombre, 'N/A'))
+                                THEN (
+                                    CASE
+                                        WHEN ${pagoReciboIdExpr} IS NOT NULL
+                                            THEN ('Pago de Recibo #' || ${pagoReciboIdExpr}::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A') || ' - Fondo: ' || COALESCE(f.nombre, 'N/A'))
+                                        ELSE ('Pago Ref: ' || COALESCE(NULLIF(BTRIM(p.referencia), ''), p.id::text) || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A') || ' - Fondo: ' || COALESCE(f.nombre, 'N/A'))
+                                    END
+                                )
                             ELSE ('Ingreso distribuido en fondo: ' || COALESCE(f.nombre, 'N/A'))
                         END AS concepto,
                         'INGRESO'::text AS tipo,
@@ -646,7 +655,13 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         ('ING-' || p.id::text) AS id,
                         p.fecha_pago::date AS fecha,
                         p.referencia,
-                        ('Pago de Recibo #' || p.id::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A')) AS concepto,
+                        (
+                            CASE
+                                WHEN ${pagoReciboIdExpr} IS NOT NULL
+                                    THEN ('Pago de Recibo #' || ${pagoReciboIdExpr}::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A'))
+                                ELSE ('Pago Ref: ' || COALESCE(NULLIF(BTRIM(p.referencia), ''), p.id::text) || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A'))
+                            END
+                        ) AS concepto,
                         'INGRESO'::text AS tipo,
                         CASE
                             WHEN UPPER(COALESCE(p.moneda, '')) = 'BS'

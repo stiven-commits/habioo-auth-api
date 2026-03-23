@@ -532,7 +532,13 @@ router.get('/estado-cuenta/:condominio_id', verifyToken, async (req: Request, re
             mf.nota,
             CASE
               WHEN p.id IS NOT NULL
-                THEN ('Pago de Recibo #' || p.id::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A'))
+                THEN (
+                  CASE
+                    WHEN p.recibo_id IS NOT NULL
+                      THEN ('Pago de Recibo #' || p.recibo_id::text || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A'))
+                    ELSE ('Pago Ref: ' || COALESCE(NULLIF(BTRIM(p.referencia), ''), p.id::text) || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A'))
+                  END
+                )
               ELSE COALESCE(mf.nota, f.nombre, 'Movimiento')
             END AS concepto,
             COALESCE(p.referencia, NULLIF(mf.referencia_id::text, '')) AS referencia,
