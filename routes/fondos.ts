@@ -79,6 +79,10 @@ interface DeleteFondoBody {
     destino_id?: string | number;
 }
 
+interface RenameFondoBody {
+    nombre?: string;
+}
+
 const asAuthUser = (value: unknown): AuthUser => {
     if (
         typeof value !== 'object' ||
@@ -179,6 +183,44 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
             await pool.query('UPDATE fondos SET es_operativo = true, porcentaje_asignacion = 0 WHERE id = $1 AND condominio_id = $2', [fondoId, condoId]);
 
             return res.json({ status: 'success', message: 'Fondo establecido como principal.' });
+        } catch (err: unknown) {
+            const error = asError(err);
+            return res.status(500).json({ status: 'error', message: error.message });
+        }
+    });
+
+    app.put('/fondos/:id', verifyToken, async (req: Request<FondosDeleteParams, unknown, RenameFondoBody>, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const fondoId = asString(req.params.id);
+            const nombre = String(req.body?.nombre || '').trim();
+
+            if (!nombre) {
+                return res.status(400).json({ status: 'error', message: 'El nombre del fondo es obligatorio.' });
+            }
+
+            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            const condoId = condoRes.rows[0]?.id;
+            if (!condoId) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            }
+
+            const updatedRes = await pool.query<IFondoRow>(
+                `
+                UPDATE fondos
+                SET nombre = $1
+                WHERE id = $2
+                  AND condominio_id = $3
+                RETURNING id, condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, activo, visible_propietarios
+                `,
+                [nombre, fondoId, condoId]
+            );
+
+            if (updatedRes.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'Fondo no encontrado.' });
+            }
+
+            return res.json({ status: 'success', message: 'Nombre del fondo actualizado correctamente.' });
         } catch (err: unknown) {
             const error = asError(err);
             return res.status(500).json({ status: 'error', message: error.message });
