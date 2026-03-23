@@ -13,6 +13,7 @@ interface ChatAskBody {
 
 interface CondominioAdminRow {
     id: number;
+    nombre: string | null;
 }
 
 interface UsuarioNombreRow {
@@ -66,7 +67,7 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
 
             const adminCheck = await pool.query<CondominioAdminRow>(
                 `
-                SELECT c.id
+                SELECT c.id, c.nombre
                 FROM condominios c
                 WHERE c.admin_user_id = $1
                 LIMIT 1
@@ -92,6 +93,26 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
             if (!nombreObtenido) {
                 nombreObtenido = rolDetectado === 'Administrador' ? 'Administradora' : 'Propietario';
             }
+            let nombreCondominio = 'tu condominio';
+            if (rolDetectado === 'Administrador') {
+                const nombreAdminCondominio = String(adminCheck.rows[0]?.nombre || '').trim();
+                if (nombreAdminCondominio) nombreCondominio = nombreAdminCondominio;
+            } else {
+                const condominioPropietario = await pool.query<UsuarioNombreRow>(
+                    `
+                    SELECT c.nombre
+                    FROM usuarios_propiedades up
+                    JOIN propiedades p ON p.id = up.propiedad_id
+                    JOIN condominios c ON c.id = p.condominio_id
+                    WHERE up.user_id = $1
+                    ORDER BY up.id ASC
+                    LIMIT 1
+                    `,
+                    [user.id],
+                );
+                const nombrePropCondominio = String(condominioPropietario.rows[0]?.nombre || '').trim();
+                if (nombrePropCondominio) nombreCondominio = nombrePropCondominio;
+            }
 
             const abortController = new AbortController();
             const timeoutId = setTimeout(() => abortController.abort(), 25000);
@@ -104,6 +125,7 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
                     userId: user.id,
                     rol: rolDetectado,
                     nombre: nombreObtenido,
+                    condominio: nombreCondominio,
                 }),
                 signal: abortController.signal,
             }).finally(() => {
