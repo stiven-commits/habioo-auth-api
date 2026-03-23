@@ -96,6 +96,8 @@ interface IPagoFullRow {
     cuenta_bancaria_id: number | null;
     moneda: string | null;
     referencia: string | null;
+    created_at?: string | Date | null;
+    recibo_id?: number | null;
 }
 
 interface IPagoPendienteAdminRow {
@@ -115,6 +117,16 @@ interface IPagoPendienteAdminRow {
 
 interface IRechazarPagoBody {
     nota?: string | null;
+}
+
+interface IMovimientoFondoPagoRow {
+    id: number;
+    fondo_id: number;
+    monto: string | number;
+}
+
+interface IReciboPagadoCountRow {
+    total: string;
 }
 
 interface AbonoFondosInput {
@@ -1034,6 +1046,125 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
             return res.json({ status: 'success', message: 'Pago rechazado correctamente.' });
         } catch (err: unknown) {
+            return res.status(500).json({ status: 'error', message: asError(err).message });
+        }
+    });
+
+    app.post('/pagos/:id/rollback', verifyToken, async (req: Request<PagoValidarParams>, res: Response, _next: NextFunction) => {
+        const pagoId = asString(req.params.id);
+
+        try {
+            const user = asAuthUser(req.user);
+            await pool.query('BEGIN');
+
+            const pagoRes = await pool.query<IPagoFullRow>(
+                `
+                SELECT
+                  id,
+                  monto_usd,
+                  monto_origen,
+                  tasa_cambio,
+                  propiedad_id,
+                  estado,
+                  cuenta_bancaria_id,
+                  moneda,
+                  referencia,
+                  recibo_id,
+                  created_at
+                FROM pagos
+                WHERE id = $1
+                LIMIT 1
+                `,
+                [pagoId]
+            );
+            if (pagoRes.rows.length === 0) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Pago no encontrado.' });
+            }
+
+            const pago = pagoRes.rows[0];
+            const hasAccess = await adminHasPropiedadAccess(user.id, pago.propiedad_id);
+            if (!hasAccess) {
+                await pool.query('ROLLBACK');
+                return res.status(403).json({ status: 'error', message: 'No autorizado para revertir este pago.' });
+            }
+
+            if (String(pago.estado || '').trim() !== 'Validado') {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'Solo se pueden revertir pagos en estado Validado.' });
+            }
+
+            const createdAt = pago.created_at ? new Date(pago.created_at) : null;
+            if (!createdAt || Number.isNaN(createdAt.getTime())) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'El pago no tiene fecha de creación válida para rollback.' });
+            }
+
+            const ageMs = Date.now() - createdAt.getTime();
+            const rollbackWindowMs = 48 * 60 * 60 * 1000;
+            if (ageMs > rollbackWindowMs) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'La ventana de rollback (48 horas) ya expiró para este pago.' });
+            }
+
+            if (pago.recibo_id) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Este pago está asociado a un recibo. Use ajuste manual para conservar trazabilidad contable.',
+                });
+            }
+
+            const recibosPagadosRes = await pool.query<IReciboPagadoCountRow>(
+                `
+                SELECT COUNT(*)::text AS total
+                FROM recibos
+                WHERE propiedad_id = $1
+                  AND COALESCE(monto_pagado_usd, 0) > 0
+                `,
+                [pago.propiedad_id]
+            );
+            const recibosPagados = parseInt(recibosPagadosRes.rows[0]?.total || '0', 10) || 0;
+            if (recibosPagados > 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Este pago ya impactó avisos/recibos. Para corregirlo, use ajuste manual.',
+                });
+            }
+
+            const movimientosRes = await pool.query<IMovimientoFondoPagoRow>(
+                `
+                SELECT id, fondo_id, monto
+                FROM movimientos_fondos
+                WHERE referencia_id = $1
+                ORDER BY id ASC
+                `,
+                [pago.id]
+            );
+
+            for (const mov of movimientosRes.rows) {
+                await pool.query(
+                    `
+                    UPDATE fondos
+                    SET saldo_actual = COALESCE(saldo_actual, 0) - $1
+                    WHERE id = $2
+                    `,
+                    [round2(parseLocaleNumber(mov.monto)), mov.fondo_id]
+                );
+            }
+
+            await pool.query('DELETE FROM movimientos_fondos WHERE referencia_id = $1', [pago.id]);
+            await pool.query(
+                'UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2',
+                [round2(parseLocaleNumber(pago.monto_usd)), pago.propiedad_id]
+            );
+            await pool.query('DELETE FROM pagos WHERE id = $1', [pago.id]);
+
+            await pool.query('COMMIT');
+            return res.json({ status: 'success', message: 'Pago revertido correctamente.' });
+        } catch (err: unknown) {
+            await pool.query('ROLLBACK');
             return res.status(500).json({ status: 'error', message: asError(err).message });
         }
     });

@@ -52,6 +52,7 @@ interface IMovimientoRow {
     fondo_origen_id: number | null;
     fondo_destino_id: number | null;
     fondo_nombre: string | null;
+    pago_id?: number | null;
 }
 
 interface IGastoPendienteRow {
@@ -604,7 +605,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         f.id::int AS fondo_id,
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
-                        f.nombre::text AS fondo_nombre
+                        f.nombre::text AS fondo_nombre,
+                        p.id::int AS pago_id
                     FROM movimientos_fondos mf
                     JOIN fondos f ON f.id = mf.fondo_id
                     LEFT JOIN pagos p ON p.id = COALESCE(
@@ -678,7 +680,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_id,
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
-                        NULL::text AS fondo_nombre
+                        NULL::text AS fondo_nombre,
+                        p.id::int AS pago_id
                     FROM pagos p
                     LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
                     LEFT JOIN ingresos_distribuidos_por_pago idp ON idp.pago_id = p.id
@@ -702,7 +705,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         gpf.fondo_id::int AS fondo_id,
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
-                        f.nombre::text AS fondo_nombre
+                        f.nombre::text AS fondo_nombre,
+                        NULL::int AS pago_id
                     FROM (
                         SELECT
                             gpf.*,
@@ -737,7 +741,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         pp.fondo_id::int AS fondo_id,
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
-                        f.nombre::text AS fondo_nombre
+                        f.nombre::text AS fondo_nombre,
+                        NULL::int AS pago_id
                     FROM pagos_proveedores pp
                     JOIN gastos g ON g.id = pp.gasto_id
                     LEFT JOIN proveedores prov ON prov.id = g.proveedor_id
@@ -814,7 +819,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                             WHEN f_dest.cuenta_bancaria_id = $1 AND f_orig.cuenta_bancaria_id <> $1 THEN f_dest.nombre::text
                             WHEN f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1 THEN f_orig.nombre::text
                             ELSE NULL::text
-                        END AS fondo_nombre
+                        END AS fondo_nombre,
+                        NULL::int AS pago_id
                     FROM transferencias t
                     JOIN fondos f_orig ON f_orig.id = t.fondo_origen_id
                     JOIN fondos f_dest ON f_dest.id = t.fondo_destino_id
@@ -826,19 +832,19 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         (f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1)
                     )
                 )
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
                 FROM ingresos_fondos
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
                 FROM ingresos_transito
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
                 FROM egresos_gpf
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
                 FROM egresos_pp
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
                 FROM transferencias_cuentas
                 ORDER BY fecha DESC, id DESC
             `;
