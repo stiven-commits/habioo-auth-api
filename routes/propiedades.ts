@@ -1467,7 +1467,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     const notaMovimiento = historialId
                         ? `${notaBase} | ajuste_historial_id:${historialId}`
                         : notaBase;
-                    const tipoMovimiento = await resolveMovimientoFondoTipo(['INGRESO', 'ABONO', 'ENTRADA', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
+                    const tipoMovimiento = await resolveMovimientoFondoTipo(['AJUSTE_INICIAL', 'INGRESO', 'ABONO', 'ENTRADA'], 'AJUSTE_INICIAL');
                     await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, f.id]);
                     await pool.query(
                         'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5)', 

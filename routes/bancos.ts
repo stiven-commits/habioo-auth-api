@@ -53,6 +53,7 @@ interface IMovimientoRow {
     fondo_destino_id: number | null;
     fondo_nombre: string | null;
     pago_id?: number | null;
+    inmueble?: string | null;
 }
 
 interface IGastoPendienteRow {
@@ -588,10 +589,22 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     SELECT
                         ('ING-MF-' || mf.id::text) AS id,
                         COALESCE(p.fecha_pago::date, mf.fecha::date) AS fecha,
-                        COALESCE(
-                            p.referencia,
-                            NULLIF(BTRIM(COALESCE((regexp_match(COALESCE(mf.nota, ''), '\\(([^)]*)\\)'))[1], '')), '')
-                        ) AS referencia,
+                        CASE
+                            WHEN p.id IS NOT NULL THEN NULLIF(BTRIM(COALESCE(p.referencia, '')), '')
+                            WHEN mf.tipo = 'AJUSTE_INICIAL'
+                                 AND (
+                                     COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                     OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                                 )
+                                THEN COALESCE(
+                                    CASE
+                                        WHEN hsi.id IS NOT NULL THEN ('AJ-' || hsi.id::text)
+                                        ELSE ('AJ-MF-' || mf.id::text)
+                                    END,
+                                    ('AJ-MF-' || mf.id::text)
+                                )
+                            ELSE NULLIF(BTRIM(COALESCE((regexp_match(COALESCE(mf.nota, ''), '\\(([^)]*)\\)'))[1], '')), '')
+                        END AS referencia,
                         CASE
                             WHEN p.id IS NOT NULL
                                 THEN (
@@ -630,7 +643,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
                         f.nombre::text AS fondo_nombre,
-                        p.id::int AS pago_id
+                        p.id::int AS pago_id,
+                        COALESCE(pr.identificador, pr_aj.identificador)::text AS inmueble
                     FROM movimientos_fondos mf
                     JOIN fondos f ON f.id = mf.fondo_id
                     LEFT JOIN pagos p ON p.id = COALESCE(
@@ -638,6 +652,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULLIF((regexp_match(COALESCE(mf.nota, ''), '(?i)pago\\s*#\\s*([0-9]+)'))[1], '')::int
                     )
                     LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
+                    LEFT JOIN historial_saldos_inmuebles hsi ON hsi.id = NULLIF((regexp_match(COALESCE(mf.nota, ''), '(?i)ajuste_historial_id:\\s*([0-9]+)'))[1], '')::int
+                    LEFT JOIN propiedades pr_aj ON pr_aj.id = hsi.propiedad_id
                     WHERE f.cuenta_bancaria_id = $1
                       AND (
                         mf.tipo IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
@@ -719,7 +735,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
                         NULL::text AS fondo_nombre,
-                        p.id::int AS pago_id
+                        p.id::int AS pago_id,
+                        pr.identificador::text AS inmueble
                     FROM pagos p
                     LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
                     LEFT JOIN ingresos_distribuidos_por_pago idp ON idp.pago_id = p.id
@@ -744,7 +761,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
                         f.nombre::text AS fondo_nombre,
-                        NULL::int AS pago_id
+                        NULL::int AS pago_id,
+                        NULL::text AS inmueble
                     FROM (
                         SELECT
                             gpf.*,
@@ -780,7 +798,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
                         f.nombre::text AS fondo_nombre,
-                        NULL::int AS pago_id
+                        NULL::int AS pago_id,
+                        NULL::text AS inmueble
                     FROM pagos_proveedores pp
                     JOIN gastos g ON g.id = pp.gasto_id
                     LEFT JOIN proveedores prov ON prov.id = g.proveedor_id
@@ -858,7 +877,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                             WHEN f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1 THEN f_orig.nombre::text
                             ELSE NULL::text
                         END AS fondo_nombre,
-                        NULL::int AS pago_id
+                        NULL::int AS pago_id,
+                        NULL::text AS inmueble
                     FROM transferencias t
                     JOIN fondos f_orig ON f_orig.id = t.fondo_origen_id
                     JOIN fondos f_dest ON f_dest.id = t.fondo_destino_id
@@ -870,19 +890,19 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         (f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1)
                     )
                 )
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
                 FROM ingresos_fondos
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
                 FROM ingresos_transito
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
                 FROM egresos_gpf
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
                 FROM egresos_pp
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
                 FROM transferencias_cuentas
                 ORDER BY fecha DESC, id DESC
             `;
@@ -958,13 +978,32 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             }
 
             const historialMatch = notaMovimiento.match(/ajuste_historial_id:\s*(\d+)/i);
-            const historialId = historialMatch?.[1] ? parseInt(historialMatch[1], 10) : NaN;
+            let historialId = historialMatch?.[1] ? parseInt(historialMatch[1], 10) : NaN;
+
             if (!Number.isFinite(historialId) || historialId <= 0) {
-                await pool.query('ROLLBACK');
-                return res.status(400).json({
-                    status: 'error',
-                    message: 'Este ajuste no tiene trazabilidad suficiente para rollback automático. Realice un ajuste compensatorio manual.',
-                });
+                // Fallback para ajustes creados antes del tracking de ajuste_historial_id:
+                // buscar por nota exacta + timestamp del movimiento (misma transacción)
+                const fallbackRes = await pool.query<{ id: number }>(
+                    `SELECT h.id FROM historial_saldos_inmuebles h
+                     JOIN propiedades p ON p.id = h.propiedad_id
+                     WHERE h.nota = $1
+                       AND h.tipo IN ('AGREGAR_FAVOR', 'FAVOR')
+                       AND p.condominio_id = $2
+                       AND h.fecha BETWEEN $3::timestamp - INTERVAL '2 seconds'
+                                       AND $3::timestamp + INTERVAL '2 seconds'
+                     ORDER BY ABS(EXTRACT(EPOCH FROM (h.fecha - $3::timestamp))) ASC
+                     LIMIT 1`,
+                    [notaMovimiento, condominioId, mov.fecha]
+                );
+                if (fallbackRes.rows.length > 0) {
+                    historialId = fallbackRes.rows[0].id;
+                } else {
+                    await pool.query('ROLLBACK');
+                    return res.status(400).json({
+                        status: 'error',
+                        message: 'Este ajuste no tiene trazabilidad suficiente para rollback automático. Realice un ajuste compensatorio manual.',
+                    });
+                }
             }
 
             const historialRes = await pool.query<IAjusteHistorialRollbackRow>(
