@@ -1115,22 +1115,86 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 });
             }
 
-            const recibosPagadosRes = await pool.query<IReciboPagadoCountRow>(
-                `
-                SELECT COUNT(*)::text AS total
-                FROM recibos
-                WHERE propiedad_id = $1
-                  AND COALESCE(monto_pagado_usd, 0) > 0
-                `,
+            // Simulación FIFO para determinar exactamente qué recibos tocó ESTE pago.
+            // Se obtienen todos los recibos de la propiedad en orden cronológico y se simulan
+            // primero los otros pagos validados, luego este pago, para saber cuánto aportó a cada recibo.
+            const recibosFifoRes = await pool.query<IReciboRow>(
+                `SELECT id, monto_usd, monto_pagado_usd, estado, mes_cobro, propiedad_id
+                 FROM recibos WHERE propiedad_id = $1 ORDER BY fecha_emision ASC, id ASC`,
                 [pago.propiedad_id]
             );
-            const recibosPagados = parseInt(recibosPagadosRes.rows[0]?.total || '0', 10) || 0;
-            if (recibosPagados > 0) {
-                await pool.query('ROLLBACK');
-                return res.status(400).json({
-                    status: 'error',
-                    message: 'Este pago ya impactó avisos/recibos. Para corregirlo, use ajuste manual.',
-                });
+            const recibosFifo = recibosFifoRes.rows;
+
+            const otrosPagosRes = await pool.query<{ total: string }>(
+                `SELECT COALESCE(SUM(monto_usd), 0)::text AS total
+                 FROM pagos WHERE propiedad_id = $1 AND estado = 'Validado' AND id != $2`,
+                [pago.propiedad_id, pago.id]
+            );
+            let otrosPagosRemaining = round2(parseLocaleNumber(otrosPagosRes.rows[0].total));
+
+            // Simular cuánta deuda queda por recibo después de los demás pagos
+            const deudaRestantePorRecibo = new Map<number, number>();
+            for (const rec of recibosFifo) {
+                const deuda = round2(parseFloat(String(rec.monto_usd || 0)));
+                if (deuda <= 0) { deudaRestantePorRecibo.set(rec.id, 0); continue; }
+                if (otrosPagosRemaining >= deuda) {
+                    otrosPagosRemaining = round2(otrosPagosRemaining - deuda);
+                    deudaRestantePorRecibo.set(rec.id, 0);
+                } else {
+                    deudaRestantePorRecibo.set(rec.id, round2(deuda - otrosPagosRemaining));
+                    otrosPagosRemaining = 0;
+                }
+            }
+
+            // Determinar qué recibos tocó este pago y en cuánto
+            const reciboHits: Array<{ recibo: IReciboRow; montoAportado: number }> = [];
+            let thisRemaining = round2(parseLocaleNumber(pago.monto_usd));
+            for (const rec of recibosFifo) {
+                if (thisRemaining <= 0) break;
+                const deudaRestante = deudaRestantePorRecibo.get(rec.id) ?? 0;
+                if (deudaRestante <= 0) continue;
+                const aportado = round2(Math.min(thisRemaining, deudaRestante));
+                thisRemaining = round2(thisRemaining - aportado);
+                reciboHits.push({ recibo: rec, montoAportado: aportado });
+            }
+
+            // Revertir recibos y gastos que este pago tocó
+            for (const { recibo, montoAportado } of reciboHits) {
+                await pool.query(
+                    `UPDATE recibos
+                     SET monto_pagado_usd = GREATEST(0, COALESCE(monto_pagado_usd, 0) - $1),
+                         estado = CASE
+                             WHEN GREATEST(0, COALESCE(monto_pagado_usd, 0) - $1) <= 0.005 THEN 'Pendiente'
+                             ELSE 'Abonado'
+                         END
+                     WHERE id = $2`,
+                    [montoAportado, recibo.id]
+                );
+
+                const breakdown = await buildReciboBreakdownByGasto(pool, recibo);
+                if (breakdown.length > 0) {
+                    const pagadoPrevio = round2(Math.max(0, parseFloat(String(recibo.monto_pagado_usd || 0)) - montoAportado));
+                    const rows = breakdown.map((b) => ({ ...b, restante: round2(b.shareUsd) }));
+                    let prevRemaining = pagadoPrevio;
+                    for (const row of rows) {
+                        if (prevRemaining <= 0) break;
+                        const aplicadoAntes = Math.min(row.restante, prevRemaining);
+                        row.restante = round2(row.restante - aplicadoAntes);
+                        prevRemaining = round2(prevRemaining - aplicadoAntes);
+                    }
+                    let gastoRemaining = montoAportado;
+                    for (const row of rows) {
+                        if (gastoRemaining <= 0) break;
+                        if (row.restante <= 0) continue;
+                        const aplicar = Math.min(row.restante, gastoRemaining);
+                        if (aplicar <= 0) continue;
+                        await pool.query(
+                            `UPDATE gastos SET monto_pagado_usd = GREATEST(0, COALESCE(monto_pagado_usd, 0) - $1) WHERE id = $2`,
+                            [aplicar, row.gastoId]
+                        );
+                        gastoRemaining = round2(gastoRemaining - aplicar);
+                    }
+                }
             }
 
             const movimientosRes = await pool.query<IMovimientoFondoPagoRow>(
