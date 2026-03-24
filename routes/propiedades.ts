@@ -804,8 +804,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     'AJUSTE' as tipo,
                     id as ref_id,
                     nota as concepto,
-                    CASE WHEN tipo = 'CARGAR_DEUDA' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(DEUDA)%') THEN monto ELSE 0 END as cargo,
-                    CASE WHEN tipo = 'AGREGAR_FAVOR' OR (tipo = 'SALDO_INICIAL' AND nota LIKE '%(FAVOR)%') THEN monto ELSE 0 END as abono,
+                    CASE WHEN tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (tipo = 'SALDO_INICIAL' AND COALESCE(nota, '') LIKE '%(DEUDA)%') THEN monto ELSE 0 END as cargo,
+                    CASE WHEN tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (tipo = 'SALDO_INICIAL' AND COALESCE(nota, '') LIKE '%(FAVOR)%') THEN monto ELSE 0 END as abono,
                     NULL::numeric as monto_bs,
                     NULL::numeric as tasa_cambio,
                     NULL::text as estado_recibo,
@@ -1385,13 +1385,68 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         const montoNum = parseFloat((monto || '0').toString().replace(',', '.')) || 0;
         if (montoNum <= 0) return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
 
+        const tipoAjusteRaw = String(tipo_ajuste || '').trim().toUpperCase();
+        const esCargaDeuda = tipoAjusteRaw === 'CARGAR_DEUDA' || tipoAjusteRaw === 'DEUDA';
+        const esAgregarFavor = tipoAjusteRaw === 'AGREGAR_FAVOR' || tipoAjusteRaw === 'FAVOR';
+        if (!esCargaDeuda && !esAgregarFavor) {
+            return res.status(400).json({ error: 'tipo_ajuste inválido.' });
+        }
+
+        const tipoAjusteCanonico = esCargaDeuda ? 'CARGAR_DEUDA' : 'AGREGAR_FAVOR';
+
         try {
             await pool.query('BEGIN');
-            const operador = tipo_ajuste === 'CARGAR_DEUDA' ? '+' : '-';
+            const operador = esCargaDeuda ? '+' : '-';
             await pool.query(`UPDATE propiedades SET saldo_actual = saldo_actual ${operador} $1 WHERE id = $2`, [montoNum, propiedadId]);
-            await pool.query('INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)', [propiedadId, tipo_ajuste, montoNum, nota || 'Ajuste manual del administrador']);
+
+            const tiposCompatibles = tipoAjusteCanonico === 'CARGAR_DEUDA'
+                ? ['CARGAR_DEUDA', 'DEUDA']
+                : ['AGREGAR_FAVOR', 'FAVOR'];
+            let historialInsertado = false;
+            let ultimoErrorHistorial: unknown = null;
+
+            for (const tipoHistorial of tiposCompatibles) {
+                try {
+                    await pool.query(
+                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
+                        [propiedadId, tipoHistorial, montoNum, nota || 'Ajuste manual del administrador']
+                    );
+                    historialInsertado = true;
+                    break;
+                } catch (err: unknown) {
+                    const pgError = asPgError(err);
+                    const esErrorCompatibilidadTipo = pgError.code === '22P02' || pgError.code === '23514' || pgError.code === '22001';
+                    if (!esErrorCompatibilidadTipo) {
+                        throw err;
+                    }
+                    ultimoErrorHistorial = err;
+                }
+            }
+            if (!historialInsertado && ultimoErrorHistorial) {
+                throw ultimoErrorHistorial;
+            }
             
-            if (tipo_ajuste === 'AGREGAR_FAVOR' && cuenta_bancaria_id && !es_gasto_extra) {
+            if (tipoAjusteCanonico === 'AGREGAR_FAVOR' && cuenta_bancaria_id && !es_gasto_extra) {
+                const resolveMovimientoFondoTipo = async (preferred: string[], fallback: string): Promise<string> => {
+                    try {
+                        const r = await pool.query<{ def: string }>(`
+                            SELECT pg_get_constraintdef(oid) AS def
+                            FROM pg_constraint
+                            WHERE conname = 'movimientos_fondos_tipo_check'
+                            LIMIT 1
+                        `);
+                        const def = r.rows?.[0]?.def || '';
+                        const matches = [...def.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+                        const allowed = new Set(matches);
+                        const selected = preferred.find((t) => allowed.has(t));
+                        if (selected) return selected;
+                        if (matches.length > 0) return matches[0];
+                    } catch (_err) {
+                        // fallback below
+                    }
+                    return fallback;
+                };
+
                 const fondosRes = await pool.query<{ id: number; moneda: string }>(
                     'SELECT id, moneda FROM fondos WHERE cuenta_bancaria_id = $1 AND activo = true ORDER BY es_operativo DESC, id ASC',
                     [cuenta_bancaria_id]
@@ -1402,13 +1457,14 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     if (f.moneda === 'Bs' || f.moneda === 'BS') {
                         montoFondo = parseFloat(String(monto_bs || '0')) || montoNum * (parseFloat(String(tasa_cambio || '1')) || 1);
                     }
+                    const tipoMovimiento = await resolveMovimientoFondoTipo(['INGRESO', 'ABONO', 'ENTRADA', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
                     await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, f.id]);
                     await pool.query(
                         'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5)', 
-                        [f.id, 'INGRESO', montoFondo, parseFloat(String(tasa_cambio || '1')) || 1, nota || 'Ajuste manual a favor']
+                        [f.id, tipoMovimiento, montoFondo, parseFloat(String(tasa_cambio || '1')) || 1, nota || 'Ajuste manual a favor']
                     );
                 }
-            } else if (tipo_ajuste === 'AGREGAR_FAVOR' && es_gasto_extra && gasto_extra_id) {
+            } else if (tipoAjusteCanonico === 'AGREGAR_FAVOR' && es_gasto_extra && gasto_extra_id) {
                 // Abono directo para rebajar la deuda del gasto extra
                 await pool.query(
                     'UPDATE gastos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1 WHERE id = $2',

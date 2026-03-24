@@ -583,6 +583,12 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                         ELSE ('Pago Ref: ' || COALESCE(NULLIF(BTRIM(p.referencia), ''), p.id::text) || ' - Inmueble: ' || COALESCE(pr.identificador, 'N/A') || ' - Fondo: ' || COALESCE(f.nombre, 'N/A'))
                                     END
                                 )
+                            WHEN mf.tipo = 'AJUSTE_INICIAL'
+                                 AND (
+                                     COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                     OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                                 )
+                                THEN COALESCE(NULLIF(BTRIM(mf.nota), ''), ('Ajuste en fondo: ' || COALESCE(f.nombre, 'N/A')))
                             ELSE ('Ingreso distribuido en fondo: ' || COALESCE(f.nombre, 'N/A'))
                         END AS concepto,
                         'INGRESO'::text AS tipo,
@@ -617,7 +623,14 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     WHERE f.cuenta_bancaria_id = $1
                       AND (
                         mf.tipo IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
-                        OR (mf.tipo = 'AJUSTE_INICIAL' AND COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%')
+                        OR (
+                            mf.tipo = 'AJUSTE_INICIAL'
+                            AND (
+                                COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%'
+                                OR COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                            )
+                        )
                       )
                 ),
                 ingresos_distribuidos_por_pago AS (
@@ -648,7 +661,14 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                       AND (
                         mf.id IS NULL
                         OR mf.tipo IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
-                        OR (mf.tipo = 'AJUSTE_INICIAL' AND COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%')
+                        OR (
+                            mf.tipo = 'AJUSTE_INICIAL'
+                            AND (
+                                COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%'
+                                OR COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                            )
+                        )
                       )
                     GROUP BY p.id
                 ),

@@ -446,12 +446,12 @@ router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Req
           h.id AS ref_id,
           COALESCE(h.nota, 'Ajuste manual') AS concepto,
           CASE
-            WHEN h.tipo = 'CARGAR_DEUDA' OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
+            WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
               THEN COALESCE(h.monto, 0)
             ELSE 0
           END AS cargo,
           CASE
-            WHEN h.tipo = 'AGREGAR_FAVOR' OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+            WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
               THEN COALESCE(h.monto, 0)
             ELSE 0
           END AS abono,
