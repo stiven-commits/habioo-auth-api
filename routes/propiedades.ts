@@ -200,6 +200,10 @@ interface CopropietarioRow {
     telefono: string | null;
 }
 
+interface IHistorialSaldoIdRow {
+    id: number;
+}
+
 const asAuthUser = (value: unknown): AuthUser => {
     if (
         typeof value !== 'object' ||
@@ -1396,6 +1400,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 
         try {
             await pool.query('BEGIN');
+            const notaBase = (nota || 'Ajuste manual del administrador').trim();
             const operador = esCargaDeuda ? '+' : '-';
             await pool.query(`UPDATE propiedades SET saldo_actual = saldo_actual ${operador} $1 WHERE id = $2`, [montoNum, propiedadId]);
 
@@ -1403,14 +1408,16 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 ? ['CARGAR_DEUDA', 'DEUDA']
                 : ['AGREGAR_FAVOR', 'FAVOR'];
             let historialInsertado = false;
+            let historialId: number | null = null;
             let ultimoErrorHistorial: unknown = null;
 
             for (const tipoHistorial of tiposCompatibles) {
                 try {
-                    await pool.query(
-                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
-                        [propiedadId, tipoHistorial, montoNum, nota || 'Ajuste manual del administrador']
+                    const historialRes = await pool.query<IHistorialSaldoIdRow>(
+                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4) RETURNING id',
+                        [propiedadId, tipoHistorial, montoNum, notaBase]
                     );
+                    historialId = historialRes.rows?.[0]?.id || null;
                     historialInsertado = true;
                     break;
                 } catch (err: unknown) {
@@ -1457,11 +1464,14 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     if (f.moneda === 'Bs' || f.moneda === 'BS') {
                         montoFondo = parseFloat(String(monto_bs || '0')) || montoNum * (parseFloat(String(tasa_cambio || '1')) || 1);
                     }
+                    const notaMovimiento = historialId
+                        ? `${notaBase} | ajuste_historial_id:${historialId}`
+                        : notaBase;
                     const tipoMovimiento = await resolveMovimientoFondoTipo(['INGRESO', 'ABONO', 'ENTRADA', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
                     await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, f.id]);
                     await pool.query(
                         'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5)', 
-                        [f.id, tipoMovimiento, montoFondo, parseFloat(String(tasa_cambio || '1')) || 1, nota || 'Ajuste manual a favor']
+                        [f.id, tipoMovimiento, montoFondo, parseFloat(String(tasa_cambio || '1')) || 1, notaMovimiento]
                     );
                 }
             } else if (tipoAjusteCanonico === 'AGREGAR_FAVOR' && es_gasto_extra && gasto_extra_id) {

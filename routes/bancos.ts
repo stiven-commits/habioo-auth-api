@@ -124,6 +124,24 @@ interface IFondoTransferRow {
     es_operativo: boolean;
 }
 
+interface IAjusteRollbackMovimientoRow {
+    id: number;
+    fondo_id: number;
+    tipo: string | null;
+    monto: string | number;
+    nota: string | null;
+    fecha: string | Date;
+    condominio_id: number;
+    saldo_fondo: string | number;
+}
+
+interface IAjusteHistorialRollbackRow {
+    id: number;
+    propiedad_id: number;
+    tipo: string | null;
+    monto: string | number;
+}
+
 const asAuthUser = (value: unknown): AuthUser => {
     if (
         typeof value !== 'object' ||
@@ -875,6 +893,129 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const typedError = asError(error);
             console.error('Error en estado de cuenta:', error);
             res.status(500).json({ error: typedError.message });
+        }
+    });
+
+    app.post('/movimientos-fondos/:id/rollback-ajuste', verifyToken, async (req: Request<BancosParams>, res: Response, _next: NextFunction) => {
+        const movimientoId = asPositiveInt(asString(req.params.id), 'movimiento_fondo_id');
+        const rollbackWindowMs = 48 * 60 * 60 * 1000;
+        try {
+            const user = asAuthUser(req.user);
+            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            if (!condoRes.rows.length) {
+                return res.status(403).json({ status: 'error', message: 'No autorizado para revertir ajustes.' });
+            }
+            const condominioId = condoRes.rows[0].id;
+
+            await pool.query('BEGIN');
+            const movRes = await pool.query<IAjusteRollbackMovimientoRow>(
+                `
+                SELECT
+                    mf.id,
+                    mf.fondo_id,
+                    mf.tipo,
+                    COALESCE(mf.monto, 0) AS monto,
+                    mf.nota,
+                    mf.fecha,
+                    cb.condominio_id,
+                    COALESCE(f.saldo_actual, 0) AS saldo_fondo
+                FROM movimientos_fondos mf
+                JOIN fondos f ON f.id = mf.fondo_id
+                JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+                WHERE mf.id = $1
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [movimientoId]
+            );
+            if (!movRes.rows.length) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Movimiento no encontrado.' });
+            }
+            const mov = movRes.rows[0];
+            if (mov.condominio_id !== condominioId) {
+                await pool.query('ROLLBACK');
+                return res.status(403).json({ status: 'error', message: 'No autorizado para revertir este ajuste.' });
+            }
+
+            const tipoMovimiento = String(mov.tipo || '').toUpperCase();
+            const notaMovimiento = String(mov.nota || '');
+            const esAjusteElegible = tipoMovimiento === 'AJUSTE_INICIAL' && /ajuste/i.test(notaMovimiento);
+            if (!esAjusteElegible) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'Este movimiento no corresponde a un ajuste de saldo reversible.' });
+            }
+
+            const fechaMovimiento = new Date(mov.fecha);
+            if (Number.isNaN(fechaMovimiento.getTime())) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'El ajuste no tiene fecha válida para rollback.' });
+            }
+            const ageMs = Date.now() - fechaMovimiento.getTime();
+            if (ageMs > rollbackWindowMs) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'La ventana de rollback (48 horas) ya expiró para este ajuste.' });
+            }
+
+            const historialMatch = notaMovimiento.match(/ajuste_historial_id:\s*(\d+)/i);
+            const historialId = historialMatch?.[1] ? parseInt(historialMatch[1], 10) : NaN;
+            if (!Number.isFinite(historialId) || historialId <= 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Este ajuste no tiene trazabilidad suficiente para rollback automático. Realice un ajuste compensatorio manual.',
+                });
+            }
+
+            const historialRes = await pool.query<IAjusteHistorialRollbackRow>(
+                `
+                SELECT h.id, h.propiedad_id, h.tipo, h.monto
+                FROM historial_saldos_inmuebles h
+                JOIN propiedades p ON p.id = h.propiedad_id
+                WHERE h.id = $1
+                  AND p.condominio_id = $2
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [historialId, condominioId]
+            );
+            if (!historialRes.rows.length) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'No se encontró el historial del ajuste asociado.' });
+            }
+            const historial = historialRes.rows[0];
+            const tipoHistorial = String(historial.tipo || '').toUpperCase();
+            if (tipoHistorial !== 'AGREGAR_FAVOR' && tipoHistorial !== 'FAVOR') {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'Solo se pueden revertir ajustes de saldo a favor.' });
+            }
+
+            const montoFondo = parseFloat(String(mov.monto ?? 0)) || 0;
+            const saldoFondoActual = parseFloat(String(mov.saldo_fondo ?? 0)) || 0;
+            if (montoFondo <= 0 || saldoFondoActual < montoFondo) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'No se puede revertir porque el fondo ya no tiene saldo suficiente para deshacer este ajuste.',
+                });
+            }
+
+            const montoPropiedad = parseFloat(String(historial.monto ?? 0)) || 0;
+            if (montoPropiedad <= 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'Monto del historial de ajuste inválido.' });
+            }
+
+            await pool.query('UPDATE fondos SET saldo_actual = GREATEST(0, COALESCE(saldo_actual, 0) - $1) WHERE id = $2', [montoFondo, mov.fondo_id]);
+            await pool.query('UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoPropiedad, historial.propiedad_id]);
+            await pool.query('DELETE FROM movimientos_fondos WHERE id = $1', [movimientoId]);
+            await pool.query('DELETE FROM historial_saldos_inmuebles WHERE id = $1', [historialId]);
+
+            await pool.query('COMMIT');
+            return res.json({ status: 'success', message: 'Ajuste revertido correctamente.' });
+        } catch (err: unknown) {
+            await pool.query('ROLLBACK');
+            return res.status(500).json({ status: 'error', message: asError(err).message });
         }
     });
 
