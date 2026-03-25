@@ -616,10 +616,12 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                 )
                             WHEN mf.tipo = 'AJUSTE_INICIAL'
                                  AND (
-                                     COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
-                                     OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                                      COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                      OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
                                  )
                                 THEN COALESCE(NULLIF(BTRIM(mf.nota), ''), ('Ajuste en fondo: ' || COALESCE(f.nombre, 'N/A')))
+                            WHEN COALESCE(mf.nota, '') ILIKE 'Ingreso alquiler%'
+                                THEN COALESCE(NULLIF(BTRIM(mf.nota), ''), ('Ingreso por alquiler - Fondo: ' || COALESCE(f.nombre, 'N/A')))
                             ELSE ('Ingreso distribuido en fondo: ' || COALESCE(f.nombre, 'N/A'))
                         END AS concepto,
                         'INGRESO'::text AS tipo,
@@ -644,7 +646,11 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_destino_id,
                         f.nombre::text AS fondo_nombre,
                         p.id::int AS pago_id,
-                        COALESCE(pr.identificador, pr_aj.identificador)::text AS inmueble
+                        COALESCE(
+                            pr.identificador,
+                            pr_aj.identificador,
+                            NULLIF(BTRIM(COALESCE((regexp_match(COALESCE(mf.nota, ''), '(?i)Inmueble:\\s*([^|]+)'))[1], '')), '')
+                        )::text AS inmueble
                     FROM movimientos_fondos mf
                     JOIN fondos f ON f.id = mf.fondo_id
                     LEFT JOIN pagos p ON p.id = COALESCE(
@@ -663,6 +669,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                 COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%'
                                 OR COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
                                 OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                                OR COALESCE(mf.nota, '') ILIKE 'Ingreso alquiler%'
                             )
                         )
                       )
@@ -1209,4 +1216,3 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 };
 
 module.exports = { registerBancosRoutes };
-

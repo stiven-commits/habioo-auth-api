@@ -68,6 +68,7 @@ interface IReservacionRow {
     fecha_reserva: string;
     estado: string;
     monto_total_usd: string | number;
+    monto_pagado_usd?: string | number | null;
     deposito_usd?: string | number;
     monto_bs_pagado?: string | number | null;
     tasa_cambio?: string | number | null;
@@ -108,6 +109,8 @@ const parseNumeric = (value: unknown): number => {
     const n = parseFloat(normalized);
     return Number.isFinite(n) ? n : NaN;
 };
+
+const round2 = (value: number): number => Number.parseFloat(value.toFixed(2));
 
 const toIsoDate = (value: unknown): string => {
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
@@ -156,6 +159,27 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             [userId]
         );
         return r.rows[0] ?? null;
+    };
+
+    const resolveMovimientoFondoTipo = async (preferred: string[], fallback: string): Promise<string> => {
+        try {
+            const checkRes = await pool.query<{ consrc: string }>(
+                `
+                SELECT pg_get_constraintdef(oid) AS consrc
+                FROM pg_constraint
+                WHERE conname = 'movimientos_fondos_tipo_check'
+                LIMIT 1
+                `
+            );
+            const def = String(checkRes.rows[0]?.consrc || '');
+            const allowed = new Set(Array.from(def.matchAll(/'([^']+)'/g)).map((m) => m[1].toUpperCase()));
+            for (const t of preferred) {
+                if (allowed.has(t.toUpperCase())) return t;
+            }
+        } catch {
+            // noop
+        }
+        return fallback;
     };
 
     app.get('/alquileres', verifyToken, async (req: Request, res: Response) => {
@@ -365,7 +389,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
                 ? ', cb.nombre_banco AS banco_destino_nombre'
                 : '';
             const extraSql = selectExtra.length > 0 ? `,\n                    ${selectExtra.join(',\n                    ')}` : '';
-            const joinBancoSql = withBancoJoin ? '\n                LEFT JOIN bancos cb ON cb.id = r.banco_destino_id' : '';
+            const joinBancoSql = withBancoJoin ? '\n                LEFT JOIN cuentas_bancarias cb ON cb.id = r.banco_destino_id' : '';
 
             const reservacionesRes = await pool.query<IReservacionRow>(
                 `
@@ -376,6 +400,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
                     r.fecha_reserva,
                     r.estado,
                     r.monto_total_usd,
+                    COALESCE((to_jsonb(r)->>'monto_pagado_usd')::numeric, 0) AS monto_pagado_usd,
                     a.deposito_usd,
                     a.nombre AS amenidad_nombre,
                     p.identificador AS propiedad_identificador
@@ -429,7 +454,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             );
             if (bancosIdsPendientes.length > 0) {
                 const bancosLookup = await pool.query<{ id: number; nombre_banco: string | null }>(
-                    `SELECT id, nombre_banco FROM bancos WHERE id = ANY($1::int[])`,
+                    `SELECT id, nombre_banco FROM cuentas_bancarias WHERE id = ANY($1::int[])`,
                     [bancosIdsPendientes]
                 );
                 const byId = new Map<number, string | null>(bancosLookup.rows.map((b) => [b.id, b.nombre_banco]));
@@ -495,6 +520,191 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
         }
     });
 
+    app.put('/alquileres/reservaciones/:id/aprobar-pago', verifyToken, async (req: Request, res: Response) => {
+        try {
+            const user = asAuthUser(req.user);
+            const condominioId = await getAdminCondominioId(user.id);
+            if (!condominioId) {
+                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden aprobar pagos de reservaciones.' });
+            }
+
+            const reservacionId = parseInt(String((req.params as Record<string, string | undefined>)?.id || ''), 10);
+            if (!Number.isFinite(reservacionId) || reservacionId <= 0) {
+                return res.status(400).json({ status: 'error', message: 'ID de reservación inválido.' });
+            }
+
+            await pool.query('BEGIN');
+            const reservacionRes = await pool.query<{
+                id: number;
+                estado: string;
+                amenidad_nombre: string;
+                propiedad_identificador: string;
+                monto_total_usd: string | number;
+                monto_pagado_usd: string | number;
+                monto_bs_pagado: string | number;
+                tasa_cambio: string | number;
+                banco_destino_id: string | number | null;
+                referencia: string | null;
+                comprobante_url: string | null;
+                historial_captures: string | null;
+            }>(
+                `
+                SELECT
+                    r.id,
+                    r.estado,
+                    a.nombre AS amenidad_nombre,
+                    p.identificador AS propiedad_identificador,
+                    COALESCE(r.monto_total_usd, 0) AS monto_total_usd,
+                    COALESCE((to_jsonb(r)->>'monto_pagado_usd')::numeric, 0) AS monto_pagado_usd,
+                    COALESCE((to_jsonb(r)->>'monto_bs_pagado')::numeric, 0) AS monto_bs_pagado,
+                    COALESCE((to_jsonb(r)->>'tasa_cambio')::numeric, 0) AS tasa_cambio,
+                    NULLIF(BTRIM(COALESCE((to_jsonb(r)->>'banco_destino_id'), '')), '') AS banco_destino_id,
+                    NULLIF(BTRIM(COALESCE((to_jsonb(r)->>'referencia'), '')), '') AS referencia,
+                    NULLIF(BTRIM(COALESCE((to_jsonb(r)->>'comprobante_url'), '')), '') AS comprobante_url,
+                    NULLIF(BTRIM(COALESCE((to_jsonb(r)->>'historial_captures'), '')), '') AS historial_captures
+                FROM reservaciones r
+                INNER JOIN amenidades a ON a.id = r.amenidad_id
+                INNER JOIN propiedades p ON p.id = r.propiedad_id
+                WHERE r.id = $1
+                  AND a.condominio_id = $2
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [reservacionId, condominioId]
+            );
+            if (reservacionRes.rows.length === 0) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Reservación no encontrada.' });
+            }
+
+            const row = reservacionRes.rows[0];
+            const montoTotalUsd = parseFloat(String(row.monto_total_usd ?? 0)) || 0;
+            const montoPagadoUsd = parseFloat(String(row.monto_pagado_usd ?? 0)) || 0;
+            const montoBsPagado = parseFloat(String(row.monto_bs_pagado ?? 0)) || 0;
+            const tasaCambio = parseFloat(String(row.tasa_cambio ?? 0)) || 0;
+            const bancoDestinoId = parseInt(String(row.banco_destino_id ?? ''), 10);
+            const referenciaPago = String(row.referencia || '').trim();
+            const comprobanteActual = String(row.comprobante_url || '').trim();
+            if (montoBsPagado <= 0 || tasaCambio <= 0 || !comprobanteActual || !Number.isFinite(bancoDestinoId) || bancoDestinoId <= 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'La reservación no tiene un pago temporal válido (monto_bs_pagado, tasa_cambio y comprobante_url).',
+                });
+            }
+
+            const abonoUsd = montoBsPagado / tasaCambio;
+            const nuevoPagado = montoPagadoUsd + abonoUsd;
+            const nuevoEstado = nuevoPagado + 0.000001 >= montoTotalUsd ? 'CONFIRMADA' : 'PAGO_PARCIAL';
+
+            const historialActual = String(row.historial_captures || '').trim();
+            const historialCargas = [historialActual, comprobanteActual].filter(Boolean).join('\n');
+
+            const fondoRes = await pool.query<{ id: number }>(
+                `
+                SELECT id
+                FROM fondos
+                WHERE cuenta_bancaria_id = $1
+                  AND COALESCE(activo, true) = true
+                ORDER BY CASE WHEN COALESCE(es_operativo, false) THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [bancoDestinoId]
+            );
+            if (fondoRes.rows.length === 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'La cuenta bancaria destino no tiene fondos activos configurados.',
+                });
+            }
+
+            const fondoDestinoId = fondoRes.rows[0].id;
+            const abonoUsdRounded = round2(abonoUsd);
+            const montoBsRounded = round2(montoBsPagado);
+            const tipoIngreso = await resolveMovimientoFondoTipo(['INGRESO', 'ABONO', 'ENTRADA', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
+            const notaMovimiento = `Ingreso alquiler (${referenciaPago || `ALQ-${reservacionId}`}) | Inmueble: ${row.propiedad_identificador || 'N/A'} | Espacio: ${row.amenidad_nombre || 'N/A'} | Bs ${montoBsRounded.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | USD ${abonoUsdRounded.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+            await pool.query(
+                `UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2`,
+                [abonoUsdRounded, fondoDestinoId]
+            );
+            await pool.query(
+                `
+                INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota)
+                VALUES ($1, $2, $3, $4, $5)
+                `,
+                [fondoDestinoId, tipoIngreso, abonoUsdRounded, tasaCambio, notaMovimiento]
+            );
+
+            const colsRes = await pool.query<IColumnInfoRow>(
+                `
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'reservaciones'
+                `
+            );
+            const cols = new Set(colsRes.rows.map((r) => r.column_name));
+
+            const updates: string[] = ['estado = $1'];
+            const params: unknown[] = [nuevoEstado];
+            let idx = 2;
+
+            if (cols.has('monto_pagado_usd')) {
+                updates.push(`monto_pagado_usd = $${idx}`);
+                params.push(nuevoPagado);
+                idx += 1;
+            }
+            if (cols.has('historial_captures')) {
+                updates.push(`historial_captures = $${idx}`);
+                params.push(historialCargas || null);
+                idx += 1;
+            }
+            if (cols.has('monto_bs_pagado')) {
+                updates.push(`monto_bs_pagado = NULL`);
+            }
+            if (cols.has('tasa_cambio')) {
+                updates.push(`tasa_cambio = NULL`);
+            }
+            if (cols.has('comprobante_url')) {
+                updates.push(`comprobante_url = NULL`);
+            }
+            if (cols.has('referencia')) {
+                updates.push(`referencia = NULL`);
+            }
+
+            params.push(reservacionId);
+            const idIdx = idx;
+
+            const updateRes = await pool.query<{ id: number; estado: string }>(
+                `
+                UPDATE reservaciones
+                SET ${updates.join(', ')}
+                WHERE id = $${idIdx}
+                RETURNING id, estado
+                `,
+                params
+            );
+
+            await pool.query('COMMIT');
+            return res.json({
+                status: 'success',
+                message: 'Pago de reservación aprobado correctamente.',
+                data: {
+                    id: updateRes.rows[0]?.id ?? reservacionId,
+                    estado: updateRes.rows[0]?.estado ?? nuevoEstado,
+                    abono_usd: Number(abonoUsd.toFixed(2)),
+                    monto_pagado_usd: Number(nuevoPagado.toFixed(2)),
+                },
+            });
+        } catch (err: unknown) {
+            try { await pool.query('ROLLBACK'); } catch { /* noop */ }
+            return res.status(500).json({ status: 'error', message: asError(err).message });
+        }
+    });
+
     app.get('/alquileres/mis-reservas', verifyToken, async (req: Request, res: Response) => {
         try {
             const user = asAuthUser(req.user);
@@ -513,6 +723,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
                     r.fecha_reserva,
                     r.estado,
                     r.monto_total_usd,
+                    COALESCE((to_jsonb(r)->>'monto_pagado_usd')::numeric, 0) AS monto_pagado_usd,
                     a.deposito_usd,
                     a.nombre AS amenidad_nombre,
                     p.identificador AS propiedad_identificador,
@@ -526,7 +737,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
                 FROM reservaciones r
                 INNER JOIN amenidades a ON a.id = r.amenidad_id
                 INNER JOIN propiedades p ON p.id = r.propiedad_id
-                LEFT JOIN bancos cb
+                LEFT JOIN cuentas_bancarias cb
                   ON cb.id = CASE
                     WHEN (to_jsonb(r)->>'banco_destino_id') ~ '^[0-9]+$'
                     THEN (to_jsonb(r)->>'banco_destino_id')::int
@@ -603,8 +814,9 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             if (!reserva) {
                 return res.status(404).json({ status: 'error', message: 'Reservación no encontrada para este propietario.' });
             }
-            if (String(reserva.estado).trim() !== 'Aprobada') {
-                return res.status(400).json({ status: 'error', message: 'Solo se puede reportar pago de reservaciones en estado Aprobada.' });
+            const estadoReserva = String(reserva.estado || '').trim().toUpperCase();
+            if (estadoReserva !== 'APROBADA' && estadoReserva !== 'PAGO_PARCIAL') {
+                return res.status(400).json({ status: 'error', message: 'Solo se puede reportar pago en reservaciones APROBADA o PAGO_PARCIAL.' });
             }
 
             const montoBs = parseNumeric((req.body as Record<string, unknown>)?.monto_bs_pagado);
@@ -792,6 +1004,25 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             const costo = Number(amenidad.costo_usd || 0);
             const deposito = Number(amenidad.deposito_usd || 0);
             const montoTotal = (Number.isFinite(costo) ? costo : 0) + (Number.isFinite(deposito) ? deposito : 0);
+
+            const reservaActivaRes = await pool.query<{ id: number; estado: string; fecha_reserva: string }>(
+                `
+                SELECT id, estado, fecha_reserva
+                FROM reservaciones
+                WHERE propiedad_id = $1
+                  AND UPPER(BTRIM(COALESCE(estado, ''))) IN ('PENDIENTE', 'APROBADA', 'PAGO_REPORTADO', 'PAGO_PARCIAL')
+                ORDER BY id DESC
+                LIMIT 1
+                `,
+                [ownerData.propiedad_id]
+            );
+            if (reservaActivaRes.rows.length > 0) {
+                const activa = reservaActivaRes.rows[0];
+                return res.status(409).json({
+                    status: 'error',
+                    message: `Ya existe una solicitud de alquiler activa para este inmueble (ID ${activa.id}, estado ${activa.estado}).`,
+                });
+            }
 
             const reservaRes = await pool.query<IReservacionInsertRow>(
                 `
