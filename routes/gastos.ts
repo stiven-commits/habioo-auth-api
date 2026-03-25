@@ -215,6 +215,7 @@ const asError = (value: unknown): Error => {
 const toNumber = (value: string | number | null | undefined): number => parseFloat(String(value ?? 0)) || 0;
 const getCurrentYyyyMm = (): string => new Date().toISOString().slice(0, 7);
 const asYyyyMmOrCurrent = (value: unknown): string => (/^\d{4}-\d{2}$/.test(String(value || '').trim()) ? String(value).trim() : getCurrentYyyyMm());
+const isImageMime = (mime: unknown): boolean => String(mime || '').toLowerCase().startsWith('image/');
 
 const fetchBcvRateToday = async (): Promise<number> => {
     const response = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
@@ -268,12 +269,18 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             if (files) {
                 if (files.factura_img && files.factura_img.length > 0) {
                     const file = files.factura_img[0];
+                    if (!isImageMime(file.mimetype)) {
+                        return res.status(400).json({ status: 'error', message: 'La factura principal debe ser una imagen valida.' });
+                    }
                     const uniqueName = `factura_${Date.now()}_${Math.round(Math.random() * 1e9)}.webp`;
                     await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
                     facturaGuardada = `/uploads/gastos/${uniqueName}`;
                 }
                 if (files.soportes && files.soportes.length > 0) {
                     for (const file of files.soportes) {
+                        if (!isImageMime(file.mimetype)) {
+                            return res.status(400).json({ status: 'error', message: 'Todos los soportes deben ser imagenes validas.' });
+                        }
                         const uniqueName = `soporte_${Date.now()}_${Math.round(Math.random() * 1e9)}.webp`;
                         await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
                         soportesGuardados.push(`/uploads/gastos/${uniqueName}`);

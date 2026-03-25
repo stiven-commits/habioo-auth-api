@@ -526,7 +526,12 @@ router.get('/estado-cuenta/:condominio_id', verifyToken, async (req: Request, re
           SELECT
             mf.id,
             mf.fecha,
-            mf.tipo,
+            CASE
+              WHEN UPPER(COALESCE(mf.tipo, '')) IN ('EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO', 'PAGO_PROVEEDOR', 'EGRESO_PAGO')
+                OR COALESCE(mf.nota, '') ILIKE 'Egreso manual libro mayor%'
+                THEN 'EGRESO'
+              ELSE 'INGRESO'
+            END AS tipo,
             COALESCE(mf.monto, 0) AS monto,
             mf.tasa_cambio,
             mf.nota,

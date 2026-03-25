@@ -116,6 +116,16 @@ interface TransferenciaBody {
     nota: string | null;
 }
 
+interface ManualEgresoBody {
+    cuenta_id: unknown;
+    fondo_id: unknown;
+    monto_origen: unknown;
+    tasa_cambio?: unknown;
+    referencia: string | null;
+    concepto: string | null;
+    fecha: string | Date;
+}
+
 interface IFondoTransferRow {
     id: number;
     cuenta_bancaria_id: number;
@@ -221,6 +231,37 @@ const toIsoDate = (value: unknown, fieldName: string): string => {
 };
 
 const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
+    const getMovimientoFondoTiposPermitidos = async (): Promise<string[]> => {
+        try {
+            const r = await pool.query<{ def: string }>(
+                `
+                SELECT pg_get_constraintdef(oid) AS def
+                FROM pg_constraint c
+                INNER JOIN pg_class t ON t.oid = c.conrelid
+                WHERE c.contype = 'c'
+                  AND t.relname = 'movimientos_fondos'
+                `
+            );
+            const defs = r.rows.map((row) => String(row.def || ''));
+            const tipoDef = defs.find((def) => /tipo/i.test(def)) || defs[0] || '';
+            const matches = Array.from(tipoDef.matchAll(/'([^']+)'/g)).map((m) => String(m[1] || '').trim()).filter(Boolean);
+            if (matches.length > 0) return Array.from(new Set(matches));
+        } catch {
+            // noop, fallback below
+        }
+        return [];
+    };
+
+    const resolveMovimientoFondoTipo = async (preferred: string[], fallback: string): Promise<string> => {
+        const allowed = await getMovimientoFondoTiposPermitidos();
+        for (const t of preferred) {
+            const selected = allowed.find((m) => m.toUpperCase() === t.toUpperCase());
+            if (selected) return selected;
+        }
+        if (allowed.length > 0) return allowed[0] || fallback;
+        return fallback;
+    };
+
     app.get('/bancos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
@@ -819,6 +860,39 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                           AND gpf2.fecha_pago = pp.fecha_pago
                       )
                 ),
+                egresos_manuales_fondos AS (
+                    SELECT
+                        ('EGR-MF-' || mf.id::text) AS id,
+                        mf.fecha::date AS fecha,
+                        NULLIF(BTRIM(COALESCE((regexp_match(COALESCE(mf.nota, ''), '(?i)Ref:\\s*([^|]+)'))[1], '')), '') AS referencia,
+                        COALESCE(NULLIF(BTRIM(COALESCE((regexp_match(COALESCE(mf.nota, ''), '(?i)Concepto:\\s*([^|]+)'))[1], '')), ''), COALESCE(mf.nota, 'Egreso manual')) AS concepto,
+                        'EGRESO'::text AS tipo,
+                        CASE
+                            WHEN UPPER(COALESCE(f.moneda, '')) = 'BS' THEN mf.monto
+                            WHEN UPPER(COALESCE(f.moneda, '')) = 'USD' AND COALESCE(mf.tasa_cambio, 0) > 0 THEN (mf.monto * mf.tasa_cambio)
+                            ELSE NULL
+                        END AS monto_bs,
+                        mf.tasa_cambio AS tasa_cambio,
+                        CASE
+                            WHEN UPPER(COALESCE(f.moneda, '')) = 'USD' THEN mf.monto
+                            WHEN UPPER(COALESCE(f.moneda, '')) = 'BS' AND COALESCE(mf.tasa_cambio, 0) > 0 THEN (mf.monto / mf.tasa_cambio)
+                            ELSE NULL
+                        END AS monto_usd,
+                        NULL::numeric AS monto_origen_pago,
+                        NULL::text AS banco_origen,
+                        NULL::text AS cedula_origen,
+                        mf.fondo_id::int AS fondo_id,
+                        NULL::int AS fondo_origen_id,
+                        NULL::int AS fondo_destino_id,
+                        f.nombre::text AS fondo_nombre,
+                        NULL::int AS pago_id,
+                        NULL::text AS inmueble
+                    FROM movimientos_fondos mf
+                    JOIN fondos f ON f.id = mf.fondo_id
+                    WHERE f.cuenta_bancaria_id = $1
+                      AND UPPER(COALESCE(mf.tipo, '')) IN ('EGRESO', 'EGRESO_GASTO', 'SALIDA', 'DEBITO', 'DESCUENTO')
+                      AND COALESCE(mf.nota, '') ILIKE 'Egreso manual libro mayor%'
+                ),
                 transferencias_cuentas AS (
                     SELECT
                         ('TRF-' || t.id::text || '-' ||
@@ -908,6 +982,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 UNION ALL
                 SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
                 FROM egresos_pp
+                UNION ALL
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
+                FROM egresos_manuales_fondos
                 UNION ALL
                 SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
                 FROM transferencias_cuentas
@@ -1059,6 +1136,182 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 
             await pool.query('COMMIT');
             return res.json({ status: 'success', message: 'Ajuste revertido correctamente.' });
+        } catch (err: unknown) {
+            await pool.query('ROLLBACK');
+            return res.status(500).json({ status: 'error', message: asError(err).message });
+        }
+    });
+
+    app.post('/egresos-manuales', verifyToken, async (req: Request<{}, unknown, ManualEgresoBody>, res: Response) => {
+        const { cuenta_id, fondo_id, monto_origen, tasa_cambio, referencia, concepto, fecha } = req.body;
+        try {
+            const user = asAuthUser(req.user);
+            const cuentaId = asPositiveInt(cuenta_id, 'cuenta_id');
+            const fondoId = asPositiveInt(fondo_id, 'fondo_id');
+            const montoOrigen = asDecimal(monto_origen, 'monto_origen');
+            const tasaCambio = (tasa_cambio === null || tasa_cambio === undefined || String(tasa_cambio).trim() === '')
+                ? null
+                : asDecimal(tasa_cambio, 'tasa_cambio');
+            const referenciaSafe = String(referencia || '').trim();
+            const conceptoSafe = String(concepto || '').trim();
+            const fechaSafe = toIsoDate(fecha, 'fecha');
+
+            if (!referenciaSafe) return res.status(400).json({ status: 'error', message: 'La referencia es requerida.' });
+            if (!conceptoSafe) return res.status(400).json({ status: 'error', message: 'El concepto es requerido.' });
+            if (!Number.isFinite(montoOrigen) || montoOrigen <= 0) {
+                return res.status(400).json({ status: 'error', message: 'El monto debe ser mayor a 0.' });
+            }
+
+            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            if (!condoRes.rows.length) {
+                return res.status(403).json({ status: 'error', message: 'No autorizado para registrar egresos.' });
+            }
+            const condominioId = condoRes.rows[0].id;
+
+            await pool.query('BEGIN');
+
+            const cuentaRes = await pool.query<{ id: number; nombre_banco: string | null; apodo: string | null; tipo: string | null }>(
+                `
+                SELECT id, nombre_banco, apodo, tipo
+                FROM cuentas_bancarias
+                WHERE id = $1
+                  AND condominio_id = $2
+                LIMIT 1
+                `,
+                [cuentaId, condominioId]
+            );
+            if (!cuentaRes.rows.length) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Cuenta bancaria no encontrada.' });
+            }
+
+            const fondoRes = await pool.query<{ id: number; moneda: string | null; saldo_actual: string | number; nombre: string | null }>(
+                `
+                SELECT id, moneda, saldo_actual, nombre
+                FROM fondos
+                WHERE id = $1
+                  AND cuenta_bancaria_id = $2
+                  AND condominio_id = $3
+                  AND COALESCE(activo, true) = true
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [fondoId, cuentaId, condominioId]
+            );
+            if (!fondoRes.rows.length) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Fondo no encontrado para la cuenta seleccionada.' });
+            }
+
+            const cuenta = cuentaRes.rows[0];
+            const fondo = fondoRes.rows[0];
+            const cuentaText = `${String(cuenta.tipo || '')} ${String(cuenta.apodo || '')} ${String(cuenta.nombre_banco || '')}`.toUpperCase();
+            const cuentaMoneda = /USD|ZELLE|DIVISA|DOLAR/.test(cuentaText) ? 'USD' : 'BS';
+            const fondoMoneda = String(fondo.moneda || '').toUpperCase() === 'USD' ? 'USD' : 'BS';
+
+            let montoBs = 0;
+            let montoUsd = 0;
+
+            if (cuentaMoneda === 'BS') {
+                if (!tasaCambio || tasaCambio <= 0) {
+                    await pool.query('ROLLBACK');
+                    return res.status(400).json({ status: 'error', message: 'La tasa BCV es requerida para cuentas en Bs.' });
+                }
+                montoBs = montoOrigen;
+                montoUsd = montoBs / tasaCambio;
+            } else {
+                montoUsd = montoOrigen;
+                montoBs = tasaCambio && tasaCambio > 0 ? (montoUsd * tasaCambio) : 0;
+            }
+
+            const montoFondo = fondoMoneda === 'USD' ? montoUsd : montoBs;
+            const saldoFondo = parseFloat(String(fondo.saldo_actual ?? 0)) || 0;
+            if (montoFondo <= 0 || saldoFondo + 0.0001 < montoFondo) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'Saldo insuficiente en el fondo seleccionado.' });
+            }
+
+            await pool.query(
+                `UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2`,
+                [montoFondo, fondoId]
+            );
+
+            const preferredTiposEgreso = ['EGRESO_GASTO', 'EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO', 'PAGO_PROVEEDOR', 'EGRESO_PAGO'];
+            const tipoEgreso = await resolveMovimientoFondoTipo(preferredTiposEgreso, 'EGRESO_GASTO');
+            const nota = `Egreso manual libro mayor | Concepto: ${conceptoSafe} | Ref: ${referenciaSafe} | Bs ${montoBs.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | USD ${montoUsd.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+            const mfColsRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'movimientos_fondos'
+                  AND column_name IN ('fecha', 'referencia_id', 'tasa_cambio')
+                `
+            );
+            const mfCols = new Set(mfColsRes.rows.map((r) => r.column_name));
+            const insertCols = ['fondo_id', 'tipo', 'monto', 'nota'];
+            const insertVals: unknown[] = [fondoId, tipoEgreso, montoFondo, nota];
+            if (mfCols.has('tasa_cambio')) {
+                insertCols.push('tasa_cambio');
+                insertVals.push(tasaCambio);
+            }
+            if (mfCols.has('referencia_id')) {
+                insertCols.push('referencia_id');
+                insertVals.push(null);
+            }
+            if (mfCols.has('fecha')) {
+                insertCols.push('fecha');
+                insertVals.push(fechaSafe);
+            }
+            const placeholders = insertVals.map((_, idx) => `$${idx + 1}`).join(', ');
+            const allowedTipos = await getMovimientoFondoTiposPermitidos();
+            const tiposCandidatos = Array.from(
+                new Set([
+                    tipoEgreso,
+                    ...preferredTiposEgreso,
+                    ...allowedTipos,
+                ].map((t) => String(t || '').trim()).filter(Boolean))
+            );
+            let inserted = false;
+            let lastInsertErr: unknown = null;
+            for (const tipo of tiposCandidatos) {
+                try {
+                    const vals = [...insertVals];
+                    vals[1] = tipo;
+                    await pool.query(
+                        `INSERT INTO movimientos_fondos (${insertCols.join(', ')}) VALUES (${placeholders})`,
+                        vals
+                    );
+                    inserted = true;
+                    break;
+                } catch (insertErr: unknown) {
+                    const errObj = insertErr as { code?: string; constraint?: string };
+                    const isTipoCheck = errObj?.code === '23514' && (
+                        String(errObj?.constraint || '').includes('movimientos_fondos_tipo_check') ||
+                        String((errObj as { message?: string })?.message || '').includes('movimientos_fondos_tipo_check')
+                    );
+                    if (!isTipoCheck) throw insertErr;
+                    lastInsertErr = insertErr;
+                }
+            }
+            if (!inserted) {
+                throw asError(lastInsertErr || new Error('No se pudo determinar un tipo valido para movimientos_fondos.'));
+            }
+
+            await pool.query('COMMIT');
+            return res.json({
+                status: 'success',
+                message: 'Egreso registrado correctamente.',
+                data: {
+                    cuenta_id: cuentaId,
+                    fondo_id: fondoId,
+                    referencia: referenciaSafe,
+                    concepto: conceptoSafe,
+                    monto_bs: Number(montoBs.toFixed(2)),
+                    monto_usd: Number(montoUsd.toFixed(2)),
+                },
+            });
         } catch (err: unknown) {
             await pool.query('ROLLBACK');
             return res.status(500).json({ status: 'error', message: asError(err).message });
