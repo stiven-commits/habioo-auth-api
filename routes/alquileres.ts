@@ -3,6 +3,7 @@ import type { Pool } from 'pg';
 const fs: typeof import('fs') = require('fs');
 const path: typeof import('path') = require('path');
 const multer: typeof import('multer') = require('multer');
+const sharp: typeof import('sharp') = require('sharp');
 
 interface AuthUser {
     id: number;
@@ -852,11 +853,22 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             let comprobanteUrl: string | null = comprobanteFromBody || null;
 
             if (uploadedFile) {
-                const ext = path.extname(uploadedFile.originalname || '').toLowerCase();
-                const safeExt = ext || '.bin';
-                const filename = `reserva_${reservacionId}_${Date.now()}${safeExt}`;
-                fs.writeFileSync(path.join(alquileresUploadsDir, filename), uploadedFile.buffer);
-                comprobanteUrl = `/uploads/alquileres/${filename}`;
+                const mime = String(uploadedFile.mimetype || '').toLowerCase();
+                if (mime.startsWith('image/')) {
+                    const filename = `reserva_${reservacionId}_${Date.now()}.webp`;
+                    await sharp(uploadedFile.buffer)
+                        .rotate()
+                        .resize({ width: 1600, withoutEnlargement: true })
+                        .webp({ quality: 82 })
+                        .toFile(path.join(alquileresUploadsDir, filename));
+                    comprobanteUrl = `/uploads/alquileres/${filename}`;
+                } else {
+                    const ext = path.extname(uploadedFile.originalname || '').toLowerCase();
+                    const safeExt = ext || '.bin';
+                    const filename = `reserva_${reservacionId}_${Date.now()}${safeExt}`;
+                    fs.writeFileSync(path.join(alquileresUploadsDir, filename), uploadedFile.buffer);
+                    comprobanteUrl = `/uploads/alquileres/${filename}`;
+                }
             }
 
             if (!comprobanteUrl) {
