@@ -532,6 +532,11 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                 [condoId],
             );
             await pool.query(
+                `DELETE FROM reservaciones
+                 WHERE propiedad_id IN (SELECT id FROM propiedades WHERE condominio_id = $1)`,
+                [condoId],
+            );
+            await pool.query(
                 `DELETE FROM usuarios_propiedades
                  WHERE propiedad_id IN (SELECT id FROM propiedades WHERE condominio_id = $1)`,
                 [condoId],

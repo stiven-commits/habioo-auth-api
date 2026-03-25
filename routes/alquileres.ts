@@ -764,18 +764,12 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
                 return res.status(400).json({ status: 'error', message: 'amenidad_id inválido.' });
             }
 
-            const solvenciaRes = await pool.query<ISolvenciaRow>(
-                `
-                SELECT COUNT(*)::text AS total
-                FROM recibos
-                WHERE propiedad_id = $1
-                  AND COALESCE(estado, '') NOT IN ('Pagado', 'Anulado')
-                  AND (COALESCE(monto_usd, 0) - COALESCE(monto_pagado_usd, 0)) > 0
-                `,
+            const solvenciaRes = await pool.query<{ saldo_actual: string | number }>(
+                `SELECT COALESCE(saldo_actual, 0) AS saldo_actual FROM propiedades WHERE id = $1`,
                 [ownerData.propiedad_id]
             );
-            const totalDeudas = parseInt(solvenciaRes.rows[0]?.total || '0', 10) || 0;
-            if (totalDeudas > 0) {
+            const saldoActual = parseFloat(String(solvenciaRes.rows[0]?.saldo_actual ?? 0)) || 0;
+            if (saldoActual > 0) {
                 return res.status(403).json({ status: 'error', message: 'Debes estar al día con tus pagos para reservar espacios.' });
             }
 

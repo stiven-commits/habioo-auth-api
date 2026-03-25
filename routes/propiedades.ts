@@ -178,6 +178,7 @@ interface AjustarSaldoBody {
     cuenta_bancaria_id?: number | null;
     es_gasto_extra?: boolean;
     gasto_extra_id?: number | null;
+    subtipo_favor?: 'directo' | 'distribuido';
 }
 
 interface CopropietarioBody {
@@ -1385,7 +1386,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
     // 7. AJUSTAR SALDO MANUALMENTE
     app.post('/propiedades-admin/:id/ajustar-saldo', verifyToken, async (req: Request<PropiedadEstadoCuentaParams, unknown, AjustarSaldoBody>, res: Response, _next: NextFunction) => {
         const propiedadId = asString(req.params.id);
-        const { monto, tipo_ajuste, nota, monto_bs, tasa_cambio, cuenta_bancaria_id, es_gasto_extra, gasto_extra_id } = req.body;
+        const { monto, tipo_ajuste, nota, monto_bs, tasa_cambio, cuenta_bancaria_id, es_gasto_extra, gasto_extra_id, subtipo_favor } = req.body;
         const montoNum = parseFloat((monto || '0').toString().replace(',', '.')) || 0;
         if (montoNum <= 0) return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
 
@@ -1433,6 +1434,33 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 throw ultimoErrorHistorial;
             }
             
+            if (tipoAjusteCanonico === 'AGREGAR_FAVOR' && !es_gasto_extra) {
+                // FIFO: cerrar recibos pendientes con el monto del ajuste
+                const r2 = (n: number) => Math.round(n * 100) / 100;
+                const recibosPendientes = await pool.query<{ id: number; monto_usd: string; monto_pagado_usd: string }>(
+                    `SELECT id, monto_usd, COALESCE(monto_pagado_usd, 0) AS monto_pagado_usd
+                     FROM recibos
+                     WHERE propiedad_id = $1
+                       AND COALESCE(estado, '') NOT IN ('Pagado', 'Anulado')
+                       AND (monto_usd - COALESCE(monto_pagado_usd, 0)) > 0
+                     ORDER BY fecha_emision ASC, id ASC`,
+                    [propiedadId]
+                );
+                let montoRestante = montoNum;
+                for (const recibo of recibosPendientes.rows) {
+                    if (montoRestante <= 0) break;
+                    const pendiente = r2(parseFloat(String(recibo.monto_usd)) - parseFloat(String(recibo.monto_pagado_usd)));
+                    const aplicar = Math.min(montoRestante, pendiente);
+                    const nuevoPagado = r2(parseFloat(String(recibo.monto_pagado_usd)) + aplicar);
+                    const nuevoEstado = nuevoPagado >= r2(parseFloat(String(recibo.monto_usd))) - 0.001 ? 'Pagado' : 'Abonado';
+                    await pool.query(
+                        'UPDATE recibos SET monto_pagado_usd = $1, estado = $2 WHERE id = $3',
+                        [nuevoPagado, nuevoEstado, recibo.id]
+                    );
+                    montoRestante = r2(montoRestante - aplicar);
+                }
+            }
+
             if (tipoAjusteCanonico === 'AGREGAR_FAVOR' && cuenta_bancaria_id && !es_gasto_extra) {
                 const resolveMovimientoFondoTipo = async (preferred: string[], fallback: string): Promise<string> => {
                     try {
@@ -1454,25 +1482,71 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     return fallback;
                 };
 
-                const fondosRes = await pool.query<{ id: number; moneda: string }>(
-                    'SELECT id, moneda FROM fondos WHERE cuenta_bancaria_id = $1 AND activo = true ORDER BY es_operativo DESC, id ASC',
-                    [cuenta_bancaria_id]
-                );
-                if (fondosRes.rows.length > 0) {
-                    const f = fondosRes.rows[0];
-                    let montoFondo = montoNum;
-                    if (f.moneda === 'Bs' || f.moneda === 'BS') {
-                        montoFondo = parseFloat(String(monto_bs || '0')) || montoNum * (parseFloat(String(tasa_cambio || '1')) || 1);
-                    }
-                    const notaMovimiento = historialId
-                        ? `${notaBase} | ajuste_historial_id:${historialId}`
-                        : notaBase;
-                    const tipoMovimiento = await resolveMovimientoFondoTipo(['AJUSTE_INICIAL', 'INGRESO', 'ABONO', 'ENTRADA'], 'AJUSTE_INICIAL');
-                    await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, f.id]);
-                    await pool.query(
-                        'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5)', 
-                        [f.id, tipoMovimiento, montoFondo, parseFloat(String(tasa_cambio || '1')) || 1, notaMovimiento]
+                const tasaNum = parseFloat(String(tasa_cambio || '1')) || 1;
+                const notaMovimiento = historialId
+                    ? `${notaBase} | ajuste_historial_id:${historialId}`
+                    : notaBase;
+                const tipoMovimiento = await resolveMovimientoFondoTipo(['AJUSTE_INICIAL', 'INGRESO', 'ABONO', 'ENTRADA'], 'AJUSTE_INICIAL');
+                const r2 = (n: number) => Math.round(n * 100) / 100;
+
+                if (subtipo_favor === 'distribuido') {
+                    // Distribuir por porcentaje entre todos los fondos de la cuenta
+                    const fondosRes = await pool.query<{ id: number; moneda: string; porcentaje_asignacion: string; es_operativo: boolean }>(
+                        'SELECT id, moneda, porcentaje_asignacion, es_operativo FROM fondos WHERE cuenta_bancaria_id = $1 AND activo = true ORDER BY es_operativo ASC, id ASC',
+                        [cuenta_bancaria_id]
                     );
+                    const fondos = fondosRes.rows;
+                    if (fondos.length > 0) {
+                        const noOperativos = fondos.filter((f) => !f.es_operativo);
+                        const fondoOperativo = fondos.find((f) => f.es_operativo) || null;
+                        let acumulado = 0;
+                        const dist: Array<{ id: number; moneda: string; monto: number }> = [];
+                        for (const f of noOperativos) {
+                            const pct = parseFloat(String(f.porcentaje_asignacion || 0));
+                            const parte = r2((montoNum * pct) / 100);
+                            acumulado = r2(acumulado + parte);
+                            dist.push({ id: f.id, moneda: f.moneda, monto: parte });
+                        }
+                        const remanente = r2(montoNum - acumulado);
+                        if (fondoOperativo) {
+                            dist.push({ id: fondoOperativo.id, moneda: fondoOperativo.moneda, monto: remanente });
+                        } else if (dist.length > 0) {
+                            dist[dist.length - 1].monto = r2(dist[dist.length - 1].monto + remanente);
+                        }
+                        for (const d of dist) {
+                            if (d.monto <= 0) continue;
+                            let montoFondo = d.monto;
+                            const monedaFondo = String(d.moneda || '').toUpperCase();
+                            if (monedaFondo === 'BS' || monedaFondo === 'BS.') {
+                                montoFondo = parseFloat(String(monto_bs || '0')) > 0
+                                    ? r2((parseFloat(String(monto_bs)) / montoNum) * d.monto)
+                                    : r2(d.monto * tasaNum);
+                            }
+                            await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, d.id]);
+                            await pool.query(
+                                'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5)',
+                                [d.id, tipoMovimiento, montoFondo, tasaNum, notaMovimiento]
+                            );
+                        }
+                    }
+                } else {
+                    // Directo: 100% al fondo operativo principal
+                    const fondosRes = await pool.query<{ id: number; moneda: string }>(
+                        'SELECT id, moneda FROM fondos WHERE cuenta_bancaria_id = $1 AND activo = true ORDER BY es_operativo DESC, id ASC',
+                        [cuenta_bancaria_id]
+                    );
+                    if (fondosRes.rows.length > 0) {
+                        const f = fondosRes.rows[0];
+                        let montoFondo = montoNum;
+                        if (f.moneda === 'Bs' || f.moneda === 'BS') {
+                            montoFondo = parseFloat(String(monto_bs || '0')) || r2(montoNum * tasaNum);
+                        }
+                        await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, f.id]);
+                        await pool.query(
+                            'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5)',
+                            [f.id, tipoMovimiento, montoFondo, tasaNum, notaMovimiento]
+                        );
+                    }
                 }
             } else if (tipoAjusteCanonico === 'AGREGAR_FAVOR' && es_gasto_extra && gasto_extra_id) {
                 // Abono directo para rebajar la deuda del gasto extra
