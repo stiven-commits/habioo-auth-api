@@ -731,7 +731,14 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                 0
                             )::numeric,
                             2
-                        ) AS monto_distribuido_usd
+                        ) AS monto_distribuido_usd,
+                        ROUND(
+                            COALESCE(
+                                SUM(CASE WHEN UPPER(COALESCE(f.moneda, '')) = 'BS' THEN mf.monto ELSE 0 END),
+                                0
+                            )::numeric,
+                            2
+                        ) AS monto_distribuido_bs
                     FROM pagos p
                     LEFT JOIN movimientos_fondos mf ON p.id = COALESCE(
                         mf.referencia_id,
@@ -769,13 +776,18 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         'INGRESO'::text AS tipo,
                         CASE
                             WHEN UPPER(COALESCE(p.moneda, '')) = 'BS'
-                                THEN (GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2)) * COALESCE(NULLIF(p.tasa_cambio, 0), 1))
+                                THEN GREATEST(0, ROUND((COALESCE(p.monto_origen, 0) - COALESCE(idp.monto_distribuido_bs, 0))::numeric, 2))
                             WHEN UPPER(COALESCE(p.moneda, '')) = 'USD' AND p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0
                                 THEN (GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2)) * p.tasa_cambio)
                             ELSE NULL
                         END AS monto_bs,
                         p.tasa_cambio,
-                        GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2)) AS monto_usd,
+                        CASE
+                            WHEN UPPER(COALESCE(p.moneda, '')) = 'BS' AND COALESCE(NULLIF(p.tasa_cambio, 0), 0) > 0
+                                THEN GREATEST(0, ROUND((COALESCE(p.monto_origen, 0) - COALESCE(idp.monto_distribuido_bs, 0))::numeric, 2)) / p.tasa_cambio
+                            ELSE
+                                GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2))
+                        END AS monto_usd,
                         p.monto_origen AS monto_origen_pago,
                         ${pagoBancoOrigenExpr} AS banco_origen,
                         ${pagoCedulaOrigenExpr} AS cedula_origen,
@@ -790,7 +802,14 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     LEFT JOIN ingresos_distribuidos_por_pago idp ON idp.pago_id = p.id
                     WHERE p.cuenta_bancaria_id = $1
                       AND p.estado = 'Validado'
-                      AND GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2)) > 0
+                      AND (
+                          CASE
+                              WHEN UPPER(COALESCE(p.moneda, '')) = 'BS'
+                                  THEN GREATEST(0, ROUND((COALESCE(p.monto_origen, 0) - COALESCE(idp.monto_distribuido_bs, 0))::numeric, 2))
+                              ELSE
+                                  GREATEST(0, ROUND((p.monto_usd - COALESCE(idp.monto_distribuido_usd, 0))::numeric, 2))
+                          END
+                      ) > 0
                 ),
                 egresos_gpf AS (
                     SELECT
