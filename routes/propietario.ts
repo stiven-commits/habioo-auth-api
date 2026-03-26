@@ -411,8 +411,8 @@ router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Req
           NULL::numeric AS monto_bs,
           NULL::numeric AS tasa_cambio,
           r.estado AS estado_recibo,
-          r.fecha_emision AS fecha_operacion,
-          r.fecha_emision AS fecha_registro
+          (r.fecha_emision AT TIME ZONE 'UTC') AS fecha_operacion,
+          (r.fecha_emision AT TIME ZONE 'UTC') AS fecha_registro
         FROM recibos r
         WHERE r.propiedad_id = $1
       `,
@@ -430,8 +430,11 @@ router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Req
           COALESCE(p.monto_origen, 0) AS monto_bs,
           p.tasa_cambio,
           NULL::text AS estado_recibo,
-          p.fecha_pago AS fecha_operacion,
-          COALESCE(p.created_at, p.fecha_pago) AS fecha_registro
+          (p.fecha_pago::timestamp AT TIME ZONE 'America/Caracas') AS fecha_operacion,
+          COALESCE(
+            p.created_at AT TIME ZONE 'UTC',
+            p.fecha_pago::timestamp AT TIME ZONE 'America/Caracas'
+          ) AS fecha_registro
         FROM pagos p
         WHERE p.propiedad_id = $1
           AND p.estado = 'Validado'

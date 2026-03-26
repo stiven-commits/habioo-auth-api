@@ -778,8 +778,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     NULL::numeric as monto_bs,
                     NULL::numeric as tasa_cambio,
                     estado as estado_recibo,
-                    fecha_emision as fecha_operacion,
-                    fecha_emision as fecha_registro
+                    (fecha_emision AT TIME ZONE 'UTC') as fecha_operacion,
+                    (fecha_emision AT TIME ZONE 'UTC') as fecha_registro
                  FROM recibos
                  WHERE propiedad_id = $1`,
                 [propiedadId]
@@ -796,8 +796,11 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     COALESCE(monto_origen, 0) as monto_bs,
                     tasa_cambio,
                     NULL::text as estado_recibo,
-                    fecha_pago as fecha_operacion,
-                    COALESCE(created_at, fecha_pago) as fecha_registro
+                    (fecha_pago::timestamp AT TIME ZONE 'America/Caracas') as fecha_operacion,
+                    COALESCE(
+                      created_at AT TIME ZONE 'UTC',
+                      fecha_pago::timestamp AT TIME ZONE 'America/Caracas'
+                    ) as fecha_registro
                  FROM pagos
                  WHERE propiedad_id = $1 AND estado = 'Validado'`,
                 [propiedadId]
