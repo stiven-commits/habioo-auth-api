@@ -54,6 +54,7 @@ interface IMovimientoRow {
     fondo_nombre: string | null;
     pago_id?: number | null;
     inmueble?: string | null;
+    created_at?: string | Date | null;
 }
 
 interface IGastoPendienteRow {
@@ -691,7 +692,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                             pr.identificador,
                             pr_aj.identificador,
                             NULLIF(BTRIM(COALESCE((regexp_match(COALESCE(mf.nota, ''), '(?i)Inmueble:\\s*([^|]+)'))[1], '')), '')
-                        )::text AS inmueble
+                        )::text AS inmueble,
+                        COALESCE(p.created_at, mf.fecha) AS created_at
                     FROM movimientos_fondos mf
                     JOIN fondos f ON f.id = mf.fondo_id
                     LEFT JOIN pagos p ON p.id = COALESCE(
@@ -796,7 +798,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_destino_id,
                         NULL::text AS fondo_nombre,
                         p.id::int AS pago_id,
-                        pr.identificador::text AS inmueble
+                        pr.identificador::text AS inmueble,
+                        p.created_at AS created_at
                     FROM pagos p
                     LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
                     LEFT JOIN ingresos_distribuidos_por_pago idp ON idp.pago_id = p.id
@@ -829,7 +832,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_destino_id,
                         f.nombre::text AS fondo_nombre,
                         NULL::int AS pago_id,
-                        NULL::text AS inmueble
+                        NULL::text AS inmueble,
+                        NULL::timestamp AS created_at
                     FROM (
                         SELECT
                             gpf.*,
@@ -866,7 +870,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_destino_id,
                         f.nombre::text AS fondo_nombre,
                         NULL::int AS pago_id,
-                        NULL::text AS inmueble
+                        NULL::text AS inmueble,
+                        NULL::timestamp AS created_at
                     FROM pagos_proveedores pp
                     JOIN gastos g ON g.id = pp.gasto_id
                     LEFT JOIN proveedores prov ON prov.id = g.proveedor_id
@@ -905,7 +910,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_destino_id,
                         f.nombre::text AS fondo_nombre,
                         NULL::int AS pago_id,
-                        NULL::text AS inmueble
+                        NULL::text AS inmueble,
+                        mf.fecha AS created_at
                     FROM movimientos_fondos mf
                     JOIN fondos f ON f.id = mf.fondo_id
                     WHERE f.cuenta_bancaria_id = $1
@@ -978,7 +984,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                             ELSE NULL::text
                         END AS fondo_nombre,
                         NULL::int AS pago_id,
-                        NULL::text AS inmueble
+                        NULL::text AS inmueble,
+                        NULL::timestamp AS created_at
                     FROM transferencias t
                     JOIN fondos f_orig ON f_orig.id = t.fondo_origen_id
                     JOIN fondos f_dest ON f_dest.id = t.fondo_destino_id
@@ -990,22 +997,22 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         (f_orig.cuenta_bancaria_id = $1 AND f_dest.cuenta_bancaria_id <> $1)
                     )
                 )
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble, created_at
                 FROM ingresos_fondos
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble, created_at
                 FROM ingresos_transito
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble, created_at
                 FROM egresos_gpf
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble, created_at
                 FROM egresos_pp
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble, created_at
                 FROM egresos_manuales_fondos
                 UNION ALL
-                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble, created_at
                 FROM transferencias_cuentas
                 ORDER BY fecha DESC, id DESC
             `;
