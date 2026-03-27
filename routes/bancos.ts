@@ -1021,7 +1021,6 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 
     app.post('/movimientos-fondos/:id/rollback-ajuste', verifyToken, async (req: Request<BancosParams>, res: Response, _next: NextFunction) => {
         const movimientoId = asPositiveInt(asString(req.params.id), 'movimiento_fondo_id');
-        const rollbackWindowMs = 48 * 60 * 60 * 1000;
         try {
             const user = asAuthUser(req.user);
             const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
@@ -1067,17 +1066,6 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             if (!esAjusteElegible) {
                 await pool.query('ROLLBACK');
                 return res.status(400).json({ status: 'error', message: 'Este movimiento no corresponde a un ajuste de saldo reversible.' });
-            }
-
-            const fechaMovimiento = new Date(mov.fecha);
-            if (Number.isNaN(fechaMovimiento.getTime())) {
-                await pool.query('ROLLBACK');
-                return res.status(400).json({ status: 'error', message: 'El ajuste no tiene fecha válida para rollback.' });
-            }
-            const ageMs = Date.now() - fechaMovimiento.getTime();
-            if (ageMs > rollbackWindowMs) {
-                await pool.query('ROLLBACK');
-                return res.status(400).json({ status: 'error', message: 'La ventana de rollback (48 horas) ya expiró para este ajuste.' });
             }
 
             const historialMatch = notaMovimiento.match(/ajuste_historial_id:\s*(\d+)/i);

@@ -1094,19 +1094,6 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 return res.status(400).json({ status: 'error', message: 'Solo se pueden revertir pagos en estado Validado.' });
             }
 
-            const createdAt = pago.created_at ? new Date(pago.created_at) : null;
-            if (!createdAt || Number.isNaN(createdAt.getTime())) {
-                await pool.query('ROLLBACK');
-                return res.status(400).json({ status: 'error', message: 'El pago no tiene fecha de creación válida para rollback.' });
-            }
-
-            const ageMs = Date.now() - createdAt.getTime();
-            const rollbackWindowMs = 48 * 60 * 60 * 1000;
-            if (ageMs > rollbackWindowMs) {
-                await pool.query('ROLLBACK');
-                return res.status(400).json({ status: 'error', message: 'La ventana de rollback (48 horas) ya expiró para este pago.' });
-            }
-
             if (pago.recibo_id) {
                 await pool.query('ROLLBACK');
                 return res.status(400).json({
