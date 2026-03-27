@@ -811,14 +811,45 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 `SELECT
                     'AJUSTE' as tipo,
                     id as ref_id,
-                    nota as concepto,
+                    TRIM(
+                      regexp_replace(
+                        regexp_replace(
+                          regexp_replace(
+                            regexp_replace(COALESCE(nota, ''), '\\s*\\|\\s*\\[(?:bs_raw|tasa_raw):[^\\]]+\\]', '', 'gi'),
+                            '\\s*\\|\\s*Inmueble:[^|]*', '', 'gi'
+                          ),
+                          '\\s*\\|\\s*Ajuste desde Cuentas por Cobrar[^|]*', '', 'gi'
+                        ),
+                        '\\s*\\|\\s*(?:Bs|Tasa)\\s*[0-9\\.,]+', '', 'gi'
+                      )
+                    ) as concepto,
                     CASE WHEN tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (tipo = 'SALDO_INICIAL' AND COALESCE(nota, '') LIKE '%(DEUDA)%') THEN monto ELSE 0 END as cargo,
                     CASE WHEN tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (tipo = 'SALDO_INICIAL' AND COALESCE(nota, '') LIKE '%(FAVOR)%') THEN monto ELSE 0 END as abono,
-                    NULL::numeric as monto_bs,
-                    NULL::numeric as tasa_cambio,
+                    COALESCE(
+                      NULLIF((regexp_match(COALESCE(nota, ''), '\\[bs_raw:([0-9]+(?:\\.[0-9]+)?)\\]'))[1], '')::numeric,
+                      NULLIF(
+                        replace(
+                          replace((regexp_match(COALESCE(nota, ''), '(?i)\\bBs\\s*([0-9][0-9\\.,]*)'))[1], '.', ''),
+                          ',',
+                          '.'
+                        ),
+                        ''
+                      )::numeric
+                    ) as monto_bs,
+                    COALESCE(
+                      NULLIF((regexp_match(COALESCE(nota, ''), '\\[tasa_raw:([0-9]+(?:\\.[0-9]+)?)\\]'))[1], '')::numeric,
+                      NULLIF(
+                        replace(
+                          replace((regexp_match(COALESCE(nota, ''), '(?i)\\bTasa\\s*([0-9][0-9\\.,]*)'))[1], '.', ''),
+                          ',',
+                          '.'
+                        ),
+                        ''
+                      )::numeric
+                    ) as tasa_cambio,
                     NULL::text as estado_recibo,
-                    fecha as fecha_operacion,
-                    fecha as fecha_registro
+                    (fecha AT TIME ZONE 'UTC') as fecha_operacion,
+                    (fecha AT TIME ZONE 'UTC') as fecha_registro
                  FROM historial_saldos_inmuebles
                  WHERE propiedad_id = $1`,
                 [propiedadId]
