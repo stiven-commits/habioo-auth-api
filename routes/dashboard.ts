@@ -191,11 +191,9 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                     [condominioId],
                 ),
                 pool.query<IResumenSumRow>(
-                    `SELECT COALESCE(SUM(GREATEST(r.monto_usd - COALESCE(r.monto_pagado_usd, 0), 0)), 0)::text AS total
-                     FROM recibos r
-                     INNER JOIN propiedades p ON p.id = r.propiedad_id
-                     WHERE p.condominio_id = $1
-                       AND r.estado IN ('Aviso de Cobro', 'Pendiente')`,
+                    `SELECT COALESCE(SUM(GREATEST(p.saldo_actual, 0)), 0)::text AS total
+                     FROM propiedades p
+                     WHERE p.condominio_id = $1`,
                     [condominioId],
                 ),
                 pool.query<IResumenSumRow>(
@@ -207,12 +205,21 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                     [condominioId],
                 ),
                 pool.query<IResumenSumRow>(
-                    `SELECT COALESCE(SUM(pp.monto_usd), 0)::text AS total
-                     FROM pagos_proveedores pp
-                     JOIN gastos g ON pp.gasto_id = g.id
-                     WHERE g.condominio_id = $1
-                       AND EXTRACT(MONTH FROM pp.fecha_pago) = EXTRACT(MONTH FROM CURRENT_DATE)
-                       AND EXTRACT(YEAR FROM pp.fecha_pago) = EXTRACT(YEAR FROM CURRENT_DATE)`,
+                    `SELECT COALESCE(
+                        SUM(
+                          CASE
+                            WHEN UPPER(COALESCE(f.moneda, 'BS')) = 'USD'
+                              THEN COALESCE(mf.monto, 0)
+                            ELSE
+                              COALESCE(mf.monto, 0) / NULLIF(COALESCE(mf.tasa_cambio, 0), 0)
+                          END
+                        ), 0
+                      )::text AS total
+                     FROM movimientos_fondos mf
+                     INNER JOIN fondos f ON f.id = mf.fondo_id
+                     WHERE f.condominio_id = $1
+                       AND UPPER(COALESCE(mf.tipo, '')) IN ('EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO', 'PAGO_PROVEEDOR', 'EGRESO_PAGO')
+                       AND date_trunc('month', COALESCE(mf.fecha, CURRENT_DATE)::timestamp) = date_trunc('month', CURRENT_DATE)`,
                     [condominioId],
                 ),
             ]);
@@ -258,38 +265,51 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
 
             const [ingresosRes, egresosRes, gastosRubrosRes] = await Promise.all([
                 pool.query<IMonthlySumRow>(
-                    `SELECT to_char(date_trunc('month', p.fecha_pago::timestamp), 'YYYY-MM') AS mes,
+                    `SELECT to_char(date_trunc('month', COALESCE(p.created_at, p.fecha_pago::timestamp)), 'YYYY-MM') AS mes,
                             COALESCE(SUM(p.monto_usd), 0)::text AS total
                      FROM pagos p
                      INNER JOIN propiedades pr ON pr.id = p.propiedad_id
                      WHERE pr.condominio_id = $1
-                       AND date_trunc('month', p.fecha_pago::timestamp) >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
-                       AND date_trunc('month', p.fecha_pago::timestamp) <= date_trunc('month', CURRENT_DATE)
+                        AND p.estado = 'Validado'
+                        AND date_trunc('month', COALESCE(p.created_at, p.fecha_pago::timestamp)) >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+                        AND date_trunc('month', COALESCE(p.created_at, p.fecha_pago::timestamp)) <= date_trunc('month', CURRENT_DATE)
                      GROUP BY 1
                      ORDER BY 1 ASC`,
                     [condominioId],
                 ),
                 pool.query<IMonthlySumRow>(
-                    `SELECT to_char(date_trunc('month', pp.fecha_pago::timestamp), 'YYYY-MM') AS mes,
-                            COALESCE(SUM(pp.monto_usd), 0)::text AS total
-                     FROM pagos_proveedores pp
-                     INNER JOIN gastos g ON g.id = pp.gasto_id
-                     WHERE g.condominio_id = $1
-                       AND date_trunc('month', pp.fecha_pago::timestamp) >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
-                       AND date_trunc('month', pp.fecha_pago::timestamp) <= date_trunc('month', CURRENT_DATE)
+                    `SELECT to_char(date_trunc('month', COALESCE(mf.fecha, CURRENT_DATE)::timestamp), 'YYYY-MM') AS mes,
+                            COALESCE(
+                              SUM(
+                                CASE
+                                  WHEN UPPER(COALESCE(f.moneda, 'BS')) = 'USD'
+                                    THEN COALESCE(mf.monto, 0)
+                                  ELSE
+                                    COALESCE(mf.monto, 0) / NULLIF(COALESCE(mf.tasa_cambio, 0), 0)
+                                END
+                              ), 0
+                            )::text AS total
+                     FROM movimientos_fondos mf
+                     INNER JOIN fondos f ON f.id = mf.fondo_id
+                     WHERE f.condominio_id = $1
+                        AND UPPER(COALESCE(mf.tipo, '')) IN ('EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO', 'PAGO_PROVEEDOR', 'EGRESO_PAGO')
+                        AND date_trunc('month', COALESCE(mf.fecha, CURRENT_DATE)::timestamp) >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+                        AND date_trunc('month', COALESCE(mf.fecha, CURRENT_DATE)::timestamp) <= date_trunc('month', CURRENT_DATE)
                      GROUP BY 1
                      ORDER BY 1 ASC`,
                     [condominioId],
                 ),
                 pool.query<IGastoRubroRow>(
                     `SELECT COALESCE(NULLIF(BTRIM(pr.rubro), ''), 'Otros') AS name,
-                            COALESCE(SUM(g.monto_usd), 0)::text AS value
-                     FROM gastos g
+                            COALESCE(SUM(gc.monto_cuota_usd), 0)::text AS value
+                     FROM gastos_cuotas gc
+                     INNER JOIN gastos g ON g.id = gc.gasto_id
                      LEFT JOIN proveedores pr ON pr.id = g.proveedor_id
                      WHERE g.condominio_id = $1
-                       AND date_trunc('month', g.fecha_gasto::timestamp) = date_trunc('month', CURRENT_DATE)
+                        AND gc.mes_asignado = to_char(CURRENT_DATE, 'YYYY-MM')
+                        AND COALESCE(gc.estado, 'Pendiente') = 'Pendiente'
                      GROUP BY 1
-                     ORDER BY SUM(g.monto_usd) DESC`,
+                     ORDER BY SUM(gc.monto_cuota_usd) DESC`,
                     [condominioId],
                 ),
             ]);
@@ -350,19 +370,20 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
             }
             const condominioId = condoRes.rows[0].id;
 
-            const [ultimosPagosRes, pagosPendientesRes, gastosPendientesRes] = await Promise.all([
+            const [ultimosPagosRes, pagosPendientesRes, reservasPendientesRes, reservasPagoReportadoRes] = await Promise.all([
                 pool.query<IUltimoPagoDashboardRow>(
                     `SELECT
                         p.monto_usd,
                         p.metodo,
-                        p.fecha_pago,
+                        COALESCE(p.created_at, p.fecha_pago::timestamp) AS fecha_pago,
                         p.estado,
                         pr.identificador
-                     FROM pagos p
-                     INNER JOIN propiedades pr ON pr.id = p.propiedad_id
-                     WHERE pr.condominio_id = $1
-                     ORDER BY p.created_at DESC
-                     LIMIT 5`,
+                      FROM pagos p
+                      INNER JOIN propiedades pr ON pr.id = p.propiedad_id
+                      WHERE pr.condominio_id = $1
+                        AND p.estado IN ('Validado', 'PendienteAprobacion')
+                      ORDER BY COALESCE(p.created_at, p.fecha_pago::timestamp) DESC
+                      LIMIT 5`,
                     [condominioId],
                 ),
                 pool.query<ICountDashboardRow>(
@@ -370,29 +391,39 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                      FROM pagos p
                      INNER JOIN propiedades pr ON pr.id = p.propiedad_id
                      WHERE pr.condominio_id = $1
-                       AND p.estado = 'Pendiente'`,
+                       AND p.estado = 'PendienteAprobacion'`,
                     [condominioId],
                 ),
                 pool.query<ICountDashboardRow>(
                     `SELECT COUNT(*)::int AS total
-                     FROM gastos_cuotas gc
-                     INNER JOIN gastos g ON g.id = gc.gasto_id
-                     WHERE g.condominio_id = $1
-                       AND gc.estado = 'Pendiente'`,
+                     FROM reservaciones r
+                     INNER JOIN propiedades p ON p.id = r.propiedad_id
+                     WHERE p.condominio_id = $1
+                       AND r.estado = 'Pendiente'`,
+                    [condominioId],
+                ),
+                pool.query<ICountDashboardRow>(
+                    `SELECT COUNT(*)::int AS total
+                     FROM reservaciones r
+                     INNER JOIN propiedades p ON p.id = r.propiedad_id
+                     WHERE p.condominio_id = $1
+                       AND r.estado = 'Pago_Reportado'`,
                     [condominioId],
                 ),
             ]);
 
             const pagosPendientes = Number(pagosPendientesRes.rows[0]?.total || 0);
-            const gastosPendientes = Number(gastosPendientesRes.rows[0]?.total || 0);
+            const reservasPendientes = Number(reservasPendientesRes.rows[0]?.total || 0);
+            const reservasPagoReportado = Number(reservasPagoReportadoRes.rows[0]?.total || 0);
 
             return res.json({
                 status: 'success',
                 data: {
                     ultimosPagos: ultimosPagosRes.rows,
                     alertas: {
-                        pagosPendientes,
-                        gastosPendientes,
+                        pagosPendientesAprobacion: pagosPendientes,
+                        solicitudesAlquilerPendientes: reservasPendientes,
+                        pagosAlquilerReportados: reservasPagoReportado,
                     },
                 },
             });

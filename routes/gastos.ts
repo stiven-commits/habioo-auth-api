@@ -27,6 +27,7 @@ interface ICondominioConfigRow {
     id: number;
     mes_actual: string;
     metodo_division: 'Alicuota' | 'Partes Iguales' | string;
+    metodo_division_manual?: boolean;
     nombre?: string | null;
     nombre_legal?: string | null;
     rif?: string | null;
@@ -217,6 +218,17 @@ const getCurrentYyyyMm = (): string => new Date().toISOString().slice(0, 7);
 const asYyyyMmOrCurrent = (value: unknown): string => (/^\d{4}-\d{2}$/.test(String(value || '').trim()) ? String(value).trim() : getCurrentYyyyMm());
 const isImageMime = (mime: unknown): boolean => String(mime || '').toLowerCase().startsWith('image/');
 
+let ensureMetodoDivisionManualColumnPromise: Promise<void> | null = null;
+
+const ensureMetodoDivisionManualColumn = async (pool: Pool): Promise<void> => {
+    if (!ensureMetodoDivisionManualColumnPromise) {
+        ensureMetodoDivisionManualColumnPromise = pool
+            .query("ALTER TABLE condominios ADD COLUMN IF NOT EXISTS metodo_division_manual boolean NOT NULL DEFAULT false")
+            .then(() => undefined);
+    }
+    await ensureMetodoDivisionManualColumnPromise;
+};
+
 const fetchBcvRateToday = async (): Promise<number> => {
     const response = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
     if (!response.ok) {
@@ -399,8 +411,10 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
     app.get('/preliminar', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const condoRes = await pool.query<ICondominioConfigRow>('SELECT id, mes_actual, metodo_division FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            const { id: condominio_id, mes_actual, metodo_division } = condoRes.rows[0];
+            await ensureMetodoDivisionManualColumn(pool);
+            const condoRes = await pool.query<ICondominioConfigRow>('SELECT id, mes_actual, metodo_division, metodo_division_manual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            const { id: condominio_id, mes_actual, metodo_division: metodoDivisionActual } = condoRes.rows[0];
+            const metodoDivisionManual = Boolean(condoRes.rows[0]?.metodo_division_manual);
             const gastosRes = await pool.query<IPreliminarGastoRow>(
                 `
             SELECT g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, p.nombre as proveedor, g.nota, g.monto_usd as monto_total_usd, gc.mes_asignado,
@@ -411,15 +425,27 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 [condominio_id, mes_actual]
             );
             const total_usd = gastosRes.rows.filter((g) => g.mes_asignado === mes_actual).reduce((sum, item) => sum + parseFloat(String(item.monto_cuota_usd)), 0);
-            const alicuotasRes = await pool.query<IAlicuotaRow>('SELECT DISTINCT alicuota FROM propiedades WHERE condominio_id = $1 ORDER BY alicuota ASC', [condominio_id]);
+            const alicuotasRes = await pool.query<IAlicuotaRow>('SELECT alicuota FROM propiedades WHERE condominio_id = $1 ORDER BY alicuota ASC', [condominio_id]);
+            const alicuotas = alicuotasRes.rows.map((r) => parseFloat(String(r.alicuota)));
+            let metodoDivisionEfectivo: 'Alicuota' | 'Partes Iguales' = metodoDivisionActual === 'Partes Iguales' ? 'Partes Iguales' : 'Alicuota';
+
+            if (!metodoDivisionManual && alicuotas.length > 0) {
+                const alicuotasNormalizadas = alicuotas.map((a) => Number(a || 0).toFixed(6));
+                const sonDistintas = new Set(alicuotasNormalizadas).size > 1;
+                const metodoAuto: 'Alicuota' | 'Partes Iguales' = sonDistintas ? 'Alicuota' : 'Partes Iguales';
+                metodoDivisionEfectivo = metodoAuto;
+                if (metodoDivisionActual !== metodoAuto) {
+                    await pool.query('UPDATE condominios SET metodo_division = $1 WHERE id = $2', [metodoAuto, condominio_id]);
+                }
+            }
             res.json({
                 status: 'success',
                 mes_actual,
                 mes_texto: formatMonthText(mes_actual),
-                metodo_division,
+                metodo_division: metodoDivisionEfectivo,
                 gastos: gastosRes.rows,
                 total_usd: total_usd.toFixed(2),
-                alicuotas_disponibles: alicuotasRes.rows.map((r) => parseFloat(String(r.alicuota))),
+                alicuotas_disponibles: alicuotas,
             });
         } catch (err: unknown) {
             const error = asError(err);
@@ -434,8 +460,9 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             return res.status(400).json({ error: 'MÃ©todo invÃ¡lido.' });
         }
         try {
+            await ensureMetodoDivisionManualColumn(pool);
             await pool.query(
-                'UPDATE condominios SET metodo_division = $1 WHERE admin_user_id = $2',
+                'UPDATE condominios SET metodo_division = $1, metodo_division_manual = true WHERE admin_user_id = $2',
                 [metodo, user.id]
             );
             res.json({ status: 'success', message: `MÃ©todo actualizado a ${metodo}` });

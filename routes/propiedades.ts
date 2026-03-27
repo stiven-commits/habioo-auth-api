@@ -896,10 +896,6 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 throw new Error('El archivo Excel contiene alícuotas mixtas. O todos los inmuebles tienen alícuota 0 (partes iguales), o todos deben tener una alícuota mayor a 0.');
             }
 
-            if (allAlicuotasCero) {
-                await pool.query("UPDATE condominios SET metodo_division = 'Partes Iguales' WHERE id = $1", [condoId]);
-            }
-
             // 2) Bulk INSERT de propiedades + RETURNING id, identificador.
             const propValues: unknown[] = [];
             const propPlaceholders: string[] = [];
