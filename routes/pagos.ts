@@ -605,6 +605,10 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
         const propiedadId = pago.propiedad_id;
         await client.query('UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2', [montoUsd, propiedadId]);
+        await client.query(
+            'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
+            [propiedadId, 'AGREGAR_FAVOR', montoUsd, `Pago validado${pago.referencia ? ` (Ref: ${pago.referencia})` : ''}${pago.id ? ` #${pago.id}` : ''}`]
+        );
 
         let dineroRestante = montoUsd;
         let montoDistribuibleFondos = 0;
