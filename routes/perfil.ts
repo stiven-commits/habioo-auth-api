@@ -44,6 +44,7 @@ interface PerfilCondominioRow {
   admin_telefono: string | null;
   admin_correo: string | null;
   logo_url: string | null;
+  logo_condominio_url: string | null;
   firma_url: string | null;
   aviso_msg_1: string | null;
   aviso_msg_2: string | null;
@@ -80,6 +81,13 @@ const resolveCondominioIdFromToken = (req: Request): number | null => {
   const condominioId = authUser.condominio_id;
   if (typeof condominioId !== 'number' || !Number.isFinite(condominioId)) return null;
   return condominioId;
+};
+
+const getPerfilColumnByTipo = (tipo: string): 'logo_url' | 'logo_condominio_url' | 'firma_url' | null => {
+  if (tipo === 'logo') return 'logo_url';
+  if (tipo === 'logo-condominio') return 'logo_condominio_url';
+  if (tipo === 'firma') return 'firma_url';
+  return null;
 };
 
 const hasColumn = async (columnName: string): Promise<boolean> => {
@@ -120,6 +128,7 @@ router.get('/', verifyToken, async (req: Request, res: Response<ApiRes<PerfilCon
           admin_telefono,
           admin_correo,
           logo_url,
+          logo_condominio_url,
           firma_url,
           aviso_msg_1,
           aviso_msg_2,
@@ -284,8 +293,9 @@ router.post('/upload/:tipo', verifyToken, upload.any(), async (req: Request, res
     }
 
     const tipo = String(req.params.tipo || '').toLowerCase();
-    if (tipo !== 'logo' && tipo !== 'firma') {
-      res.status(400).json({ status: 'error', message: "Parametro :tipo invalido. Use 'logo' o 'firma'." });
+    const column = getPerfilColumnByTipo(tipo);
+    if (!column) {
+      res.status(400).json({ status: 'error', message: "Parametro :tipo invalido. Use 'logo', 'logo-condominio' o 'firma'." });
       return;
     }
 
@@ -336,7 +346,6 @@ router.post('/upload/:tipo', verifyToken, upload.any(), async (req: Request, res
         .toFile(absolutePath);
     }
 
-    const column = tipo === 'logo' ? 'logo_url' : 'firma_url';
     const exists = await hasColumn(column);
     if (!exists) {
       res.status(400).json({ status: 'error', message: `La columna ${column} no existe en condominios.` });
@@ -355,6 +364,58 @@ router.post('/upload/:tipo', verifyToken, upload.any(), async (req: Request, res
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Error inesperado al subir la imagen.';
+    res.status(500).json({ status: 'error', message });
+  }
+});
+
+router.delete('/upload/:tipo', verifyToken, async (req: Request, res: Response<ApiRes>): Promise<void> => {
+  try {
+    const condominioId = resolveCondominioIdFromToken(req);
+    if (!condominioId) {
+      res.status(400).json({ status: 'error', message: 'No se encontro condominio_id en el token.' });
+      return;
+    }
+
+    const tipo = String(req.params.tipo || '').toLowerCase();
+    const column = getPerfilColumnByTipo(tipo);
+    if (!column) {
+      res.status(400).json({ status: 'error', message: "Parametro :tipo invalido. Use 'logo', 'logo-condominio' o 'firma'." });
+      return;
+    }
+
+    const exists = await hasColumn(column);
+    if (!exists) {
+      res.status(400).json({ status: 'error', message: `La columna ${column} no existe en condominios.` });
+      return;
+    }
+
+    const currentValueRes = await pool.query<{ file_url: string | null }>(
+      `SELECT ${column} AS file_url FROM condominios WHERE id = $1 LIMIT 1`,
+      [condominioId],
+    );
+
+    if (currentValueRes.rows.length === 0) {
+      res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+      return;
+    }
+
+    const currentUrl = String(currentValueRes.rows[0]?.file_url || '').trim();
+    await pool.query(`UPDATE condominios SET ${column} = NULL WHERE id = $1`, [condominioId]);
+
+    if (currentUrl.startsWith('/uploads/perfil/')) {
+      const filename = path.basename(currentUrl);
+      const absolutePath = path.join(UPLOAD_DIR, filename);
+      if (fs.existsSync(absolutePath)) {
+        await fs.promises.unlink(absolutePath);
+      }
+    }
+
+    res.json({
+      status: 'success',
+      message: `${tipo} eliminado correctamente.`,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Error inesperado al eliminar la imagen.';
     res.status(500).json({ status: 'error', message });
   }
 });

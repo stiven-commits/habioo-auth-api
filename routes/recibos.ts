@@ -29,6 +29,21 @@ interface IReciboAvisoRow {
     inmueble_alicuota: string | number;
     propietario_nombre: string | null;
     inquilino_nombre: string | null;
+    condominio_nombre: string | null;
+    condominio_nombre_legal: string | null;
+    condominio_rif: string | null;
+    admin_nombre: string | null;
+    admin_rif: string | null;
+    admin_correo: string | null;
+    logo_url: string | null;
+    logo_condominio_url: string | null;
+    cuenta_principal_banco: string | null;
+    cuenta_principal_numero: string | null;
+    cuenta_principal_rif: string | null;
+    cuenta_principal_telefono: string | null;
+    cuenta_principal_acepta_pago_movil: boolean | null;
+    cuenta_principal_pago_movil_telefono: string | null;
+    cuenta_principal_pago_movil_rif: string | null;
     snapshot_jsonb: Record<string, unknown> | null;
 }
 
@@ -94,6 +109,21 @@ const registerRecibosRoutes = (app: Application, { pool, verifyToken }: AuthDepe
                     p.alicuota AS inmueble_alicuota,
                     upo.nombre AS propietario_nombre,
                     upi.nombre AS inquilino_nombre,
+                    c.nombre AS condominio_nombre,
+                    c.nombre_legal AS condominio_nombre_legal,
+                    c.rif AS condominio_rif,
+                    c.admin_nombre,
+                    c.admin_rif,
+                    c.admin_correo,
+                    c.logo_url,
+                    c.logo_condominio_url,
+                    cbp.nombre_banco AS cuenta_principal_banco,
+                    cbp.numero_cuenta AS cuenta_principal_numero,
+                    cbp.cedula_rif AS cuenta_principal_rif,
+                    cbp.telefono AS cuenta_principal_telefono,
+                    cbp.acepta_pago_movil AS cuenta_principal_acepta_pago_movil,
+                    cbp.pago_movil_telefono AS cuenta_principal_pago_movil_telefono,
+                    cbp.pago_movil_cedula_rif AS cuenta_principal_pago_movil_rif,
                     r.snapshot_jsonb
                  FROM recibos r
                  JOIN propiedades p ON p.id = r.propiedad_id
@@ -116,6 +146,21 @@ const registerRecibosRoutes = (app: Application, { pool, verifyToken }: AuthDepe
                     LIMIT 1
                  ) upi ON true
                  JOIN condominios c ON c.id = p.condominio_id
+                 LEFT JOIN LATERAL (
+                    SELECT
+                      cb.nombre_banco,
+                      cb.numero_cuenta,
+                      cb.cedula_rif,
+                      cb.telefono,
+                      cb.acepta_pago_movil,
+                      cb.pago_movil_telefono,
+                      cb.pago_movil_cedula_rif
+                    FROM cuentas_bancarias cb
+                    WHERE cb.condominio_id = c.id
+                      AND COALESCE(cb.activo, true) = true
+                    ORDER BY COALESCE(cb.es_predeterminada, false) DESC, cb.id ASC
+                    LIMIT 1
+                 ) cbp ON true
                  WHERE r.id = $1
                    AND (
                      c.admin_user_id = $2
@@ -153,10 +198,59 @@ const registerRecibosRoutes = (app: Application, { pool, verifyToken }: AuthDepe
             const titularMostrado = inquilino ? `${propietario} / Inquilino: ${inquilino}` : propietario;
 
             const snapshotInmueble = (recibo.snapshot_jsonb as Record<string, unknown>).inmueble as Record<string, unknown> | undefined;
+            const snapshotAdministradora = (recibo.snapshot_jsonb as Record<string, unknown>).administradora as Record<string, unknown> | undefined;
+            const snapshotCondominio = (recibo.snapshot_jsonb as Record<string, unknown>).condominio as Record<string, unknown> | undefined;
+
+            const condominioNombre = String(
+                snapshotCondominio?.nombre
+                || recibo.condominio_nombre_legal
+                || recibo.condominio_nombre
+                || ''
+            );
+            const condominioRif = String(snapshotCondominio?.rif || recibo.condominio_rif || '');
+
+            const administradoraNombre = String(
+                snapshotAdministradora?.nombre
+                || recibo.admin_nombre
+                || condominioNombre
+                || ''
+            );
+            const administradoraRif = String(snapshotAdministradora?.rif || recibo.admin_rif || '');
+            const administradoraCorreo = String(snapshotAdministradora?.correo || recibo.admin_correo || '');
+            const administradoraLogo = snapshotAdministradora?.logo_url || recibo.logo_url || null;
+            const condominioLogo = snapshotCondominio?.logo_url || recibo.logo_condominio_url || null;
+            const cuentaPrincipalSnapshot = (recibo.snapshot_jsonb as Record<string, unknown>).cuenta_principal as Record<string, unknown> | undefined;
 
             const aviso = {
                 ...recibo.snapshot_jsonb,
                 estado_recibo: estadoRecibo,
+                administradora: {
+                    ...(snapshotAdministradora || {}),
+                    nombre: administradoraNombre,
+                    rif: administradoraRif,
+                    correo: administradoraCorreo,
+                    logo_url: administradoraLogo,
+                },
+                condominio: {
+                    ...(snapshotCondominio || {}),
+                    nombre: condominioNombre,
+                    rif: condominioRif,
+                    logo_url: condominioLogo,
+                },
+                cuenta_principal: {
+                    ...(cuentaPrincipalSnapshot || {}),
+                    nombre_banco: String(cuentaPrincipalSnapshot?.nombre_banco || recibo.cuenta_principal_banco || ''),
+                    numero_cuenta: String(cuentaPrincipalSnapshot?.numero_cuenta || recibo.cuenta_principal_numero || ''),
+                    cedula_rif: String(cuentaPrincipalSnapshot?.cedula_rif || recibo.cuenta_principal_rif || ''),
+                    telefono: String(cuentaPrincipalSnapshot?.telefono || recibo.cuenta_principal_telefono || ''),
+                    acepta_pago_movil: Boolean(
+                        typeof cuentaPrincipalSnapshot?.acepta_pago_movil === 'boolean'
+                            ? cuentaPrincipalSnapshot?.acepta_pago_movil
+                            : recibo.cuenta_principal_acepta_pago_movil
+                    ),
+                    pago_movil_telefono: String(cuentaPrincipalSnapshot?.pago_movil_telefono || recibo.cuenta_principal_pago_movil_telefono || ''),
+                    pago_movil_cedula_rif: String(cuentaPrincipalSnapshot?.pago_movil_cedula_rif || recibo.cuenta_principal_pago_movil_rif || ''),
+                },
                 inmueble: {
                     ...(snapshotInmueble || {}),
                     identificador: String(snapshotInmueble?.identificador || recibo.inmueble_identificador || ''),
