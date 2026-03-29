@@ -154,6 +154,26 @@ interface IAjusteHistorialRollbackRow {
     monto: string | number;
 }
 
+interface ITransferenciaRollbackRow {
+    id: number;
+    condominio_id: number;
+    fondo_origen_id: number;
+    fondo_destino_id: number;
+    monto_origen: string | number;
+    monto_destino: string | number;
+    saldo_origen: string | number;
+    saldo_destino: string | number;
+}
+
+interface IEgresoManualRollbackRow {
+    id: number;
+    condominio_id: number;
+    fondo_id: number;
+    tipo: string | null;
+    nota: string | null;
+    monto: string | number;
+}
+
 const asAuthUser = (value: unknown): AuthUser => {
     if (
         typeof value !== 'object' ||
@@ -1153,6 +1173,147 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         } catch (err: unknown) {
             await pool.query('ROLLBACK');
             return res.status(500).json({ status: 'error', message: asError(err).message });
+        }
+    });
+
+    app.post('/transferencias/:id/rollback', verifyToken, async (req: Request<BancosParams>, res: Response, _next: NextFunction) => {
+        const transferenciaId = asPositiveInt(asString(req.params.id), 'transferencia_id');
+        try {
+            const user = asAuthUser(req.user);
+            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            if (!condoRes.rows.length) {
+                return res.status(403).json({ status: 'error', message: 'No autorizado para revertir transferencias.' });
+            }
+            const condominioId = condoRes.rows[0].id;
+
+            await pool.query('BEGIN');
+            const transferRes = await pool.query<ITransferenciaRollbackRow>(
+                `
+                SELECT
+                    t.id,
+                    t.condominio_id,
+                    t.fondo_origen_id,
+                    t.fondo_destino_id,
+                    COALESCE(t.monto_origen, 0) AS monto_origen,
+                    COALESCE(t.monto_destino, 0) AS monto_destino,
+                    COALESCE(fo.saldo_actual, 0) AS saldo_origen,
+                    COALESCE(fd.saldo_actual, 0) AS saldo_destino
+                FROM transferencias t
+                JOIN fondos fo ON fo.id = t.fondo_origen_id
+                JOIN fondos fd ON fd.id = t.fondo_destino_id
+                WHERE t.id = $1
+                  AND t.condominio_id = $2
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [transferenciaId, condominioId]
+            );
+
+            if (!transferRes.rows.length) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Transferencia no encontrada.' });
+            }
+
+            const transferencia = transferRes.rows[0];
+            const montoOrigen = parseFloat(String(transferencia.monto_origen || 0)) || 0;
+            const montoDestino = parseFloat(String(transferencia.monto_destino || 0)) || 0;
+            const saldoDestino = parseFloat(String(transferencia.saldo_destino || 0)) || 0;
+
+            if (montoOrigen <= 0 || montoDestino <= 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'La transferencia no tiene montos válidos para rollback.' });
+            }
+
+            if (saldoDestino + 1e-6 < montoDestino) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'No se puede eliminar: el fondo destino no tiene saldo suficiente para revertir esta transferencia.',
+                });
+            }
+
+            await pool.query(
+                'UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2',
+                [montoOrigen, transferencia.fondo_origen_id]
+            );
+            await pool.query(
+                'UPDATE fondos SET saldo_actual = saldo_actual - $1 WHERE id = $2',
+                [montoDestino, transferencia.fondo_destino_id]
+            );
+            await pool.query('DELETE FROM transferencias WHERE id = $1', [transferenciaId]);
+
+            await pool.query('COMMIT');
+            return res.json({ status: 'success', message: 'Transferencia eliminada y saldos revertidos correctamente.' });
+        } catch (error: unknown) {
+            await pool.query('ROLLBACK');
+            return res.status(500).json({ status: 'error', message: asError(error).message });
+        }
+    });
+
+    app.post('/movimientos-fondos/:id/rollback-egreso-manual', verifyToken, async (req: Request<BancosParams>, res: Response, _next: NextFunction) => {
+        const movimientoId = asPositiveInt(asString(req.params.id), 'movimiento_fondo_id');
+        try {
+            const user = asAuthUser(req.user);
+            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            if (!condoRes.rows.length) {
+                return res.status(403).json({ status: 'error', message: 'No autorizado para revertir egresos.' });
+            }
+            const condominioId = condoRes.rows[0].id;
+
+            await pool.query('BEGIN');
+            const movRes = await pool.query<IEgresoManualRollbackRow>(
+                `
+                SELECT
+                    mf.id,
+                    cb.condominio_id,
+                    mf.fondo_id,
+                    mf.tipo,
+                    mf.nota,
+                    COALESCE(mf.monto, 0) AS monto
+                FROM movimientos_fondos mf
+                JOIN fondos f ON f.id = mf.fondo_id
+                JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+                WHERE mf.id = $1
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [movimientoId]
+            );
+
+            if (!movRes.rows.length) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Movimiento no encontrado.' });
+            }
+
+            const mov = movRes.rows[0];
+            if (mov.condominio_id !== condominioId) {
+                await pool.query('ROLLBACK');
+                return res.status(403).json({ status: 'error', message: 'No autorizado para revertir este egreso.' });
+            }
+
+            const nota = String(mov.nota || '');
+            if (!/egreso manual libro mayor/i.test(nota)) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'Este movimiento no corresponde a un egreso manual reversible.' });
+            }
+
+            const monto = parseFloat(String(mov.monto || 0)) || 0;
+            if (monto <= 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'Monto inválido para reversión del egreso.' });
+            }
+
+            await pool.query(
+                'UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2',
+                [monto, mov.fondo_id]
+            );
+            await pool.query('DELETE FROM movimientos_fondos WHERE id = $1', [movimientoId]);
+
+            await pool.query('COMMIT');
+            return res.json({ status: 'success', message: 'Egreso manual revertido correctamente.' });
+        } catch (error: unknown) {
+            await pool.query('ROLLBACK');
+            return res.status(500).json({ status: 'error', message: asError(error).message });
         }
     });
 
