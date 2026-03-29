@@ -810,48 +810,73 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             const ajustes = await pool.query<IMovimientoEstadoCuentaRow>(
                 `SELECT
                     'AJUSTE' as tipo,
-                    id as ref_id,
+                    h.id as ref_id,
                     TRIM(
                       regexp_replace(
                         regexp_replace(
                           regexp_replace(
-                            regexp_replace(COALESCE(nota, ''), '\\s*\\|\\s*\\[(?:bs_raw|tasa_raw):[^\\]]+\\]', '', 'gi'),
+                            regexp_replace(
+                              regexp_replace(COALESCE(h.nota, ''), '\\s*\\|\\s*\\[(bs_raw|tasa_raw):[^\\]]+\\]', '', 'gi'),
+                              '\\s*\\|\\s*ajuste_historial_id:\\d+',
+                              '',
+                              'gi'
+                            ),
                             '\\s*\\|\\s*Inmueble:[^|]*', '', 'gi'
                           ),
                           '\\s*\\|\\s*Ajuste desde Cuentas por Cobrar[^|]*', '', 'gi'
                         ),
-                        '\\s*\\|\\s*(?:Bs|Tasa)\\s*[0-9\\.,]+', '', 'gi'
+                        '\\s*\\|\\s*(Bs|Tasa)\\s*[0-9\\.,]+', '', 'gi'
                       )
                     ) as concepto,
-                    CASE WHEN tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (tipo = 'SALDO_INICIAL' AND COALESCE(nota, '') LIKE '%(DEUDA)%') THEN monto ELSE 0 END as cargo,
-                    CASE WHEN tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (tipo = 'SALDO_INICIAL' AND COALESCE(nota, '') LIKE '%(FAVOR)%') THEN monto ELSE 0 END as abono,
+                    CASE WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%') THEN h.monto ELSE 0 END as cargo,
+                    CASE WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%') THEN h.monto ELSE 0 END as abono,
                     COALESCE(
-                      NULLIF((regexp_match(COALESCE(nota, ''), '\\[bs_raw:([0-9]+(?:\\.[0-9]+)?)\\]'))[1], '')::numeric,
+                      h.monto_bs,
+                      NULLIF(
+                        split_part(split_part(COALESCE(h.nota, ''), '[bs_raw:', 2), ']', 1),
+                        ''
+                      )::numeric,
                       NULLIF(
                         replace(
-                          replace((regexp_match(COALESCE(nota, ''), '(?i)\\bBs\\s*([0-9][0-9\\.,]*)'))[1], '.', ''),
+                          replace(substring(COALESCE(h.nota, '') FROM '[Bb][Ss][[:space:]]*([0-9][0-9\\.,]*)'), '.', ''),
                           ',',
                           '.'
                         ),
                         ''
-                      )::numeric
+                      )::numeric,
+                      p_ajuste.monto_origen
                     ) as monto_bs,
                     COALESCE(
-                      NULLIF((regexp_match(COALESCE(nota, ''), '\\[tasa_raw:([0-9]+(?:\\.[0-9]+)?)\\]'))[1], '')::numeric,
+                      h.tasa_cambio,
+                      NULLIF(
+                        split_part(split_part(COALESCE(h.nota, ''), '[tasa_raw:', 2), ']', 1),
+                        ''
+                      )::numeric,
                       NULLIF(
                         replace(
-                          replace((regexp_match(COALESCE(nota, ''), '(?i)\\bTasa\\s*([0-9][0-9\\.,]*)'))[1], '.', ''),
+                          replace(substring(COALESCE(h.nota, '') FROM '[Tt][Aa][Ss][Aa][[:space:]]*([0-9][0-9\\.,]*)'), '.', ''),
                           ',',
                           '.'
                         ),
                         ''
-                      )::numeric
+                      )::numeric,
+                      p_ajuste.tasa_cambio
                     ) as tasa_cambio,
                     NULL::text as estado_recibo,
-                    (fecha AT TIME ZONE 'UTC') as fecha_operacion,
-                    (fecha AT TIME ZONE 'UTC') as fecha_registro
-                 FROM historial_saldos_inmuebles
-                 WHERE propiedad_id = $1`,
+                    (h.fecha AT TIME ZONE 'UTC') as fecha_operacion,
+                    (h.fecha AT TIME ZONE 'UTC') as fecha_registro
+                 FROM historial_saldos_inmuebles h
+                 LEFT JOIN LATERAL (
+                    SELECT
+                      COALESCE(p.monto_origen, 0)::numeric AS monto_origen,
+                      p.tasa_cambio
+                    FROM pagos p
+                    WHERE p.propiedad_id = h.propiedad_id
+                      AND COALESCE(p.nota, '') ILIKE ('%ajuste_historial_id:' || h.id::text || '%')
+                    ORDER BY COALESCE(p.created_at, p.fecha_pago::timestamp) DESC, p.id DESC
+                    LIMIT 1
+                 ) p_ajuste ON TRUE
+                 WHERE h.propiedad_id = $1`,
                 [propiedadId]
             );
 
@@ -1445,8 +1470,15 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             for (const tipoHistorial of tiposCompatibles) {
                 try {
                     const historialRes = await pool.query<IHistorialSaldoIdRow>(
-                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4) RETURNING id',
-                        [propiedadId, tipoHistorial, montoNum, notaBase]
+                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, monto_bs, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+                        [
+                            propiedadId,
+                            tipoHistorial,
+                            montoNum,
+                            (typeof monto_bs === 'number' || typeof monto_bs === 'string') ? (parseFloat(String(monto_bs).replace(',', '.')) || null) : null,
+                            (typeof tasa_cambio === 'number' || typeof tasa_cambio === 'string') ? (parseFloat(String(tasa_cambio).replace(',', '.')) || null) : null,
+                            notaBase
+                        ]
                     );
                     historialId = historialRes.rows?.[0]?.id || null;
                     historialInsertado = true;

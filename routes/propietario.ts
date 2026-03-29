@@ -447,7 +447,23 @@ router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Req
         SELECT
           'AJUSTE' AS tipo,
           h.id AS ref_id,
-          COALESCE(h.nota, 'Ajuste manual') AS concepto,
+          TRIM(
+            regexp_replace(
+              regexp_replace(
+                regexp_replace(
+                  regexp_replace(
+                    regexp_replace(COALESCE(h.nota, 'Ajuste manual'), '\\s*\\|\\s*\\[(bs_raw|tasa_raw):[^\\]]+\\]', '', 'gi'),
+                    '\\s*\\|\\s*ajuste_historial_id:\\d+',
+                    '',
+                    'gi'
+                  ),
+                  '\\s*\\|\\s*Inmueble:[^|]*', '', 'gi'
+                ),
+                '\\s*\\|\\s*Ajuste desde Cuentas por Cobrar[^|]*', '', 'gi'
+              ),
+              '\\s*\\|\\s*(Bs|Tasa)\\s*[0-9\\.,]+', '', 'gi'
+            )
+          ) AS concepto,
           CASE
             WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
               THEN COALESCE(h.monto, 0)
@@ -458,12 +474,52 @@ router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Req
               THEN COALESCE(h.monto, 0)
             ELSE 0
           END AS abono,
-          NULL::numeric AS monto_bs,
-          NULL::numeric AS tasa_cambio,
+          COALESCE(
+            h.monto_bs,
+            NULLIF(
+              split_part(split_part(COALESCE(h.nota, ''), '[bs_raw:', 2), ']', 1),
+              ''
+            )::numeric,
+            NULLIF(
+              replace(
+                replace(substring(COALESCE(h.nota, '') FROM '[Bb][Ss][[:space:]]*([0-9][0-9\\.,]*)'), '.', ''),
+                ',',
+                '.'
+              ),
+              ''
+            )::numeric,
+            p_ajuste.monto_origen
+          ) AS monto_bs,
+          COALESCE(
+            h.tasa_cambio,
+            NULLIF(
+              split_part(split_part(COALESCE(h.nota, ''), '[tasa_raw:', 2), ']', 1),
+              ''
+            )::numeric,
+            NULLIF(
+              replace(
+                replace(substring(COALESCE(h.nota, '') FROM '[Tt][Aa][Ss][Aa][[:space:]]*([0-9][0-9\\.,]*)'), '.', ''),
+                ',',
+                '.'
+              ),
+              ''
+            )::numeric,
+            p_ajuste.tasa_cambio
+          ) AS tasa_cambio,
           NULL::text AS estado_recibo,
-          h.fecha AS fecha_operacion,
-          h.fecha AS fecha_registro
+          (h.fecha AT TIME ZONE 'UTC') AS fecha_operacion,
+          (h.fecha AT TIME ZONE 'UTC') AS fecha_registro
         FROM historial_saldos_inmuebles h
+        LEFT JOIN LATERAL (
+          SELECT
+            COALESCE(p.monto_origen, 0)::numeric AS monto_origen,
+            p.tasa_cambio
+          FROM pagos p
+          WHERE p.propiedad_id = h.propiedad_id
+            AND COALESCE(p.nota, '') ILIKE ('%ajuste_historial_id:' || h.id::text || '%')
+          ORDER BY COALESCE(p.created_at, p.fecha_pago::timestamp) DESC, p.id DESC
+          LIMIT 1
+        ) p_ajuste ON TRUE
         WHERE h.propiedad_id = $1
       `,
       [propiedadId],
