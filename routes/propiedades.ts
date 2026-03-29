@@ -319,12 +319,39 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             }
             const r = await pool.query<IPropiedadAdminRow>(`
                 SELECT p.id, p.identificador, p.alicuota,
-                    COALESCE(p.saldo_actual, 0) AS saldo_actual,
+                    ROUND(COALESCE(saldo_calc.saldo_calculado, p.saldo_actual, 0)::numeric, 2) AS saldo_actual,
                     u1.id as prop_id, u1.nombre as prop_nombre, u1.cedula as prop_cedula, u1.email as prop_email, u1.telefono as prop_telefono,
                     u2.id as inq_id, u2.nombre as inq_nombre, u2.cedula as inq_cedula, u2.email as inq_email, u2.telefono as inq_telefono,
                     COALESCE(up2.acceso_portal, true) as inq_acceso_portal,
                     NOT EXISTS (SELECT 1 FROM recibos r WHERE r.propiedad_id = p.id) as can_delete
                 FROM propiedades p
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COALESCE((
+                            SELECT SUM(COALESCE(r.monto_usd, 0))
+                            FROM recibos r
+                            WHERE r.propiedad_id = p.id
+                        ), 0)
+                        + COALESCE((
+                            SELECT SUM(
+                                CASE
+                                    WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
+                                        THEN COALESCE(h.monto, 0)
+                                    WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+                                        THEN -COALESCE(h.monto, 0)
+                                    ELSE 0
+                                END
+                            )
+                            FROM historial_saldos_inmuebles h
+                            WHERE h.propiedad_id = p.id
+                        ), 0)
+                        - COALESCE((
+                            SELECT SUM(COALESCE(pa.monto_usd, 0))
+                            FROM pagos pa
+                            WHERE pa.propiedad_id = p.id
+                              AND pa.estado = 'Validado'
+                        ), 0) AS saldo_calculado
+                ) saldo_calc ON TRUE
                 LEFT JOIN usuarios_propiedades up1 ON p.id = up1.propiedad_id AND up1.rol = 'Propietario' LEFT JOIN users u1 ON up1.user_id = u1.id 
                 LEFT JOIN usuarios_propiedades up2 ON p.id = up2.propiedad_id AND up2.rol = 'Inquilino' LEFT JOIN users u2 ON up2.user_id = u2.id
                 WHERE p.condominio_id = $1 ORDER BY p.identificador ASC

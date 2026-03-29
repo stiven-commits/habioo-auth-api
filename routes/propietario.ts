@@ -265,10 +265,37 @@ router.get('/mis-propiedades', verifyToken, async (req: Request, res: Response<A
           p.identificador,
           COALESCE(c.nombre_legal, c.nombre, 'Condominio') AS nombre_condominio,
           p.condominio_id AS id_condominio,
-          COALESCE(p.saldo_actual, 0) AS saldo_actual
+          ROUND(COALESCE(saldo_calc.saldo_calculado, p.saldo_actual, 0)::numeric, 2) AS saldo_actual
         FROM usuarios_propiedades up
         INNER JOIN propiedades p ON p.id = up.propiedad_id
         INNER JOIN condominios c ON c.id = p.condominio_id
+        LEFT JOIN LATERAL (
+          SELECT
+            COALESCE((
+              SELECT SUM(COALESCE(r.monto_usd, 0))
+              FROM recibos r
+              WHERE r.propiedad_id = p.id
+            ), 0)
+            + COALESCE((
+              SELECT SUM(
+                CASE
+                  WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
+                    THEN COALESCE(h.monto, 0)
+                  WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+                    THEN -COALESCE(h.monto, 0)
+                  ELSE 0
+                END
+              )
+              FROM historial_saldos_inmuebles h
+              WHERE h.propiedad_id = p.id
+            ), 0)
+            - COALESCE((
+              SELECT SUM(COALESCE(pa.monto_usd, 0))
+              FROM pagos pa
+              WHERE pa.propiedad_id = p.id
+                AND pa.estado = 'Validado'
+            ), 0) AS saldo_calculado
+        ) saldo_calc ON TRUE
         WHERE up.user_id = $1
           AND COALESCE(up.acceso_portal, true) = true
         ORDER BY p.condominio_id ASC, p.identificador ASC
