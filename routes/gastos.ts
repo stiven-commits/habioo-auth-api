@@ -55,6 +55,8 @@ interface IGastoCuotaCheckRow {
 }
 
 interface IGastoImagenesRow {
+    id?: number;
+    condominio_id?: number;
     factura_img: string | null;
     imagenes: string[] | null;
 }
@@ -175,6 +177,8 @@ interface CreateGastoBody {
     zona_id?: string | number | null;
     propiedad_id?: string | number | null;
     fecha_gasto?: string | null;
+    remove_factura_img?: string | boolean | null;
+    keep_imagenes?: string | string[] | null;
 }
 
 interface MetodoDivisionBody {
@@ -182,6 +186,10 @@ interface MetodoDivisionBody {
 }
 
 interface DeleteGastoParams {
+    id?: string;
+}
+
+interface UpdateGastoParams {
     id?: string;
 }
 
@@ -217,6 +225,36 @@ const toNumber = (value: string | number | null | undefined): number => parseFlo
 const getCurrentYyyyMm = (): string => new Date().toISOString().slice(0, 7);
 const asYyyyMmOrCurrent = (value: unknown): string => (/^\d{4}-\d{2}$/.test(String(value || '').trim()) ? String(value).trim() : getCurrentYyyyMm());
 const isImageMime = (mime: unknown): boolean => String(mime || '').toLowerCase().startsWith('image/');
+const isPdfMime = (mime: unknown): boolean => String(mime || '').toLowerCase() === 'application/pdf';
+const MAX_PDF_SIZE_BYTES = 1 * 1024 * 1024;
+
+const removeUploadedFileSafe = (relativePath: string | null | undefined): void => {
+    if (!relativePath) return;
+    const normalized = String(relativePath).trim();
+    if (!normalized.startsWith('/uploads/')) return;
+    const relativeWithoutSlash = normalized.replace(/^\//, '');
+    const fullPath = path.join(__dirname, '..', relativeWithoutSlash);
+    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+};
+
+const parseKeepImagenesFromBody = (raw: unknown, allowed: string[]): string[] => {
+    if (raw === null || raw === undefined) return allowed;
+
+    let parsed: unknown = raw;
+    if (typeof raw === 'string') {
+        const trimmed = raw.trim();
+        if (!trimmed) return [];
+        try {
+            parsed = JSON.parse(trimmed);
+        } catch {
+            parsed = trimmed.includes(',') ? trimmed.split(',').map((x) => x.trim()) : [trimmed];
+        }
+    }
+
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+    const normalized = arr.map((x) => String(x || '').trim()).filter((x) => x.length > 0);
+    return allowed.filter((path) => normalized.includes(path));
+};
 
 let ensureMetodoDivisionManualColumnPromise: Promise<void> | null = null;
 
@@ -271,8 +309,9 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         const user = asAuthUser(req.user);
         if (!user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
 
-        const { proveedor_id, concepto, numero_documento, monto_bs, tasa_cambio, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto } = req.body;
+        const { proveedor_id, concepto, numero_documento, monto_bs, tasa_cambio, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, remove_factura_img } = req.body;
 
+        let inTransaction = false;
         try {
             let facturaGuardada: string | null = null;
             const soportesGuardados: string[] = [];
@@ -281,17 +320,32 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             if (files) {
                 if (files.factura_img && files.factura_img.length > 0) {
                     const file = files.factura_img[0];
+                    if (isPdfMime(file.mimetype)) {
+                        const uniqueName = `factura_${Date.now()}_${Math.round(Math.random() * 1e9)}.pdf`;
+                        fs.writeFileSync(path.join(uploadsDir, uniqueName), file.buffer);
+                        facturaGuardada = `/uploads/gastos/${uniqueName}`;
+                    } else
                     if (!isImageMime(file.mimetype)) {
-                        return res.status(400).json({ status: 'error', message: 'La factura principal debe ser una imagen valida.' });
+                        return res.status(400).json({ status: 'error', message: 'La factura o recibo debe ser imagen o PDF valido.' });
+                    } else {
+                        const uniqueName = `factura_${Date.now()}_${Math.round(Math.random() * 1e9)}.webp`;
+                        await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
+                        facturaGuardada = `/uploads/gastos/${uniqueName}`;
                     }
-                    const uniqueName = `factura_${Date.now()}_${Math.round(Math.random() * 1e9)}.webp`;
-                    await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
-                    facturaGuardada = `/uploads/gastos/${uniqueName}`;
                 }
                 if (files.soportes && files.soportes.length > 0) {
                     for (const file of files.soportes) {
+                        if (isPdfMime(file.mimetype)) {
+                            if ((file.size || 0) > MAX_PDF_SIZE_BYTES) {
+                                return res.status(400).json({ status: 'error', message: 'Cada PDF en soportes debe pesar maximo 1 MB.' });
+                            }
+                            const uniqueName = `soporte_${Date.now()}_${Math.round(Math.random() * 1e9)}.pdf`;
+                            fs.writeFileSync(path.join(uploadsDir, uniqueName), file.buffer);
+                            soportesGuardados.push(`/uploads/gastos/${uniqueName}`);
+                            continue;
+                        }
                         if (!isImageMime(file.mimetype)) {
-                            return res.status(400).json({ status: 'error', message: 'Todos los soportes deben ser imagenes validas.' });
+                            return res.status(400).json({ status: 'error', message: 'Los soportes solo permiten imagenes o PDF.' });
                         }
                         const uniqueName = `soporte_${Date.now()}_${Math.round(Math.random() * 1e9)}.webp`;
                         await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
@@ -346,6 +400,169 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         }
     });
 
+    app.put('/gastos/:id', verifyToken, upload.fields([{ name: 'factura_img', maxCount: 1 }, { name: 'soportes', maxCount: 4 }]), async (req: Request<UpdateGastoParams, unknown, CreateGastoBody>, res: Response) => {
+        const user = asAuthUser(req.user);
+        if (!user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
+
+        const gastoId = parseInt(String(req.params.id || ''), 10);
+        if (!Number.isFinite(gastoId) || gastoId <= 0) {
+            return res.status(400).json({ status: 'error', message: 'ID de gasto invalido.' });
+        }
+
+        const { proveedor_id, concepto, numero_documento, monto_bs, tasa_cambio, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, remove_factura_img } = req.body;
+
+        let inTransaction = false;
+        try {
+            const condoRes = await pool.query<ICondominioMesRow>('SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            if (condoRes.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para el administrador.' });
+            }
+            const condominio_id = condoRes.rows[0].id;
+            const mes_actual = asYyyyMmOrCurrent(condoRes.rows[0].mes_actual);
+
+            const ownGastoRes = await pool.query<IGastoImagenesRow>(
+                'SELECT id, condominio_id, factura_img, imagenes FROM gastos WHERE id = $1 LIMIT 1',
+                [gastoId]
+            );
+            const ownGasto = ownGastoRes.rows[0];
+            if (!ownGasto || Number(ownGasto.condominio_id) !== Number(condominio_id)) {
+                return res.status(404).json({ status: 'error', message: 'Gasto no encontrado.' });
+            }
+
+            const cuotasProcesadasRes = await pool.query<IGastoCuotaCheckRow>(
+                "SELECT id FROM gastos_cuotas WHERE gasto_id = $1 AND COALESCE(estado, 'Pendiente') <> 'Pendiente' LIMIT 1",
+                [gastoId]
+            );
+            if (cuotasProcesadasRes.rows.length > 0) {
+                return res.status(400).json({ status: 'error', message: 'No se puede editar un gasto que ya fue incluido en aviso(s) de cobro.' });
+            }
+
+            let facturaGuardada: string | null = ownGasto.factura_img || null;
+            const oldSoportes = Array.isArray(ownGasto.imagenes) ? ownGasto.imagenes : [];
+            let soportesGuardados: string[] = parseKeepImagenesFromBody(req.body?.keep_imagenes, oldSoportes);
+            const oldFactura = ownGasto.factura_img || null;
+            const wantsRemoveFactura = ['1', 'true', 'on', 'si'].includes(String(remove_factura_img || '').trim().toLowerCase());
+
+            const files = req.files as UploadedFiles | undefined;
+            if (files) {
+                if (files.factura_img && files.factura_img.length > 0) {
+                    const file = files.factura_img[0];
+                    if (isPdfMime(file.mimetype)) {
+                        const uniqueName = `factura_${Date.now()}_${Math.round(Math.random() * 1e9)}.pdf`;
+                        fs.writeFileSync(path.join(uploadsDir, uniqueName), file.buffer);
+                        facturaGuardada = `/uploads/gastos/${uniqueName}`;
+                    } else if (!isImageMime(file.mimetype)) {
+                        return res.status(400).json({ status: 'error', message: 'La factura o recibo debe ser imagen o PDF valido.' });
+                    } else {
+                        const uniqueName = `factura_${Date.now()}_${Math.round(Math.random() * 1e9)}.webp`;
+                        await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
+                        facturaGuardada = `/uploads/gastos/${uniqueName}`;
+                    }
+                }
+
+                if (files.soportes && files.soportes.length > 0) {
+                    for (const file of files.soportes) {
+                        if (isPdfMime(file.mimetype)) {
+                            if ((file.size || 0) > MAX_PDF_SIZE_BYTES) {
+                                return res.status(400).json({ status: 'error', message: 'Cada PDF en soportes debe pesar maximo 1 MB.' });
+                            }
+                            const uniqueName = `soporte_${Date.now()}_${Math.round(Math.random() * 1e9)}.pdf`;
+                            fs.writeFileSync(path.join(uploadsDir, uniqueName), file.buffer);
+                            soportesGuardados.push(`/uploads/gastos/${uniqueName}`);
+                            continue;
+                        }
+                        if (!isImageMime(file.mimetype)) {
+                            return res.status(400).json({ status: 'error', message: 'Los soportes solo permiten imagenes o PDF.' });
+                        }
+                        const uniqueName = `soporte_${Date.now()}_${Math.round(Math.random() * 1e9)}.webp`;
+                        await sharp(file.buffer).resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadsDir, uniqueName));
+                        soportesGuardados.push(`/uploads/gastos/${uniqueName}`);
+                    }
+                }
+            }
+
+            if (soportesGuardados.length > 4) {
+                return res.status(400).json({ status: 'error', message: 'No puedes tener mas de 4 soportes por gasto.' });
+            }
+
+            if (wantsRemoveFactura && !(files?.factura_img && files.factura_img.length > 0)) {
+                facturaGuardada = null;
+            }
+
+            const m_bs = parseLocaleNumber(monto_bs);
+            const t_c = parseLocaleNumber(tasa_cambio);
+            const fechaGastoSafe = toIsoDateOrNull(fecha_gasto);
+            const monto_usd = (m_bs / t_c).toFixed(2);
+            const totalCuotasSafe = Math.max(1, parseInt(String(total_cuotas), 10) || 1);
+            const monto_cuota_usd = (parseFloat(monto_usd) / totalCuotasSafe).toFixed(2);
+
+            const mes_factura = fechaGastoSafe ? fechaGastoSafe.substring(0, 7) : mes_actual;
+            const mes_inicio_cobro = mes_factura > mes_actual ? mes_factura : mes_actual;
+
+            const dbTipo = tipo || 'Comun';
+            const dbClasificacion = String(clasificacion || '').trim().toLowerCase() === 'fijo' ? 'Fijo' : 'Variable';
+            const zId = dbTipo === 'Zona' || dbTipo === 'No Comun' ? (zona_id || null) : null;
+            const pId = dbTipo === 'Individual' ? (propiedad_id || null) : null;
+            const numeroDocSafe = String(numero_documento || '').trim();
+            const notaSafe = String(nota || '').trim();
+            const notaFinal = numeroDocSafe
+                ? (notaSafe ? `Nro. recibo/factura: ${numeroDocSafe} | ${notaSafe}` : `Nro. recibo/factura: ${numeroDocSafe}`)
+                : (notaSafe || null);
+
+            await pool.query('BEGIN');
+            inTransaction = true;
+
+            await pool.query(
+                `
+                UPDATE gastos
+                SET proveedor_id = $1,
+                    concepto = $2,
+                    monto_bs = $3,
+                    tasa_cambio = $4,
+                    monto_usd = $5,
+                    total_cuotas = $6,
+                    nota = $7,
+                    clasificacion = $8,
+                    tipo = $9,
+                    zona_id = $10,
+                    propiedad_id = $11,
+                    fecha_gasto = $12,
+                    factura_img = $13,
+                    imagenes = $14
+                WHERE id = $15
+                `,
+                [proveedor_id, concepto, m_bs, t_c, monto_usd, totalCuotasSafe, notaFinal, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados, gastoId]
+            );
+
+            await pool.query('DELETE FROM gastos_cuotas WHERE gasto_id = $1', [gastoId]);
+            for (let i = 1; i <= totalCuotasSafe; i += 1) {
+                const mes_cuota = addMonths(mes_inicio_cobro, i - 1);
+                await pool.query(
+                    'INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado) VALUES ($1, $2, $3, $4)',
+                    [gastoId, i, monto_cuota_usd, mes_cuota]
+                );
+            }
+
+            await pool.query('COMMIT');
+            inTransaction = false;
+
+            if ((wantsRemoveFactura || (files?.factura_img && files.factura_img.length > 0)) && oldFactura && oldFactura !== facturaGuardada) {
+                removeUploadedFileSafe(oldFactura);
+            }
+            oldSoportes
+                .filter((filePath) => !soportesGuardados.includes(filePath))
+                .forEach((filePath) => removeUploadedFileSafe(filePath));
+
+            return res.json({ status: 'success', message: 'Gasto actualizado con exito.' });
+        } catch (err: unknown) {
+            if (inTransaction) {
+                await pool.query('ROLLBACK');
+            }
+            const error = asError(err);
+            return res.status(500).json({ error: error.message });
+        }
+    });
+
     app.get('/gastos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
         if (!user.cedula.startsWith('J')) return res.status(403).json({ status: 'error' });
@@ -357,8 +574,9 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                    gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.mes_asignado, gc.estado,
                    TO_CHAR(g.created_at, 'DD/MM/YYYY') as fecha_registro,
                    TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha_factura,
-                   g.tipo, z.nombre as zona_nombre, prop.identificador as propiedad_identificador,
-                   g.factura_img, g.imagenes,
+                    g.tipo, z.nombre as zona_nombre, prop.identificador as propiedad_identificador,
+                    g.proveedor_id, g.zona_id, g.propiedad_id,
+                    g.factura_img, g.imagenes,
                    GREATEST(0, g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_pendiente
             FROM gastos g
             JOIN gastos_cuotas gc ON g.id = gc.gasto_id

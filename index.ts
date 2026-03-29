@@ -98,6 +98,10 @@ interface AlquileresRoutesRegistrar {
     (app: Application, deps: { pool: Pool; verifyToken: VerifyTokenMiddleware }): void;
 }
 
+interface SupportRoutesRegistrar {
+    (app: Application, deps: { pool: Pool; verifyToken: VerifyTokenMiddleware }): void;
+}
+
 const { pool }: { pool: Pool } = require('./config/db');
 const { verifyToken }: { verifyToken: VerifyTokenMiddleware } = require('./middleware/verifyToken');
 const { parseLocaleNumber }: { parseLocaleNumber: ParseLocaleNumber } = require('./utils/number');
@@ -118,6 +122,7 @@ const { registerDashboardRoutes }: { registerDashboardRoutes: DashboardRoutesReg
 const { registerEncuestasRoutes }: { registerEncuestasRoutes: EncuestasRoutesRegistrar } = require('./routes/encuestas');
 const { registerChatRoutes }: { registerChatRoutes: ChatRoutesRegistrar } = require('./routes/chat');
 const { registerAlquileresRoutes }: { registerAlquileresRoutes: AlquileresRoutesRegistrar } = require('./routes/alquileres');
+const { registerSupportRoutes }: { registerSupportRoutes: SupportRoutesRegistrar } = require('./routes/support');
 const perfilRoutes: import('express').Router = require('./routes/perfil');
 const propietarioRoutes: import('express').Router = require('./routes/propietario');
 
@@ -131,6 +136,32 @@ const uploadsDir: string = path.join(__dirname, 'uploads', 'gastos');
 if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
+
+app.get('/uploads/gastos/:filename', (req: Request, res: Response, next: NextFunction) => {
+    const rawFilename = String(req.params.filename || '').trim();
+    const safeFilename = path.basename(rawFilename);
+    if (!safeFilename) {
+        return res.status(404).end();
+    }
+
+    const requestedPath = path.join(__dirname, 'uploads', 'gastos', safeFilename);
+    if (fs.existsSync(requestedPath)) {
+        return res.sendFile(requestedPath);
+    }
+
+    const parsed = path.parse(safeFilename);
+    const base = parsed.name;
+    const candidates = ['.webp', '.pdf', '.png', '.jpg', '.jpeg'];
+    for (const ext of candidates) {
+        const candidatePath = path.join(__dirname, 'uploads', 'gastos', `${base}${ext}`);
+        if (fs.existsSync(candidatePath)) {
+            return res.sendFile(candidatePath);
+        }
+    }
+
+    return next();
+});
+
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const getPagosOptionalColumns: GetPagosOptionalColumns = createGetPagosOptionalColumns(pool);
@@ -149,6 +180,7 @@ registerDashboardRoutes(app, { pool, verifyToken });
 registerEncuestasRoutes(app, { pool, verifyToken });
 registerChatRoutes(app, { pool, verifyToken });
 registerAlquileresRoutes(app, { pool, verifyToken });
+registerSupportRoutes(app, { pool, verifyToken });
 app.use('/api/perfil', perfilRoutes);
 app.use('/api/propietario', propietarioRoutes);
 
