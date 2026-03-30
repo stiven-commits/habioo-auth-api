@@ -223,7 +223,14 @@ const asError = (value: unknown): Error => {
 
 const toNumber = (value: string | number | null | undefined): number => parseFloat(String(value ?? 0)) || 0;
 const getCurrentYyyyMm = (): string => new Date().toISOString().slice(0, 7);
+const getPreviousYyyyMm = (): string => {
+    const now = new Date();
+    now.setUTCDate(1);
+    now.setUTCMonth(now.getUTCMonth() - 1);
+    return now.toISOString().slice(0, 7);
+};
 const asYyyyMmOrCurrent = (value: unknown): string => (/^\d{4}-\d{2}$/.test(String(value || '').trim()) ? String(value).trim() : getCurrentYyyyMm());
+const asYyyyMmOrPrevious = (value: unknown): string => (/^\d{4}-\d{2}$/.test(String(value || '').trim()) ? String(value).trim() : getPreviousYyyyMm());
 const isImageMime = (mime: unknown): boolean => String(mime || '').toLowerCase().startsWith('image/');
 const isPdfMime = (mime: unknown): boolean => String(mime || '').toLowerCase() === 'application/pdf';
 const MAX_PDF_SIZE_BYTES = 1 * 1024 * 1024;
@@ -363,7 +370,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para el administrador.' });
             }
             const condominio_id = condoRes.rows[0].id;
-            const mes_actual = asYyyyMmOrCurrent(condoRes.rows[0].mes_actual);
+            const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0].mes_actual);
 
             const monto_usd = (m_bs / t_c).toFixed(2);
             const monto_cuota_usd = (parseFloat(monto_usd) / parseInt(String(total_cuotas), 10)).toFixed(2);
@@ -418,7 +425,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para el administrador.' });
             }
             const condominio_id = condoRes.rows[0].id;
-            const mes_actual = asYyyyMmOrCurrent(condoRes.rows[0].mes_actual);
+            const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0].mes_actual);
 
             const ownGastoRes = await pool.query<IGastoImagenesRow>(
                 'SELECT id, condominio_id, factura_img, imagenes FROM gastos WHERE id = $1 LIMIT 1',
@@ -631,7 +638,11 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const user = asAuthUser(req.user);
             await ensureMetodoDivisionManualColumn(pool);
             const condoRes = await pool.query<ICondominioConfigRow>('SELECT id, mes_actual, metodo_division, metodo_division_manual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            const { id: condominio_id, mes_actual, metodo_division: metodoDivisionActual } = condoRes.rows[0];
+            const { id: condominio_id, metodo_division: metodoDivisionActual } = condoRes.rows[0];
+            const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0]?.mes_actual);
+            if (!condoRes.rows[0]?.mes_actual) {
+                await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [mes_actual, condominio_id]);
+            }
             const metodoDivisionManual = Boolean(condoRes.rows[0]?.metodo_division_manual);
             const gastosRes = await pool.query<IPreliminarGastoRow>(
                 `
@@ -705,7 +716,11 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                  LIMIT 1`,
                 [user.id]
             );
-            const { id: condo_id, mes_actual, metodo_division } = condoRes.rows[0];
+            const { id: condo_id, metodo_division } = condoRes.rows[0];
+            const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0]?.mes_actual);
+            if (!condoRes.rows[0]?.mes_actual) {
+                await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [mes_actual, condo_id]);
+            }
 
             // ðŸ’¡ 1. Agregamos "saldo_actual" a la bÃºsqueda de propiedades
             const propRes = await pool.query<IPropiedadCierreRow>(
