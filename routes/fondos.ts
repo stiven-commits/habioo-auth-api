@@ -26,6 +26,7 @@ interface IFondoWithBancoRow {
     es_operativo: boolean;
     activo: boolean;
     visible_propietarios: boolean;
+    fecha_saldo: string | null;
     nombre_banco: string;
     apodo: string | null;
 }
@@ -45,6 +46,7 @@ interface IFondoRow {
     es_operativo: boolean;
     activo: boolean;
     visible_propietarios: boolean;
+    fecha_saldo: string | null;
 }
 
 interface IUsageRow {
@@ -73,6 +75,7 @@ interface CreateFondoBody {
     porcentaje: unknown;
     saldo_inicial: unknown;
     es_operativo?: boolean;
+    fecha_saldo?: string | null;
 }
 
 interface DeleteFondoBody {
@@ -81,6 +84,7 @@ interface DeleteFondoBody {
 
 interface RenameFondoBody {
     nombre?: string;
+    fecha_saldo?: string | null;
 }
 
 const asAuthUser = (value: unknown): AuthUser => {
@@ -103,6 +107,20 @@ const asString = (value: unknown): string => {
 
 const asError = (value: unknown): Error => {
     return value instanceof Error ? value : new Error(String(value));
+};
+
+const toIsoDateNullable = (value: unknown, fieldName: string): string | null => {
+    if (value === undefined) return null;
+    if (value === null) return null;
+    const raw = String(value).trim();
+    if (!raw) return null;
+
+    const ymd = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!ymd) throw new Error(`${fieldName} invalida. Use yyyy-mm-dd.`);
+    const safe = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+    const dt = new Date(`${safe}T00:00:00`);
+    if (Number.isNaN(dt.getTime())) throw new Error(`${fieldName} invalida. Use yyyy-mm-dd.`);
+    return safe;
 };
 
 const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocaleNumber }: AuthDependencies): void => {
@@ -145,7 +163,7 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 SET visible_propietarios = $1
                 WHERE id = $2
                   AND condominio_id = $3
-                RETURNING id, condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, activo, visible_propietarios
+                RETURNING id, condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, activo, visible_propietarios, fecha_saldo
                 `,
                 [visible, fondoId, condoId]
             );
@@ -193,9 +211,15 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
         try {
             const user = asAuthUser(req.user);
             const fondoId = asString(req.params.id);
+            const hasNombre = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'nombre');
+            const hasFechaSaldo = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'fecha_saldo');
             const nombre = String(req.body?.nombre || '').trim();
+            const fechaSaldoSafe = toIsoDateNullable(req.body?.fecha_saldo, 'fecha_saldo');
 
-            if (!nombre) {
+            if (!hasNombre && !hasFechaSaldo) {
+                return res.status(400).json({ status: 'error', message: 'Debe enviar nombre y/o fecha_saldo.' });
+            }
+            if (hasNombre && !nombre) {
                 return res.status(400).json({ status: 'error', message: 'El nombre del fondo es obligatorio.' });
             }
 
@@ -208,19 +232,21 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const updatedRes = await pool.query<IFondoRow>(
                 `
                 UPDATE fondos
-                SET nombre = $1
-                WHERE id = $2
-                  AND condominio_id = $3
-                RETURNING id, condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, activo, visible_propietarios
+                SET
+                  nombre = CASE WHEN $1::boolean THEN $2 ELSE nombre END,
+                  fecha_saldo = CASE WHEN $3::boolean THEN $4 ELSE fecha_saldo END
+                WHERE id = $5
+                  AND condominio_id = $6
+                RETURNING id, condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, activo, visible_propietarios, fecha_saldo
                 `,
-                [nombre, fondoId, condoId]
+                [hasNombre, nombre, hasFechaSaldo, fechaSaldoSafe, fondoId, condoId]
             );
 
             if (updatedRes.rows.length === 0) {
                 return res.status(404).json({ status: 'error', message: 'Fondo no encontrado.' });
             }
 
-            return res.json({ status: 'success', message: 'Nombre del fondo actualizado correctamente.' });
+            return res.json({ status: 'success', message: 'Fondo actualizado correctamente.' });
         } catch (err: unknown) {
             const error = asError(err);
             return res.status(500).json({ status: 'error', message: error.message });
@@ -231,13 +257,14 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
         const { cuenta_bancaria_id, nombre, moneda, porcentaje, saldo_inicial, es_operativo } = req.body;
         const porcNum = es_operativo ? 0 : parseLocaleNumber(porcentaje);
         const saldoNum = parseLocaleNumber(saldo_inicial);
+        const fechaSaldoSafe = toIsoDateNullable(req.body?.fecha_saldo, 'fecha_saldo');
 
         try {
             const user = asAuthUser(req.user);
             const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const fondo = await pool.query<IInsertedIdRow>(
-                'INSERT INTO fondos (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
-                [condoRes.rows[0].id, cuenta_bancaria_id, nombre, moneda, porcNum, saldoNum, es_operativo || false]
+                'INSERT INTO fondos (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, fecha_saldo) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
+                [condoRes.rows[0].id, cuenta_bancaria_id, nombre, moneda, porcNum, saldoNum, es_operativo || false, fechaSaldoSafe]
             );
 
             if (saldoNum !== 0) {

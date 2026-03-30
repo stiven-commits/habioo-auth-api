@@ -294,6 +294,7 @@ router.get('/mis-propiedades', verifyToken, async (req: Request, res: Response<A
               FROM pagos pa
               WHERE pa.propiedad_id = p.id
                 AND pa.estado = 'Validado'
+                AND COALESCE(pa.es_ajuste_historico, false) = false
             ), 0) AS saldo_calculado
         ) saldo_calc ON TRUE
         WHERE up.user_id = $1
@@ -465,6 +466,7 @@ router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Req
         FROM pagos p
         WHERE p.propiedad_id = $1
           AND p.estado = 'Validado'
+          AND COALESCE(p.es_ajuste_historico, false) = false
       `,
       [propiedadId],
     );
@@ -534,9 +536,15 @@ router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Req
             p_ajuste.tasa_cambio
           ) AS tasa_cambio,
           NULL::text AS estado_recibo,
-          (h.fecha AT TIME ZONE 'UTC') AS fecha_operacion,
+          COALESCE(
+            p_hist.fecha_pago::timestamp AT TIME ZONE 'America/Caracas',
+            (h.fecha AT TIME ZONE 'UTC')
+          ) AS fecha_operacion,
           (h.fecha AT TIME ZONE 'UTC') AS fecha_registro
         FROM historial_saldos_inmuebles h
+        LEFT JOIN pagos p_hist
+          ON p_hist.id = NULLIF((regexp_match(COALESCE(h.nota, ''), '#([0-9]+)'))[1], '')::int
+         AND p_hist.propiedad_id = h.propiedad_id
         LEFT JOIN LATERAL (
           SELECT
             COALESCE(p.monto_origen, 0)::numeric AS monto_origen,

@@ -346,12 +346,13 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                             WHERE h.propiedad_id = p.id
                         ), 0)
                         - COALESCE((
-                            SELECT SUM(COALESCE(pa.monto_usd, 0))
-                            FROM pagos pa
-                            WHERE pa.propiedad_id = p.id
-                              AND pa.estado = 'Validado'
-                        ), 0) AS saldo_calculado
-                ) saldo_calc ON TRUE
+                             SELECT SUM(COALESCE(pa.monto_usd, 0))
+                             FROM pagos pa
+                             WHERE pa.propiedad_id = p.id
+                               AND pa.estado = 'Validado'
+                               AND COALESCE(pa.es_ajuste_historico, false) = false
+                         ), 0) AS saldo_calculado
+                 ) saldo_calc ON TRUE
                 LEFT JOIN usuarios_propiedades up1 ON p.id = up1.propiedad_id AND up1.rol = 'Propietario' LEFT JOIN users u1 ON up1.user_id = u1.id 
                 LEFT JOIN usuarios_propiedades up2 ON p.id = up2.propiedad_id AND up2.rol = 'Inquilino' LEFT JOIN users u2 ON up2.user_id = u2.id
                 WHERE p.condominio_id = $1 ORDER BY p.identificador ASC
@@ -829,7 +830,9 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                       fecha_pago::timestamp AT TIME ZONE 'America/Caracas'
                     ) as fecha_registro
                  FROM pagos
-                 WHERE propiedad_id = $1 AND estado = 'Validado'`,
+                 WHERE propiedad_id = $1
+                   AND estado = 'Validado'
+                   AND COALESCE(es_ajuste_historico, false) = false`,
                 [propiedadId]
             );
 
@@ -890,9 +893,15 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                       p_ajuste.tasa_cambio
                     ) as tasa_cambio,
                     NULL::text as estado_recibo,
-                    (h.fecha AT TIME ZONE 'UTC') as fecha_operacion,
+                    COALESCE(
+                      p_hist.fecha_pago::timestamp AT TIME ZONE 'America/Caracas',
+                      (h.fecha AT TIME ZONE 'UTC')
+                    ) as fecha_operacion,
                     (h.fecha AT TIME ZONE 'UTC') as fecha_registro
                  FROM historial_saldos_inmuebles h
+                 LEFT JOIN pagos p_hist
+                   ON p_hist.id = NULLIF((regexp_match(COALESCE(h.nota, ''), '#([0-9]+)'))[1], '')::int
+                  AND p_hist.propiedad_id = h.propiedad_id
                  LEFT JOIN LATERAL (
                     SELECT
                       COALESCE(p.monto_origen, 0)::numeric AS monto_origen,

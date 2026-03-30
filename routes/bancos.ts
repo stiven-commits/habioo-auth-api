@@ -136,6 +136,11 @@ interface IFondoTransferRow {
     es_operativo: boolean;
 }
 
+interface IFondoFechaSaldoRow {
+    id: number;
+    fecha_saldo: string | null;
+}
+
 interface IAjusteRollbackMovimientoRow {
     id: number;
     fondo_id: number;
@@ -251,6 +256,18 @@ const toIsoDate = (value: unknown, fieldName: string): string => {
     throw new Error(`${fieldName} inválida. Use dd/mm/yyyy o yyyy-mm-dd.`);
 };
 
+const formatYmdToDmy = (ymd: string): string => {
+    const [y, m, d] = String(ymd || '').split('-');
+    if (!y || !m || !d) return ymd;
+    return `${d}/${m}/${y}`;
+};
+
+const toEpochDay = (ymd: string): number => {
+    const [y, m, d] = String(ymd || '').split('-').map((v) => parseInt(v, 10));
+    if (!y || !m || !d) return NaN;
+    return Date.UTC(y, m - 1, d);
+};
+
 const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
     const getMovimientoFondoTiposPermitidos = async (): Promise<string[]> => {
         try {
@@ -281,6 +298,27 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         }
         if (allowed.length > 0) return allowed[0] || fallback;
         return fallback;
+    };
+
+    const validarFechaVsAperturaFondo = async (fondoId: number, fechaMovimiento: string): Promise<void> => {
+        let r: { rows: IFondoFechaSaldoRow[] };
+        try {
+            r = await pool.query<IFondoFechaSaldoRow>(
+                'SELECT id, fecha_saldo::text AS fecha_saldo FROM fondos WHERE id = $1 LIMIT 1',
+                [fondoId]
+            );
+        } catch (err: unknown) {
+            const message = asError(err).message;
+            if (message.toLowerCase().includes('fecha_saldo')) return;
+            throw err;
+        }
+        const fechaSaldo = r.rows[0]?.fecha_saldo || null;
+        if (!fechaSaldo) return;
+        const movDay = toEpochDay(fechaMovimiento);
+        const saldoDay = toEpochDay(fechaSaldo);
+        if (Number.isFinite(movDay) && Number.isFinite(saldoDay) && movDay < saldoDay) {
+            throw new Error(`No está permitido este registro porque es previo a la fecha ${formatYmdToDmy(fechaSaldo)} registrada en la apertura del fondo.`);
+        }
     };
 
     app.get('/bancos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
@@ -654,6 +692,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         CASE
                             WHEN p.id IS NOT NULL THEN NULLIF(BTRIM(COALESCE(p.referencia, '')), '')
                             WHEN mf.tipo = 'AJUSTE_INICIAL'
+                                 AND COALESCE(mf.nota, '') ILIKE 'Saldo de apertura del fondo%'
+                                THEN 'APERTURA'
+                            WHEN mf.tipo = 'AJUSTE_INICIAL'
                                  AND (
                                      COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
                                      OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
@@ -677,10 +718,13 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                     END
                                 )
                             WHEN mf.tipo = 'AJUSTE_INICIAL'
+                                 AND COALESCE(mf.nota, '') ILIKE 'Saldo de apertura del fondo%'
+                                THEN ('Saldo de apertura del fondo - Fondo: ' || COALESCE(f.nombre, 'N/A'))
+                            WHEN mf.tipo = 'AJUSTE_INICIAL'
                                  AND (
-                                      COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
-                                      OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
-                                 )
+                                       COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                       OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                                  )
                                 THEN COALESCE(NULLIF(BTRIM(mf.nota), ''), ('Ajuste en fondo: ' || COALESCE(f.nombre, 'N/A')))
                             WHEN COALESCE(mf.nota, '') ILIKE 'Ingreso alquiler%'
                                 THEN COALESCE(NULLIF(BTRIM(mf.nota), ''), ('Ingreso por alquiler - Fondo: ' || COALESCE(f.nombre, 'N/A')))
@@ -729,6 +773,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         OR (
                             mf.tipo = 'AJUSTE_INICIAL'
                             AND (
+                                COALESCE(mf.nota, '') ILIKE 'Saldo de apertura del fondo%'
+                                OR
                                 COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%'
                                 OR COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
                                 OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
@@ -769,6 +815,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     LEFT JOIN fondos f ON f.id = mf.fondo_id AND f.cuenta_bancaria_id = $1
                     WHERE p.cuenta_bancaria_id = $1
                       AND p.estado = 'Validado'
+                      AND COALESCE(p.es_ajuste_historico, false) = false
                       AND (
                         mf.id IS NULL
                         OR mf.tipo IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
@@ -825,6 +872,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     LEFT JOIN ingresos_distribuidos_por_pago idp ON idp.pago_id = p.id
                     WHERE p.cuenta_bancaria_id = $1
                       AND p.estado = 'Validado'
+                      AND COALESCE(p.es_ajuste_historico, false) = false
                       AND (
                           CASE
                               WHEN UPPER(COALESCE(p.moneda, '')) = 'BS'
@@ -1172,7 +1220,14 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             return res.json({ status: 'success', message: 'Ajuste revertido correctamente.' });
         } catch (err: unknown) {
             await pool.query('ROLLBACK');
-            return res.status(500).json({ status: 'error', message: asError(err).message });
+            const message = asError(err).message;
+            const businessError =
+                message.includes('No está permitido este registro') ||
+                message.includes('tasa BCV') ||
+                message.includes('Saldo insuficiente') ||
+                message.includes('no encontrada') ||
+                message.includes('no encontrado');
+            return res.status(businessError ? 400 : 500).json({ status: 'error', message });
         }
     });
 
@@ -1377,6 +1432,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 await pool.query('ROLLBACK');
                 return res.status(404).json({ status: 'error', message: 'Fondo no encontrado para la cuenta seleccionada.' });
             }
+            await validarFechaVsAperturaFondo(fondoId, fechaSafe);
 
             const cuenta = cuentaRes.rows[0];
             const fondo = fondoRes.rows[0];
@@ -1523,6 +1579,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 throw new Error('Fondo de origen no encontrado o no pertenece al condominio.');
             }
             const fondoOrigen = origenRes.rows[0];
+            await validarFechaVsAperturaFondo(fondoOrigenIdSafe, fechaSafe);
 
             const sourceBalanceRes = await pool.query<{ saldo_actual: number | string }>(
                 'SELECT saldo_actual FROM fondos WHERE id = $1 AND condominio_id = $2 LIMIT 1',
@@ -1559,6 +1616,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 const destinoFunds = destinoFundsRes.rows.filter((f) => f.id !== fondoOrigenIdSafe);
                 if (destinoFunds.length === 0) {
                     throw new Error(`La cuenta destino no tiene fondos activos en moneda ${fondoOrigen.moneda}.`);
+                }
+                for (const f of destinoFunds) {
+                    await validarFechaVsAperturaFondo(f.id, fechaSafe);
                 }
 
                 const noOperativos = destinoFunds.filter((f) => !f.es_operativo);
@@ -1601,6 +1661,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 }
             } else {
                 const fondoDestinoIdSafe = asPositiveInt(fondo_destino_id, 'fondo_destino_id');
+                await validarFechaVsAperturaFondo(fondoDestinoIdSafe, fechaSafe);
                 await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [montoDestinoSafe, fondoDestinoIdSafe]);
                 await pool.query(
                     `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
@@ -1614,7 +1675,13 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         } catch (err: unknown) {
             const error = asError(err);
             await pool.query('ROLLBACK');
-            res.status(500).json({ error: error.message });
+            const businessError =
+                error.message.includes('No está permitido este registro') ||
+                error.message.includes('no encontrado') ||
+                error.message.includes('Debe seleccionar') ||
+                error.message.includes('saldo suficiente') ||
+                error.message.includes('monto de transferencia');
+            res.status(businessError ? 400 : 500).json({ error: error.message });
         }
     });
 

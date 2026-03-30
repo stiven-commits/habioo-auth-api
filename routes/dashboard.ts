@@ -673,12 +673,12 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
 
             await pool.query(
                 `INSERT INTO fondos
-                    (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo)
+                    (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, fecha_saldo)
                  VALUES
-                    ($1, $2, '[TEST] Fondo Operativo Principal Bs', 'BS', 0, 8000, true),
-                    ($1, $3, '[TEST] Fondo Caja Chica Bs', 'BS', 0, 2500, false),
-                    ($1, $4, '[TEST] Fondo Reserva General Bs', 'BS', 0, 3200, false),
-                    ($1, $5, '[TEST] Fondo USD', 'USD', 0, 1500, false)`,
+                    ($1, $2, '[TEST] Fondo Operativo Principal Bs', 'BS', 0, 8000, true, '2026-03-22'),
+                    ($1, $3, '[TEST] Fondo Caja Chica Bs', 'BS', 0, 2500, false, '2026-03-22'),
+                    ($1, $4, '[TEST] Fondo Reserva General Bs', 'BS', 0, 3200, false, '2026-03-22'),
+                    ($1, $5, '[TEST] Fondo USD', 'USD', 0, 1500, false, '2026-03-22')`,
                 [
                     condoId,
                     cuentaPrincipalBs.rows[0].id,

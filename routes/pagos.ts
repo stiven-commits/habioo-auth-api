@@ -98,6 +98,7 @@ interface IPagoFullRow {
     referencia: string | null;
     created_at?: string | Date | null;
     recibo_id?: number | null;
+    es_ajuste_historico?: boolean;
 }
 
 interface IPagoPendienteAdminRow {
@@ -113,6 +114,7 @@ interface IPagoPendienteAdminRow {
     fecha_pago: string | Date | null;
     estado: string;
     nota: string | null;
+    es_ajuste_historico?: boolean;
 }
 
 interface IRechazarPagoBody {
@@ -257,6 +259,18 @@ const toIsoDate = (value: unknown, fieldName: string): string => {
     throw new Error(`${fieldName} inválida. Use dd/mm/yyyy o yyyy-mm-dd.`);
 };
 
+const formatYmdToDmy = (ymd: string): string => {
+    const [y, m, d] = String(ymd || '').split('-');
+    if (!y || !m || !d) return ymd;
+    return `${d}/${m}/${y}`;
+};
+
+const toEpochDay = (ymd: string): number => {
+    const [y, m, d] = String(ymd || '').split('-').map((v) => parseInt(v, 10));
+    if (!y || !m || !d) return NaN;
+    return Date.UTC(y, m - 1, d);
+};
+
 const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleNumber, getPagosOptionalColumns }: AuthDependencies): void => {
     const resolveMovimientoFondoTipo = async (preferred: string[], fallback: string): Promise<string> => {
         try {
@@ -281,19 +295,56 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
     const round2 = (n: unknown): number => parseFloat((parseFloat(String(n || 0))).toFixed(2));
 
-    const getPagosColumns = async (): Promise<OptionalPagosColumns & { propiedad_id: boolean }> => {
+    const getPagosColumns = async (): Promise<OptionalPagosColumns & { propiedad_id: boolean; es_ajuste_historico: boolean }> => {
         const optionalCols = await getPagosOptionalColumns();
         try {
             const result = await pool.query<IColumnNameRow>(`
                 SELECT column_name
                 FROM information_schema.columns
                 WHERE table_name = 'pagos'
-                  AND column_name IN ('propiedad_id')
+                  AND column_name IN ('propiedad_id', 'es_ajuste_historico')
             `);
             const cols = new Set(result.rows.map((r) => r.column_name));
-            return { ...optionalCols, propiedad_id: cols.has('propiedad_id') };
+            return {
+                ...optionalCols,
+                propiedad_id: cols.has('propiedad_id'),
+                es_ajuste_historico: cols.has('es_ajuste_historico'),
+            };
         } catch (_err) {
-            return { ...optionalCols, propiedad_id: false };
+            return { ...optionalCols, propiedad_id: false, es_ajuste_historico: false };
+        }
+    };
+
+    const getCuentaFechaLimiteSaldo = async (cuentaId: number): Promise<string | null> => {
+        try {
+            const r = await pool.query<{ fecha_limite: string | null }>(
+                `
+                SELECT MAX(fecha_saldo)::text AS fecha_limite
+                FROM fondos
+                WHERE cuenta_bancaria_id = $1
+                  AND fecha_saldo IS NOT NULL
+                `,
+                [cuentaId]
+            );
+            return r.rows[0]?.fecha_limite || null;
+        } catch (err: unknown) {
+            const message = asError(err).message;
+            if (message.toLowerCase().includes('fecha_saldo')) return null;
+            throw err;
+        }
+    };
+
+    const getFondoFechaSaldo = async (fondoId: number): Promise<string | null> => {
+        try {
+            const r = await pool.query<{ fecha_saldo: string | null }>(
+                'SELECT fecha_saldo::text AS fecha_saldo FROM fondos WHERE id = $1 LIMIT 1',
+                [fondoId]
+            );
+            return r.rows[0]?.fecha_saldo || null;
+        } catch (err: unknown) {
+            const message = asError(err).message;
+            if (message.toLowerCase().includes('fecha_saldo')) return null;
+            throw err;
         }
     };
 
@@ -689,12 +740,29 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             await pool.query('BEGIN');
 
             // 1. Calculamos montos normalizados.
+            const cuentaIdNum = parseInt(String(cuenta_id), 10);
+            if (!Number.isFinite(cuentaIdNum) || cuentaIdNum <= 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', error: 'cuenta_id invalido.' });
+            }
             const monedaFinal = moneda || 'BS';
             const metodoFinal = String(metodo || 'Transferencia').trim() || 'Transferencia';
             const montoOrigenNum = parseLocaleNumber(monto_origen);
             const tasaNum = monedaFinal === 'BS' ? (parseLocaleNumber(tasa_cambio) || 1) : 1;
             const montoUsd = monedaFinal === 'BS' ? round2(montoOrigenNum / tasaNum) : round2(montoOrigenNum);
             const fechaPagoSafe = toIsoDate(fecha_pago || new Date(), 'fecha_pago');
+            const fechaLimiteSaldo = await getCuentaFechaLimiteSaldo(cuentaIdNum);
+            if (fechaLimiteSaldo) {
+                const pagoDay = toEpochDay(fechaPagoSafe);
+                const limiteDay = toEpochDay(fechaLimiteSaldo);
+                if (Number.isFinite(pagoDay) && Number.isFinite(limiteDay) && pagoDay < limiteDay) {
+                    await pool.query('ROLLBACK');
+                    return res.status(400).json({
+                        status: 'error',
+                        message: `No está permitido este registro porque es previo a la fecha ${formatYmdToDmy(fechaLimiteSaldo)} registrada en la apertura del fondo.`,
+                    });
+                }
+            }
 
             // 2. Insertamos el pago ya Validado (registro administrativo).
             const optionalCols = await getPagosColumns();
@@ -723,7 +791,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const insertValues: unknown[] = [
                 propiedad_id,
                 null,
-                cuenta_id,
+                cuentaIdNum,
                 montoOrigenNum,
                 monedaFinal === 'BS' ? tasaNum : null,
                 montoUsd,
@@ -847,12 +915,24 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
             await pool.query('BEGIN');
 
+            const cuentaIdNum = parseInt(String(cuenta_id), 10);
+            if (!Number.isFinite(cuentaIdNum) || cuentaIdNum <= 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', error: 'cuenta_id invalido.' });
+            }
             const monedaFinal = moneda || 'BS';
             const metodoFinal = String(metodo || 'Transferencia').trim() || 'Transferencia';
             const montoOrigenNum = parseLocaleNumber(monto_origen);
             const tasaNum = monedaFinal === 'BS' ? (parseLocaleNumber(tasa_cambio) || 1) : 1;
             const montoUsd = monedaFinal === 'BS' ? round2(montoOrigenNum / tasaNum) : round2(montoOrigenNum);
             const fechaPagoSafe = toIsoDate(fecha_pago || new Date(), 'fecha_pago');
+            const fechaLimiteSaldo = await getCuentaFechaLimiteSaldo(cuentaIdNum);
+            const esAjusteHistorico = Boolean(
+                fechaLimiteSaldo
+                && Number.isFinite(toEpochDay(fechaPagoSafe))
+                && Number.isFinite(toEpochDay(fechaLimiteSaldo))
+                && toEpochDay(fechaPagoSafe) < toEpochDay(fechaLimiteSaldo)
+            );
 
             const optionalCols = await getPagosColumns();
             const bancoOrigenSafe = (banco_origen || '').trim();
@@ -884,7 +964,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const insertValues: unknown[] = [
                 propiedadIdNum,
                 reciboSafe,
-                cuenta_id,
+                cuentaIdNum,
                 montoOrigenNum,
                 monedaFinal === 'BS' ? tasaNum : null,
                 montoUsd,
@@ -911,6 +991,10 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 insertColumns.push('telefono_origen');
                 insertValues.push(telefonoOrigenSafe || null);
             }
+            if (optionalCols.es_ajuste_historico) {
+                insertColumns.push('es_ajuste_historico');
+                insertValues.push(esAjusteHistorico);
+            }
 
             const placeholders = insertValues.map((_, i) => `$${i + 1}`).join(', ');
             await pool.query(
@@ -919,7 +1003,13 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             );
 
             await pool.query('COMMIT');
-            return res.json({ status: 'success', message: 'Pago enviado para aprobacion de la junta.' });
+            return res.json({
+                status: 'success',
+                es_ajuste_historico: esAjusteHistorico,
+                message: esAjusteHistorico
+                    ? 'Hemos recibido la información de tu pago. Debido a que corresponde a un periodo anterior a la apertura de los fondos actuales del sistema, este registro será gestionado como un ajuste especial de saldo. Una vez validado por la Junta de Condominio, verás el descuento reflejado correctamente en tu histórico.'
+                    : 'Pago enviado para aprobacion de la junta.',
+            });
         } catch (err: unknown) {
             const error = asError(err);
             await pool.query('ROLLBACK');
@@ -936,6 +1026,10 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const whereByPropiedad = Number.isFinite(propiedadIdRaw) && propiedadIdRaw > 0 ? 'AND p.id = $2' : '';
             const params: Array<number> = [user.id];
             if (whereByPropiedad) params.push(propiedadIdRaw);
+            const pagosCols = await getPagosColumns();
+            const ajusteHistoricoExpr = pagosCols.es_ajuste_historico
+                ? 'COALESCE(pa.es_ajuste_historico, false)'
+                : 'false';
 
             const r = await pool.query<IPagoPendienteAdminRow>(
                 `
@@ -951,7 +1045,8 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                     pa.referencia,
                     pa.fecha_pago,
                     pa.estado,
-                    pa.nota
+                    pa.nota,
+                    ${ajusteHistoricoExpr} AS es_ajuste_historico
                   FROM pagos pa
                   INNER JOIN propiedades p ON p.id = pa.propiedad_id
                   INNER JOIN condominios c ON c.id = p.condominio_id
@@ -990,9 +1085,13 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const user = asAuthUser(req.user);
 
             await pool.query('BEGIN');
+            const pagosCols = await getPagosColumns();
+            const ajusteHistoricoExpr = pagosCols.es_ajuste_historico
+                ? 'COALESCE(es_ajuste_historico, false)'
+                : 'false';
 
             const pagoRes = await pool.query<IPagoFullRow>(
-                "SELECT id, monto_usd, monto_origen, tasa_cambio, propiedad_id, estado, cuenta_bancaria_id, moneda, referencia FROM pagos WHERE id = $1 AND estado IN ('Pendiente', 'PendienteAprobacion')",
+                `SELECT id, monto_usd, monto_origen, tasa_cambio, propiedad_id, estado, cuenta_bancaria_id, moneda, referencia, ${ajusteHistoricoExpr} AS es_ajuste_historico FROM pagos WHERE id = $1 AND estado IN ('Pendiente', 'PendienteAprobacion')`,
                 [pagoId]
             );
             if (pagoRes.rows.length === 0) throw new Error('Pago no encontrado o ya fue procesado.');
@@ -1004,7 +1103,32 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             }
 
             await pool.query("UPDATE pagos SET estado = 'Validado' WHERE id = $1", [pagoId]);
-            await aplicarPagoEnCascada(pool, pago);
+            if (pago.es_ajuste_historico) {
+                const montoUsd = round2(parseFloat(String(pago.monto_usd || 0)));
+                const montoBsRaw = parseFloat(String(pago.monto_origen ?? 0));
+                const tasaRaw = parseFloat(String(pago.tasa_cambio ?? 0));
+                const montoBs = Number.isFinite(montoBsRaw) && montoBsRaw > 0 ? round2(montoBsRaw) : null;
+                const tasaCambio = Number.isFinite(tasaRaw) && tasaRaw > 0 ? tasaRaw : null;
+                if (montoUsd > 0) {
+                    await pool.query(
+                        'UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2',
+                        [montoUsd, pago.propiedad_id]
+                    );
+                    await pool.query(
+                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, monto_bs, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5, $6)',
+                        [
+                            pago.propiedad_id,
+                            'AGREGAR_FAVOR',
+                            montoUsd,
+                            montoBs,
+                            tasaCambio,
+                            `[Ajuste Histórico] Pago previo a apertura${pago.referencia ? ` (Ref: ${pago.referencia})` : ''}${pago.id ? ` #${pago.id}` : ''}`,
+                        ]
+                    );
+                }
+            } else {
+                await aplicarPagoEnCascada(pool, pago);
+            }
 
             await pool.query('COMMIT');
             res.json({ status: 'success', message: 'Pago aprobado y saldos distribuidos en cascada correctamente.' });
@@ -1483,6 +1607,16 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                     referencia: referenciaOrigen || 'N/A',
                 };
             });
+            for (const origen of origenesNormalizados) {
+                if (!origen.fondoId) continue;
+                const fechaSaldo = await getFondoFechaSaldo(origen.fondoId);
+                if (!fechaSaldo) continue;
+                const pagoDay = toEpochDay(fechaPagoSafe);
+                const limiteDay = toEpochDay(fechaSaldo);
+                if (Number.isFinite(pagoDay) && Number.isFinite(limiteDay) && pagoDay < limiteDay) {
+                    throw new Error(`No está permitido este registro porque es previo a la fecha ${formatYmdToDmy(fechaSaldo)} registrada en la apertura del fondo.`);
+                }
+            }
 
             const montoTotalPagoUsd = round2(
                 origenesNormalizados.reduce((acc: number, origen) => acc + origen.montoUsd, 0)
@@ -1679,6 +1813,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const error = asError(err);
             if (txStarted) await pool.query('ROLLBACK');
             const isBusinessError =
+                error.message.includes('No está permitido este registro') ||
                 error.message.includes('monto_') ||
                 error.message.includes('tasa_cambio') ||
                 error.message.includes('cuenta_bancaria_id') ||
