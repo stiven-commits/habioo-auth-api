@@ -696,9 +696,10 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                 THEN 'APERTURA'
                             WHEN mf.tipo = 'AJUSTE_INICIAL'
                                  AND (
-                                     COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
-                                     OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
-                                 )
+                                      COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                      OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                                      OR hsi.id IS NOT NULL
+                                  )
                                 THEN COALESCE(
                                     CASE
                                         WHEN hsi.id IS NOT NULL THEN ('AJ-' || hsi.id::text)
@@ -722,10 +723,34 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                 THEN ('Saldo de apertura del fondo - Fondo: ' || COALESCE(f.nombre, 'N/A'))
                             WHEN mf.tipo = 'AJUSTE_INICIAL'
                                  AND (
-                                       COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
-                                       OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
-                                  )
-                                THEN COALESCE(NULLIF(BTRIM(mf.nota), ''), ('Ajuste en fondo: ' || COALESCE(f.nombre, 'N/A')))
+                                        COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                        OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                                        OR hsi.id IS NOT NULL
+                                   )
+                                THEN COALESCE(
+                                    NULLIF(
+                                        BTRIM(
+                                            regexp_replace(
+                                                regexp_replace(
+                                                    regexp_replace(
+                                                        COALESCE(mf.nota, ''),
+                                                        '(?i)[[:space:]]*\\|[[:space:]]*\\[bs_raw:[^]]+\\]',
+                                                        '',
+                                                        'g'
+                                                    ),
+                                                    '(?i)[[:space:]]*\\|[[:space:]]*\\[tasa_raw:[^]]+\\]',
+                                                    '',
+                                                    'g'
+                                                ),
+                                                '(?i)[[:space:]]*\\|[[:space:]]*ajuste_historial_id:[0-9]+',
+                                                '',
+                                                'g'
+                                            )
+                                        ),
+                                        ''
+                                    ),
+                                    ('Ajuste en fondo: ' || COALESCE(f.nombre, 'N/A'))
+                                )
                             WHEN COALESCE(mf.nota, '') ILIKE 'Ingreso alquiler%'
                                 THEN COALESCE(NULLIF(BTRIM(mf.nota), ''), ('Ingreso por alquiler - Fondo: ' || COALESCE(f.nombre, 'N/A')))
                             ELSE ('Ingreso distribuido en fondo: ' || COALESCE(f.nombre, 'N/A'))
@@ -770,17 +795,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     WHERE f.cuenta_bancaria_id = $1
                       AND (
                         mf.tipo IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
-                        OR (
-                            mf.tipo = 'AJUSTE_INICIAL'
-                            AND (
-                                COALESCE(mf.nota, '') ILIKE 'Saldo de apertura del fondo%'
-                                OR
-                                COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%'
-                                OR COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
-                                OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
-                                OR COALESCE(mf.nota, '') ILIKE 'Ingreso alquiler%'
-                            )
-                        )
+                        OR mf.tipo = 'AJUSTE_INICIAL'
                       )
                 ),
                 ingresos_distribuidos_por_pago AS (
@@ -819,14 +834,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                       AND (
                         mf.id IS NULL
                         OR mf.tipo IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
-                        OR (
-                            mf.tipo = 'AJUSTE_INICIAL'
-                            AND (
-                                COALESCE(mf.nota, '') ILIKE 'Abono distribuible de pago%'
-                                OR COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
-                                OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
-                            )
-                        )
+                        OR mf.tipo = 'AJUSTE_INICIAL'
                       )
                     GROUP BY p.id
                 ),
@@ -984,7 +992,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     JOIN fondos f ON f.id = mf.fondo_id
                     WHERE f.cuenta_bancaria_id = $1
                       AND UPPER(COALESCE(mf.tipo, '')) IN ('EGRESO', 'EGRESO_GASTO', 'SALIDA', 'DEBITO', 'DESCUENTO')
-                      AND COALESCE(mf.nota, '') ILIKE 'Egreso manual libro mayor%'
+                      AND mf.referencia_id IS NULL
                 ),
                 transferencias_cuentas AS (
                     SELECT
