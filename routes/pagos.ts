@@ -212,6 +212,26 @@ interface GastoMontoRow {
     monto_pagado_usd: number | string;
 }
 
+interface IPagoProveedorRollbackRow {
+    id: number;
+    gasto_id: number;
+    monto_bs: number | string | null;
+    tasa_cambio: number | string | null;
+    monto_usd: number | string;
+    fecha_pago: string | Date;
+    referencia: string | null;
+    condominio_id: number;
+}
+
+interface IGastoPagoFondoRollbackRow {
+    id: number;
+    fondo_id: number | null;
+    fondo_moneda: string | null;
+    monto_pagado_usd: number | string;
+    cuenta_bancaria_id: number | null;
+    monto_bs: number | string | null;
+}
+
 const asAuthUser = (value: unknown): AuthUser => {
     if (
         typeof value !== 'object' ||
@@ -1317,6 +1337,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 SELECT id, fondo_id, monto
                 FROM movimientos_fondos
                 WHERE referencia_id = $1
+                  AND UPPER(COALESCE(tipo, '')) IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
                 ORDER BY id ASC
                 `,
                 [pago.id]
@@ -1333,7 +1354,14 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 );
             }
 
-            await pool.query('DELETE FROM movimientos_fondos WHERE referencia_id = $1', [pago.id]);
+            await pool.query(
+                `
+                DELETE FROM movimientos_fondos
+                WHERE referencia_id = $1
+                  AND UPPER(COALESCE(tipo, '')) IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
+                `,
+                [pago.id]
+            );
             await pool.query(
                 'UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2',
                 [round2(parseLocaleNumber(pago.monto_usd)), pago.propiedad_id]
@@ -1342,6 +1370,227 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
             await pool.query('COMMIT');
             return res.json({ status: 'success', message: 'Pago revertido correctamente.' });
+        } catch (err: unknown) {
+            await pool.query('ROLLBACK');
+            return res.status(500).json({ status: 'error', message: asError(err).message });
+        }
+    });
+
+    app.post('/pagos-proveedores/:id/rollback', verifyToken, async (req: Request<PagoValidarParams>, res: Response, _next: NextFunction) => {
+        const pagoProveedorId = parseInt(asString(req.params.id), 10);
+        if (!Number.isFinite(pagoProveedorId) || pagoProveedorId <= 0) {
+            return res.status(400).json({ status: 'error', message: 'ID de pago proveedor inválido.' });
+        }
+
+        try {
+            const user = asAuthUser(req.user);
+            await pool.query('BEGIN');
+
+            const pagoRes = await pool.query<IPagoProveedorRollbackRow>(
+                `
+                SELECT
+                    pp.id,
+                    pp.gasto_id,
+                    pp.monto_bs,
+                    pp.tasa_cambio,
+                    pp.monto_usd,
+                    pp.fecha_pago,
+                    pp.referencia,
+                    g.condominio_id
+                FROM pagos_proveedores pp
+                JOIN gastos g ON g.id = pp.gasto_id
+                JOIN condominios c ON c.id = g.condominio_id
+                WHERE pp.id = $1
+                  AND c.admin_user_id = $2
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [pagoProveedorId, user.id]
+            );
+
+            if (pagoRes.rows.length === 0) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Pago a proveedor no encontrado.' });
+            }
+            const pago = pagoRes.rows[0];
+
+            const cuentaSaldoColRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'cuentas_bancarias'
+                  AND column_name IN ('saldo_actual', 'saldo')
+                LIMIT 1
+                `
+            );
+            const cuentaSaldoCol = cuentaSaldoColRes.rows[0]?.column_name || null;
+
+            const gpfColsRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'gastos_pagos_fondos'
+                  AND column_name IN ('pago_proveedor_id', 'cuenta_bancaria_id', 'monto_bs', 'referencia')
+                `
+            );
+            const gpfCols = new Set(gpfColsRes.rows.map((r) => r.column_name));
+            const hasPagoProveedorId = gpfCols.has('pago_proveedor_id');
+            const hasCuentaBancariaId = gpfCols.has('cuenta_bancaria_id');
+            const hasMontoBs = gpfCols.has('monto_bs');
+            const hasReferencia = gpfCols.has('referencia');
+            const cuentaExpr = hasCuentaBancariaId ? 'gpf.cuenta_bancaria_id' : 'NULL::int';
+            const montoBsExpr = hasMontoBs ? 'gpf.monto_bs' : 'NULL::numeric';
+            const refFilter = hasReferencia
+                ? 'AND COALESCE(NULLIF(BTRIM(gpf.referencia), \'\'), \'\') = COALESCE(NULLIF(BTRIM(pp.referencia), \'\'), \'\')'
+                : '';
+
+            const gpfQuery = hasPagoProveedorId
+                ? `
+                SELECT
+                    gpf.id,
+                    gpf.fondo_id,
+                    f.moneda AS fondo_moneda,
+                    gpf.monto_pagado_usd,
+                    ${cuentaExpr} AS cuenta_bancaria_id,
+                    ${montoBsExpr} AS monto_bs
+                FROM gastos_pagos_fondos gpf
+                LEFT JOIN fondos f ON f.id = gpf.fondo_id
+                WHERE gpf.pago_proveedor_id = $1
+                ORDER BY gpf.id ASC
+                FOR UPDATE
+                `
+                : `
+                SELECT
+                    gpf.id,
+                    gpf.fondo_id,
+                    f.moneda AS fondo_moneda,
+                    gpf.monto_pagado_usd,
+                    ${cuentaExpr} AS cuenta_bancaria_id,
+                    ${montoBsExpr} AS monto_bs
+                FROM gastos_pagos_fondos gpf
+                LEFT JOIN fondos f ON f.id = gpf.fondo_id
+                JOIN pagos_proveedores pp ON pp.id = $1
+                WHERE gpf.gasto_id = pp.gasto_id
+                  AND gpf.fecha_pago::date = pp.fecha_pago::date
+                  ${refFilter}
+                ORDER BY gpf.id ASC
+                FOR UPDATE
+                `;
+
+            const gpfRes = await pool.query<IGastoPagoFondoRollbackRow>(gpfQuery, [pagoProveedorId]);
+            if (gpfRes.rows.length === 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'No se encontraron detalles del pago en gastos_pagos_fondos para revertirlo con seguridad.',
+                });
+            }
+
+            const movimientosRes = await pool.query<IMovimientoFondoPagoRow>(
+                `
+                SELECT id, fondo_id, monto
+                FROM movimientos_fondos
+                WHERE referencia_id = $1
+                  AND UPPER(COALESCE(tipo, '')) IN ('EGRESO', 'EGRESO_GASTO', 'SALIDA', 'DEBITO', 'DESCUENTO', 'PAGO_PROVEEDOR', 'EGRESO_PAGO')
+                ORDER BY id ASC
+                `,
+                [pagoProveedorId]
+            );
+
+            const restoreByMovimiento = new Map<number, number>();
+            for (const mov of movimientosRes.rows) {
+                const fondoId = parseInt(String(mov.fondo_id), 10);
+                if (!Number.isFinite(fondoId) || fondoId <= 0) continue;
+                const monto = round2(parseLocaleNumber(mov.monto));
+                if (monto <= 0) continue;
+                restoreByMovimiento.set(fondoId, round2((restoreByMovimiento.get(fondoId) || 0) + monto));
+            }
+
+            const tasaFallback = round2(parseLocaleNumber(pago.tasa_cambio || 0));
+            const restoreByGpf = new Map<number, number>();
+            for (const row of gpfRes.rows) {
+                const fondoId = row.fondo_id ? parseInt(String(row.fondo_id), 10) : NaN;
+                if (!Number.isFinite(fondoId) || fondoId <= 0) continue;
+                const monedaFondo = String(row.fondo_moneda || '').toUpperCase();
+                const montoUsd = round2(parseLocaleNumber(row.monto_pagado_usd || 0));
+                const montoBs = round2(parseLocaleNumber(row.monto_bs || 0));
+                let restore = 0;
+                if (monedaFondo === 'USD') {
+                    restore = montoUsd;
+                } else {
+                    restore = montoBs > 0 ? montoBs : (montoUsd > 0 && tasaFallback > 0 ? round2(montoUsd * tasaFallback) : 0);
+                }
+                if (restore <= 0) continue;
+                restoreByGpf.set(fondoId, round2((restoreByGpf.get(fondoId) || 0) + restore));
+            }
+
+            const finalRestoreByFondo = new Map<number, number>();
+            for (const [fondoId, monto] of restoreByGpf.entries()) {
+                finalRestoreByFondo.set(fondoId, monto);
+            }
+            for (const [fondoId, monto] of restoreByMovimiento.entries()) {
+                finalRestoreByFondo.set(fondoId, monto);
+            }
+
+            for (const [fondoId, monto] of finalRestoreByFondo.entries()) {
+                await pool.query(
+                    `
+                    UPDATE fondos
+                    SET saldo_actual = COALESCE(saldo_actual, 0) + $1
+                    WHERE id = $2
+                    `,
+                    [monto, fondoId]
+                );
+            }
+
+            if (movimientosRes.rows.length > 0) {
+                await pool.query(
+                    `
+                    DELETE FROM movimientos_fondos
+                    WHERE referencia_id = $1
+                      AND UPPER(COALESCE(tipo, '')) IN ('EGRESO', 'EGRESO_GASTO', 'SALIDA', 'DEBITO', 'DESCUENTO', 'PAGO_PROVEEDOR', 'EGRESO_PAGO')
+                    `,
+                    [pagoProveedorId]
+                );
+            }
+
+            if (cuentaSaldoCol) {
+                const cuentasTotales = new Map<number, number>();
+                for (const row of gpfRes.rows) {
+                    const cuentaId = row.cuenta_bancaria_id;
+                    if (!Number.isFinite(cuentaId as number) || !cuentaId) continue;
+                    const montoBs = round2(parseLocaleNumber(row.monto_bs || 0));
+                    if (montoBs <= 0) continue;
+                    cuentasTotales.set(cuentaId, round2((cuentasTotales.get(cuentaId) || 0) + montoBs));
+                }
+                for (const [cuentaId, montoBs] of cuentasTotales.entries()) {
+                    await pool.query(
+                        `UPDATE cuentas_bancarias SET ${cuentaSaldoCol} = COALESCE(${cuentaSaldoCol}, 0) + $1 WHERE id = $2`,
+                        [montoBs, cuentaId]
+                    );
+                }
+            }
+
+            const gpfIds = gpfRes.rows.map((r) => r.id).filter((id) => Number.isFinite(id));
+            if (gpfIds.length > 0) {
+                await pool.query('DELETE FROM gastos_pagos_fondos WHERE id = ANY($1::int[])', [gpfIds]);
+            }
+
+            await pool.query(
+                `
+                UPDATE gastos
+                SET monto_pagado_usd = GREATEST(0, COALESCE(monto_pagado_usd, 0) - $1)
+                WHERE id = $2
+                `,
+                [round2(parseLocaleNumber(pago.monto_usd)), pago.gasto_id]
+            );
+
+            await pool.query('DELETE FROM pagos_proveedores WHERE id = $1', [pagoProveedorId]);
+
+            await pool.query('COMMIT');
+            return res.json({ status: 'success', message: 'Pago a proveedor revertido correctamente.' });
         } catch (err: unknown) {
             await pool.query('ROLLBACK');
             return res.status(500).json({ status: 'error', message: asError(err).message });

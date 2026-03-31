@@ -1,5 +1,5 @@
 ﻿import type { Application, NextFunction, Request, Response } from 'express';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 
 interface AuthUser {
     id: number;
@@ -611,7 +611,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND (
-                    (table_name = 'gastos_pagos_fondos' AND column_name IN ('id', 'cuenta_bancaria_id', 'referencia', 'monto_bs', 'tasa_cambio'))
+                    (table_name = 'gastos_pagos_fondos' AND column_name IN ('id', 'cuenta_bancaria_id', 'referencia', 'monto_bs', 'tasa_cambio', 'nota', 'pago_proveedor_id'))
                     OR
                     (table_name = 'pagos_proveedores' AND column_name IN ('cuenta_bancaria_id'))
                     OR
@@ -650,6 +650,23 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const gpfTasaExpr = hasGpfTasaCambio
                 ? 'gpf.tasa_cambio'
                 : 'pp_match.tasa_cambio';
+            const gpfNotaExpr = hasCol('gastos_pagos_fondos', 'nota')
+                ? 'COALESCE(NULLIF(BTRIM(gpf.nota), \'\'), pp_match.nota)'
+                : 'pp_match.nota';
+            const gpfPagoProveedorIdExpr = hasCol('gastos_pagos_fondos', 'pago_proveedor_id')
+                ? 'COALESCE(gpf.pago_proveedor_id, pp_match.id)'
+                : 'pp_match.id';
+            const proveedorNombreExpr = "COALESCE(NULLIF(BTRIM(prov.nombre), ''), 'Sin proveedor')";
+            const gpfConceptoPagoProveedorExpr = `CASE
+                            WHEN NULLIF(BTRIM(${gpfNotaExpr}), '') IS NOT NULL
+                                THEN ('Pago a proveedor: ' || ${proveedorNombreExpr} || ' | Nota: ' || NULLIF(BTRIM(${gpfNotaExpr}), ''))
+                            ELSE ('Pago a proveedor: ' || ${proveedorNombreExpr} || ' - Gasto: ' || COALESCE(NULLIF(BTRIM(g.concepto), ''), 'Sin concepto'))
+                        END`;
+            const ppConceptoPagoProveedorExpr = `CASE
+                            WHEN NULLIF(BTRIM(pp.nota), '') IS NOT NULL
+                                THEN ('Pago a proveedor: ' || ${proveedorNombreExpr} || ' | Nota: ' || NULLIF(BTRIM(pp.nota), ''))
+                            ELSE ('Pago a proveedor: ' || ${proveedorNombreExpr} || ' - Gasto: ' || COALESCE(NULLIF(BTRIM(g.concepto), ''), 'Sin concepto'))
+                        END`;
 
             const ppCuentaFilter = hasCol('pagos_proveedores', 'cuenta_bancaria_id')
                 ? ' OR (pp.fondo_id IS NULL AND pp.cuenta_bancaria_id = $1)'
@@ -679,6 +696,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         pp.monto_bs,
                         pp.monto_usd,
                         pp.tasa_cambio,
+                        pp.nota,
                         ROW_NUMBER() OVER (
                             PARTITION BY pp.gasto_id, pp.fecha_pago::date
                             ORDER BY pp.id ASC
@@ -895,7 +913,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         ('EGR-' || ${gpfIdExpr}) AS id,
                         gpf.fecha_pago::date AS fecha,
                         ${gpfReferenciaExpr} AS referencia,
-                        ('Pago a Proveedor - Gasto: ' || COALESCE(g.concepto, prov.nombre, 'Sin concepto')) AS concepto,
+                        ${gpfConceptoPagoProveedorExpr} AS concepto,
                         'EGRESO'::text AS tipo,
                         ${gpfMontoBsExpr} AS monto_bs,
                         ${gpfTasaExpr} AS tasa_cambio,
@@ -907,7 +925,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
                         f.nombre::text AS fondo_nombre,
-                        NULL::int AS pago_id,
+                        ${gpfPagoProveedorIdExpr}::int AS pago_id,
                         NULL::text AS inmueble,
                         NULL::timestamp AS created_at
                     FROM (
@@ -933,7 +951,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         ('EGR-PP-' || pp.id::text) AS id,
                         pp.fecha_pago::date AS fecha,
                         pp.referencia,
-                        ('Pago a Proveedor - Gasto: ' || COALESCE(g.concepto, prov.nombre, 'Sin concepto')) AS concepto,
+                        ${ppConceptoPagoProveedorExpr} AS concepto,
                         'EGRESO'::text AS tipo,
                         pp.monto_bs,
                         pp.tasa_cambio,
@@ -945,7 +963,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         NULL::int AS fondo_origen_id,
                         NULL::int AS fondo_destino_id,
                         f.nombre::text AS fondo_nombre,
-                        NULL::int AS pago_id,
+                        pp.id::int AS pago_id,
                         NULL::text AS inmueble,
                         NULL::timestamp AS created_at
                     FROM pagos_proveedores pp
@@ -1382,7 +1400,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 
     app.post('/egresos-manuales', verifyToken, async (req: Request<{}, unknown, ManualEgresoBody>, res: Response) => {
         const { cuenta_id, fondo_id, monto_origen, tasa_cambio, referencia, concepto, fecha } = req.body;
+        let client: PoolClient | null = null;
         try {
+            client = await pool.connect();
             const user = asAuthUser(req.user);
             const cuentaId = asPositiveInt(cuenta_id, 'cuenta_id');
             const fondoId = asPositiveInt(fondo_id, 'fondo_id');
@@ -1400,15 +1420,15 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 return res.status(400).json({ status: 'error', message: 'El monto debe ser mayor a 0.' });
             }
 
-            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            const condoRes = await client.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             if (!condoRes.rows.length) {
                 return res.status(403).json({ status: 'error', message: 'No autorizado para registrar egresos.' });
             }
             const condominioId = condoRes.rows[0].id;
 
-            await pool.query('BEGIN');
+            await client.query('BEGIN');
 
-            const cuentaRes = await pool.query<{ id: number; nombre_banco: string | null; apodo: string | null; tipo: string | null }>(
+            const cuentaRes = await client.query<{ id: number; nombre_banco: string | null; apodo: string | null; tipo: string | null }>(
                 `
                 SELECT id, nombre_banco, apodo, tipo
                 FROM cuentas_bancarias
@@ -1419,11 +1439,11 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 [cuentaId, condominioId]
             );
             if (!cuentaRes.rows.length) {
-                await pool.query('ROLLBACK');
+                await client.query('ROLLBACK');
                 return res.status(404).json({ status: 'error', message: 'Cuenta bancaria no encontrada.' });
             }
 
-            const fondoRes = await pool.query<{ id: number; moneda: string | null; saldo_actual: string | number; nombre: string | null }>(
+            const fondoRes = await client.query<{ id: number; moneda: string | null; saldo_actual: string | number; nombre: string | null }>(
                 `
                 SELECT id, moneda, saldo_actual, nombre
                 FROM fondos
@@ -1437,7 +1457,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 [fondoId, cuentaId, condominioId]
             );
             if (!fondoRes.rows.length) {
-                await pool.query('ROLLBACK');
+                await client.query('ROLLBACK');
                 return res.status(404).json({ status: 'error', message: 'Fondo no encontrado para la cuenta seleccionada.' });
             }
             await validarFechaVsAperturaFondo(fondoId, fechaSafe);
@@ -1453,7 +1473,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 
             if (cuentaMoneda === 'BS') {
                 if (!tasaCambio || tasaCambio <= 0) {
-                    await pool.query('ROLLBACK');
+                    await client.query('ROLLBACK');
                     return res.status(400).json({ status: 'error', message: 'La tasa BCV es requerida para cuentas en Bs.' });
                 }
                 montoBs = montoOrigen;
@@ -1466,11 +1486,11 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const montoFondo = fondoMoneda === 'USD' ? montoUsd : montoBs;
             const saldoFondo = parseFloat(String(fondo.saldo_actual ?? 0)) || 0;
             if (montoFondo <= 0 || saldoFondo + 0.0001 < montoFondo) {
-                await pool.query('ROLLBACK');
+                await client.query('ROLLBACK');
                 return res.status(400).json({ status: 'error', message: 'Saldo insuficiente en el fondo seleccionado.' });
             }
 
-            await pool.query(
+            await client.query(
                 `UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2`,
                 [montoFondo, fondoId]
             );
@@ -1479,7 +1499,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const tipoEgreso = await resolveMovimientoFondoTipo(preferredTiposEgreso, 'EGRESO_GASTO');
             const nota = `Egreso manual libro mayor | Concepto: ${conceptoSafe} | Ref: ${referenciaSafe} | Bs ${montoBs.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | USD ${montoUsd.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-            const mfColsRes = await pool.query<IColumnNameRow>(
+            const mfColsRes = await client.query<IColumnNameRow>(
                 `
                 SELECT column_name
                 FROM information_schema.columns
@@ -1518,7 +1538,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 try {
                     const vals = [...insertVals];
                     vals[1] = tipo;
-                    await pool.query(
+                    await client.query(
                         `INSERT INTO movimientos_fondos (${insertCols.join(', ')}) VALUES (${placeholders})`,
                         vals
                     );
@@ -1538,7 +1558,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 throw asError(lastInsertErr || new Error('No se pudo determinar un tipo valido para movimientos_fondos.'));
             }
 
-            await pool.query('COMMIT');
+            await client.query('COMMIT');
             return res.json({
                 status: 'success',
                 message: 'Egreso registrado correctamente.',
@@ -1552,16 +1572,20 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 },
             });
         } catch (err: unknown) {
-            await pool.query('ROLLBACK');
+            if (client) await client.query('ROLLBACK');
             return res.status(500).json({ status: 'error', message: asError(err).message });
+        } finally {
+            client?.release();
         }
     });
 
     // ðŸ”„ REGISTRAR TRANSFERENCIA ENTRE FONDOS/CUENTAS
     app.post('/transferencias', verifyToken, async (req: Request<{}, unknown, TransferenciaBody>, res: Response, _next: NextFunction) => {
         const { fondo_origen_id, fondo_destino_id, cuenta_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota } = req.body;
+        let client: PoolClient | null = null;
 
         try {
+            client = await pool.connect();
             const user = asAuthUser(req.user);
             const fondoOrigenIdSafe = asPositiveInt(fondo_origen_id, 'fondo_origen_id');
             const montoOrigenSafe = asDecimal(monto_origen, 'monto_origen');
@@ -1572,14 +1596,17 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const referenciaSafe = asOptionalStringOrNull(referencia);
             const notaSafe = asOptionalStringOrNull(nota);
             const fechaSafe = toIsoDate(fecha, 'fecha');
-            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            const condoRes = await client.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            if (!condoRes.rows.length) {
+                return res.status(403).json({ error: 'No autorizado para registrar transferencias.' });
+            }
             const condoId = condoRes.rows[0].id;
             const hasCuentaDestino = cuenta_destino_id !== undefined && cuenta_destino_id !== null && String(cuenta_destino_id).trim() !== '';
             const hasFondoDestino = fondo_destino_id !== undefined && fondo_destino_id !== null && String(fondo_destino_id).trim() !== '';
 
-            await pool.query('BEGIN');
+            await client.query('BEGIN');
 
-            const origenRes = await pool.query<IFondoTransferRow>(
+            const origenRes = await client.query<IFondoTransferRow>(
                 'SELECT id, cuenta_bancaria_id, condominio_id, moneda, porcentaje_asignacion, es_operativo FROM fondos WHERE id = $1 AND condominio_id = $2 AND activo = true LIMIT 1',
                 [fondoOrigenIdSafe, condoId]
             );
@@ -1589,7 +1616,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const fondoOrigen = origenRes.rows[0];
             await validarFechaVsAperturaFondo(fondoOrigenIdSafe, fechaSafe);
 
-            const sourceBalanceRes = await pool.query<{ saldo_actual: number | string }>(
+            const sourceBalanceRes = await client.query<{ saldo_actual: number | string }>(
                 'SELECT saldo_actual FROM fondos WHERE id = $1 AND condominio_id = $2 LIMIT 1',
                 [fondoOrigenIdSafe, condoId]
             );
@@ -1607,11 +1634,11 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 throw new Error('Seleccione solo un tipo de destino: fondo o cuenta.');
             }
 
-            await pool.query('UPDATE fondos SET saldo_actual = saldo_actual - $1 WHERE id = $2', [montoOrigenSafe, fondoOrigenIdSafe]);
+            await client.query('UPDATE fondos SET saldo_actual = saldo_actual - $1 WHERE id = $2', [montoOrigenSafe, fondoOrigenIdSafe]);
 
             if (hasCuentaDestino) {
                 const cuentaDestinoIdSafe = asPositiveInt(cuenta_destino_id, 'cuenta_destino_id');
-                const destinoFundsRes = await pool.query<IFondoTransferRow>(
+                const destinoFundsRes = await client.query<IFondoTransferRow>(
                     `SELECT id, cuenta_bancaria_id, condominio_id, moneda, porcentaje_asignacion, es_operativo
                      FROM fondos
                      WHERE cuenta_bancaria_id = $1
@@ -1650,8 +1677,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 
                 for (const dist of distribuciones) {
                     if (dist.monto <= 0) continue;
-                    await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [dist.monto, dist.fondoId]);
-                    await pool.query(
+                    await client.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [dist.monto, dist.fondoId]);
+                    await client.query(
                         `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
                         [
@@ -1670,19 +1697,19 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             } else {
                 const fondoDestinoIdSafe = asPositiveInt(fondo_destino_id, 'fondo_destino_id');
                 await validarFechaVsAperturaFondo(fondoDestinoIdSafe, fechaSafe);
-                await pool.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [montoDestinoSafe, fondoDestinoIdSafe]);
-                await pool.query(
+                await client.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [montoDestinoSafe, fondoDestinoIdSafe]);
+                await client.query(
                     `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
                     [condoId, fondoOrigenIdSafe, fondoDestinoIdSafe, montoOrigenSafe, tasaCambioSafe, montoDestinoSafe, referenciaSafe, fechaSafe, notaSafe]
                 );
             }
 
-            await pool.query('COMMIT');
+            await client.query('COMMIT');
             res.json({ status: 'success', message: 'Transferencia procesada exitosamente.' });
         } catch (err: unknown) {
             const error = asError(err);
-            await pool.query('ROLLBACK');
+            if (client) await client.query('ROLLBACK');
             const businessError =
                 error.message.includes('No está permitido este registro') ||
                 error.message.includes('no encontrado') ||
@@ -1690,6 +1717,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 error.message.includes('saldo suficiente') ||
                 error.message.includes('monto de transferencia');
             res.status(businessError ? 400 : 500).json({ error: error.message });
+        } finally {
+            client?.release();
         }
     });
 

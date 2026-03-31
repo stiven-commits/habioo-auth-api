@@ -127,16 +127,17 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
     app.get('/fondos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const result = await pool.query<IFondoWithBancoRow>(
                 `
             SELECT f.*, cb.nombre_banco, cb.apodo 
             FROM fondos f 
             JOIN cuentas_bancarias cb ON f.cuenta_bancaria_id = cb.id 
-            WHERE f.condominio_id = $1 AND f.activo = true
+            JOIN condominios c ON c.id = f.condominio_id
+            WHERE c.admin_user_id = $1
+              AND f.activo = true
             ORDER BY cb.nombre_banco ASC, f.es_operativo DESC, f.nombre ASC
         `,
-                [condoRes.rows[0].id]
+                [user.id]
             );
             res.json({ status: 'success', fondos: result.rows });
         } catch (err: unknown) {
