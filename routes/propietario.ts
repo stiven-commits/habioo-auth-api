@@ -271,31 +271,53 @@ router.get('/mis-propiedades', verifyToken, async (req: Request, res: Response<A
         INNER JOIN condominios c ON c.id = p.condominio_id
         LEFT JOIN LATERAL (
           SELECT
-            COALESCE((
-              SELECT SUM(COALESCE(r.monto_usd, 0))
-              FROM recibos r
-              WHERE r.propiedad_id = p.id
-            ), 0)
-            + COALESCE((
-              SELECT SUM(
-                CASE
-                  WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
-                    THEN COALESCE(h.monto, 0)
-                  WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
-                    THEN -COALESCE(h.monto, 0)
-                  ELSE 0
-                END
-              )
-              FROM historial_saldos_inmuebles h
-              WHERE h.propiedad_id = p.id
-            ), 0)
-            - COALESCE((
-              SELECT SUM(COALESCE(pa.monto_usd, 0))
-              FROM pagos pa
-              WHERE pa.propiedad_id = p.id
-                AND pa.estado = 'Validado'
-                AND COALESCE(pa.es_ajuste_historico, false) = false
-            ), 0) AS saldo_calculado
+            CASE
+              WHEN EXISTS (SELECT 1 FROM recibos r WHERE r.propiedad_id = p.id)
+                OR EXISTS (
+                  SELECT 1
+                  FROM historial_saldos_inmuebles h
+                  WHERE h.propiedad_id = p.id
+                    AND (
+                      h.tipo IN ('CARGAR_DEUDA', 'DEUDA', 'AGREGAR_FAVOR', 'FAVOR')
+                      OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
+                      OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+                    )
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM pagos pa
+                  WHERE pa.propiedad_id = p.id
+                    AND pa.estado = 'Validado'
+                    AND COALESCE(pa.es_ajuste_historico, false) = false
+                )
+              THEN
+                COALESCE((
+                  SELECT SUM(COALESCE(r.monto_usd, 0))
+                  FROM recibos r
+                  WHERE r.propiedad_id = p.id
+                ), 0)
+                + COALESCE((
+                  SELECT SUM(
+                    CASE
+                      WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
+                        THEN COALESCE(h.monto, 0)
+                      WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+                        THEN -COALESCE(h.monto, 0)
+                      ELSE 0
+                    END
+                  )
+                  FROM historial_saldos_inmuebles h
+                  WHERE h.propiedad_id = p.id
+                ), 0)
+                - COALESCE((
+                  SELECT SUM(COALESCE(pa.monto_usd, 0))
+                  FROM pagos pa
+                  WHERE pa.propiedad_id = p.id
+                    AND pa.estado = 'Validado'
+                    AND COALESCE(pa.es_ajuste_historico, false) = false
+                ), 0)
+              ELSE NULL
+            END AS saldo_calculado
         ) saldo_calc ON TRUE
         WHERE up.user_id = $1
           AND COALESCE(up.acceso_portal, true) = true

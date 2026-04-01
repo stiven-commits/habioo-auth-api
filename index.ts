@@ -102,6 +102,10 @@ interface SupportRoutesRegistrar {
     (app: Application, deps: { pool: Pool; verifyToken: VerifyTokenMiddleware }): void;
 }
 
+interface JuntasRoutesRegistrar {
+    (app: Application, deps: { pool: Pool; verifyToken: VerifyTokenMiddleware }): void;
+}
+
 const { pool }: { pool: Pool } = require('./config/db');
 const { verifyToken }: { verifyToken: VerifyTokenMiddleware } = require('./middleware/verifyToken');
 const { parseLocaleNumber }: { parseLocaleNumber: ParseLocaleNumber } = require('./utils/number');
@@ -123,6 +127,7 @@ const { registerEncuestasRoutes }: { registerEncuestasRoutes: EncuestasRoutesReg
 const { registerChatRoutes }: { registerChatRoutes: ChatRoutesRegistrar } = require('./routes/chat');
 const { registerAlquileresRoutes }: { registerAlquileresRoutes: AlquileresRoutesRegistrar } = require('./routes/alquileres');
 const { registerSupportRoutes }: { registerSupportRoutes: SupportRoutesRegistrar } = require('./routes/support');
+const { registerJuntasRoutes }: { registerJuntasRoutes: JuntasRoutesRegistrar } = require('./routes/juntas');
 const perfilRoutes: import('express').Router = require('./routes/perfil');
 const propietarioRoutes: import('express').Router = require('./routes/propietario');
 
@@ -181,6 +186,7 @@ registerEncuestasRoutes(app, { pool, verifyToken });
 registerChatRoutes(app, { pool, verifyToken });
 registerAlquileresRoutes(app, { pool, verifyToken });
 registerSupportRoutes(app, { pool, verifyToken });
+registerJuntasRoutes(app, { pool, verifyToken });
 app.use('/api/perfil', perfilRoutes);
 app.use('/api/propietario', propietarioRoutes);
 

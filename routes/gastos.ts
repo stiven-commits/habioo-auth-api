@@ -28,9 +28,11 @@ interface ICondominioConfigRow {
     mes_actual: string;
     metodo_division: 'Alicuota' | 'Partes Iguales' | string;
     metodo_division_manual?: boolean;
+    tipo?: string | null;
     nombre?: string | null;
     nombre_legal?: string | null;
     rif?: string | null;
+    estado_venezuela?: string | null;
     admin_nombre?: string | null;
     admin_rif?: string | null;
     admin_correo?: string | null;
@@ -300,6 +302,27 @@ const toIsoDateOrNull = (value: unknown): string | null => {
 
     throw new Error('fecha_gasto invalida. Use dd/mm/yyyy o yyyy-mm-dd.');
 };
+
+const {
+    ensureJuntaGeneralSchema,
+    isJuntaGeneralTipo,
+    listJuntaGeneralMiembrosActivos,
+    resolveMetodoDivisionAutomatico,
+    ensureProveedorForJuntaGeneral,
+    normalizeRif,
+}: {
+    ensureJuntaGeneralSchema: (pool: Pool) => Promise<void>;
+    isJuntaGeneralTipo: (tipo: unknown) => boolean;
+    listJuntaGeneralMiembrosActivos: (pool: Pool, juntaGeneralId: number) => Promise<Array<Record<string, unknown>>>;
+    resolveMetodoDivisionAutomatico: (cuotas: Array<string | number | null | undefined>, metodoActual: string | null | undefined) => 'Alicuota' | 'Partes Iguales';
+    ensureProveedorForJuntaGeneral: (pool: Pool, input: {
+        condominioId: number;
+        juntaGeneralNombre: string;
+        juntaGeneralRif: string;
+        estadoVenezuela: string;
+    }) => Promise<number>;
+    normalizeRif: (value: unknown) => string;
+} = require('../services/juntaGeneral');
 
 const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocaleNumber, addMonths, formatMonthText }: AuthDependencies): void => {
     const uploadsDir = path.join(__dirname, '..', 'uploads', 'gastos');
@@ -637,7 +660,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         try {
             const user = asAuthUser(req.user);
             await ensureMetodoDivisionManualColumn(pool);
-            const condoRes = await pool.query<ICondominioConfigRow>('SELECT id, mes_actual, metodo_division, metodo_division_manual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            await ensureJuntaGeneralSchema(pool);
+            const condoRes = await pool.query<ICondominioConfigRow>('SELECT id, mes_actual, metodo_division, metodo_division_manual, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             const { id: condominio_id, metodo_division: metodoDivisionActual } = condoRes.rows[0];
             const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0]?.mes_actual);
             if (!condoRes.rows[0]?.mes_actual) {
@@ -654,14 +678,14 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 [condominio_id, mes_actual]
             );
             const total_usd = gastosRes.rows.filter((g) => g.mes_asignado === mes_actual).reduce((sum, item) => sum + parseFloat(String(item.monto_cuota_usd)), 0);
-            const alicuotasRes = await pool.query<IAlicuotaRow>('SELECT alicuota FROM propiedades WHERE condominio_id = $1 ORDER BY alicuota ASC', [condominio_id]);
-            const alicuotas = alicuotasRes.rows.map((r) => parseFloat(String(r.alicuota)));
+            const esJuntaGeneral = isJuntaGeneralTipo(condoRes.rows[0]?.tipo);
+            const alicuotas = esJuntaGeneral
+                ? (await listJuntaGeneralMiembrosActivos(pool, condominio_id)).map((r) => parseFloat(String(r.cuota_participacion || 0)))
+                : (await pool.query<IAlicuotaRow>('SELECT alicuota FROM propiedades WHERE condominio_id = $1 ORDER BY alicuota ASC', [condominio_id])).rows.map((r) => parseFloat(String(r.alicuota)));
             let metodoDivisionEfectivo: 'Alicuota' | 'Partes Iguales' = metodoDivisionActual === 'Partes Iguales' ? 'Partes Iguales' : 'Alicuota';
 
             if (!metodoDivisionManual && alicuotas.length > 0) {
-                const alicuotasNormalizadas = alicuotas.map((a) => Number(a || 0).toFixed(6));
-                const sonDistintas = new Set(alicuotasNormalizadas).size > 1;
-                const metodoAuto: 'Alicuota' | 'Partes Iguales' = sonDistintas ? 'Alicuota' : 'Partes Iguales';
+                const metodoAuto = resolveMetodoDivisionAutomatico(alicuotas, metodoDivisionActual);
                 metodoDivisionEfectivo = metodoAuto;
                 if (metodoDivisionActual !== metodoAuto) {
                     await pool.query('UPDATE condominios SET metodo_division = $1 WHERE id = $2', [metodoAuto, condominio_id]);
@@ -675,6 +699,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 gastos: gastosRes.rows,
                 total_usd: total_usd.toFixed(2),
                 alicuotas_disponibles: alicuotas,
+                jerarquia_objetivo: esJuntaGeneral ? 'Juntas Individuales' : 'Inmuebles',
             });
         } catch (err: unknown) {
             const error = asError(err);
@@ -708,7 +733,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
             const condoRes = await pool.query<ICondominioConfigRow>(
                 `SELECT
-                    id, mes_actual, metodo_division, nombre, nombre_legal, rif,
+                    id, mes_actual, metodo_division, tipo, estado_venezuela, nombre, nombre_legal, rif,
                     admin_nombre, admin_rif, admin_correo, logo_url,
                     aviso_msg_1, aviso_msg_2, aviso_msg_3, aviso_msg_4
                  FROM condominios
@@ -723,6 +748,199 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             }
 
             // ðŸ’¡ 1. Agregamos "saldo_actual" a la bÃºsqueda de propiedades
+            const esJuntaGeneral = isJuntaGeneralTipo(condoRes.rows[0]?.tipo);
+            if (esJuntaGeneral) {
+                await ensureJuntaGeneralSchema(pool);
+                const cuotasResGeneral = await pool.query<ICuotaCierreRow>(
+                    `SELECT
+                        g.id AS gasto_id,
+                        g.concepto,
+                        g.monto_bs AS monto_total_bs,
+                        g.monto_usd AS monto_total_usd,
+                        g.tasa_cambio,
+                        gc.monto_cuota_usd,
+                        g.nota,
+                        g.clasificacion,
+                        g.tipo,
+                        g.zona_id,
+                        g.propiedad_id,
+                        z.nombre AS zona_nombre,
+                        gp.identificador AS propiedad_identificador
+                     FROM gastos_cuotas gc
+                     JOIN gastos g ON gc.gasto_id = g.id
+                     LEFT JOIN zonas z ON z.id = g.zona_id
+                     LEFT JOIN propiedades gp ON gp.id = g.propiedad_id
+                     WHERE g.condominio_id = $1
+                       AND gc.mes_asignado = $2
+                       AND gc.estado = 'Pendiente'
+                       AND g.tipo IN ('Comun', 'Extra')`,
+                    [condo_id, mes_actual]
+                );
+                const totalAvisoUsd = cuotasResGeneral.rows.reduce((acc, c) => acc + toNumber(c.monto_cuota_usd), 0);
+                const totalAvisoBs = cuotasResGeneral.rows.reduce((acc, c) => acc + (toNumber(c.monto_cuota_usd) * Math.max(toNumber(c.tasa_cambio), 0)), 0);
+                const tasaReferencia = totalAvisoUsd > 0 ? totalAvisoBs / totalAvisoUsd : 0;
+                const miembros = await listJuntaGeneralMiembrosActivos(pool, condo_id);
+                const miembrosActivos = miembros.filter((m) => Boolean(m.activo !== false));
+                const metodoGeneral = (metodo_division === 'Partes Iguales' ? 'Partes Iguales' : 'Alicuota') as 'Partes Iguales' | 'Alicuota';
+
+                let avisoId: number | null = null;
+                if (totalAvisoUsd > 0 && miembrosActivos.length > 0) {
+                    const avisoRes = await pool.query<IInsertedIdRow>(
+                        `INSERT INTO junta_general_avisos (junta_general_id, mes_origen, metodo_division, total_usd, total_bs, tasa_referencia, created_by_user_id)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)
+                         RETURNING id`,
+                        [
+                            condo_id,
+                            mes_actual,
+                            metodoGeneral,
+                            Number(totalAvisoUsd.toFixed(2)),
+                            Number(totalAvisoBs.toFixed(2)),
+                            Number(tasaReferencia.toFixed(6)),
+                            user.id,
+                        ]
+                    );
+                    avisoId = avisoRes.rows[0].id;
+
+                    const totalCuotas = miembrosActivos.reduce((acc, m) => acc + (metodoGeneral === 'Partes Iguales' ? 1 : Math.max(0, toNumber(m.cuota_participacion as string | number | null))), 0);
+                    let acumuladoUsd = 0;
+                    const generalNombre = String(condoRes.rows[0]?.nombre_legal || condoRes.rows[0]?.nombre || 'Junta General').trim();
+                    const generalRif = normalizeRif(condoRes.rows[0]?.rif || '');
+                    const estadoGeneral = String(condoRes.rows[0]?.estado_venezuela || 'Distrito Capital');
+                    const conceptoGeneral = `Aviso Junta General - ${formatMonthText(mes_actual)}`;
+
+                    for (let idx = 0; idx < miembrosActivos.length; idx += 1) {
+                        const m = miembrosActivos[idx];
+                        const basePeso = metodoGeneral === 'Partes Iguales'
+                            ? 1
+                            : Math.max(0, toNumber(m.cuota_participacion as string | number | null));
+                        const peso = totalCuotas > 0 ? (basePeso / totalCuotas) : 0;
+                        let montoUsd = Number((totalAvisoUsd * peso).toFixed(2));
+                        if (idx === miembrosActivos.length - 1) {
+                            montoUsd = Number((totalAvisoUsd - acumuladoUsd).toFixed(2));
+                        }
+                        acumuladoUsd = Number((acumuladoUsd + montoUsd).toFixed(2));
+                        const montoBs = Number((montoUsd * tasaReferencia).toFixed(2));
+
+                        const detalleRes = await pool.query<IInsertedIdRow>(
+                            `INSERT INTO junta_general_aviso_detalles (aviso_id, miembro_id, condominio_individual_id, monto_usd, monto_bs, estado)
+                             VALUES ($1, $2, $3, $4, $5, $6)
+                             RETURNING id`,
+                            [avisoId, m.id as number, (m.condominio_individual_id as number | null) ?? null, montoUsd, montoBs, 'PENDIENTE']
+                        );
+                        const detalleId = detalleRes.rows[0].id;
+
+                        const condominioIndividualId = (m.condominio_individual_id as number | null) ?? null;
+                        if (!condominioIndividualId) {
+                            await pool.query(
+                                `UPDATE junta_general_aviso_detalles
+                                 SET estado = 'FANTASMA',
+                                     nota = 'Junta individual no vinculada en Habioo.'
+                                 WHERE id = $1`,
+                                [detalleId]
+                            );
+                            continue;
+                        }
+
+                        const condominioIndividualRes = await pool.query<ICondominioConfigRow>(
+                            `SELECT id, mes_actual, estado_venezuela
+                             FROM condominios
+                             WHERE id = $1
+                             LIMIT 1`,
+                            [condominioIndividualId]
+                        );
+                        const condominioIndividual = condominioIndividualRes.rows[0];
+                        if (!condominioIndividual) {
+                            await pool.query(
+                                `UPDATE junta_general_aviso_detalles
+                                 SET estado = 'ERROR',
+                                     nota = 'Condominio individual no encontrado.'
+                                 WHERE id = $1`,
+                                [detalleId]
+                            );
+                            continue;
+                        }
+
+                        const mesIndividual = asYyyyMmOrPrevious(condominioIndividual.mes_actual);
+                        if (!condominioIndividual.mes_actual) {
+                            await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [mesIndividual, condominioIndividual.id]);
+                        }
+
+                        const proveedorId = await ensureProveedorForJuntaGeneral(pool, {
+                            condominioId: condominioIndividual.id,
+                            juntaGeneralNombre: generalNombre,
+                            juntaGeneralRif: generalRif,
+                            estadoVenezuela: String(condominioIndividual.estado_venezuela || estadoGeneral || 'Distrito Capital'),
+                        });
+
+                        const notaOrigen = `Cargo automático por aviso #${avisoId} de la Junta General (${formatMonthText(mes_actual)}).`;
+                        const gastoGenerado = await pool.query<IInsertedIdRow>(
+                            `INSERT INTO gastos (
+                                condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas,
+                                nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto,
+                                origen_tipo, origen_junta_general_id, origen_aviso_general_id, origen_detalle_general_id
+                             ) VALUES (
+                                $1, $2, $3, $4, $5, $6, 1,
+                                $7, 'Variable', 'Comun', NULL, NULL, NOW(),
+                                'JUNTA_GENERAL', $8, $9, $10
+                             )
+                             RETURNING id`,
+                            [
+                                condominioIndividual.id,
+                                proveedorId,
+                                conceptoGeneral,
+                                montoBs,
+                                Number(tasaReferencia.toFixed(6)),
+                                montoUsd,
+                                notaOrigen,
+                                condo_id,
+                                avisoId,
+                                detalleId,
+                            ]
+                        );
+                        const gastoId = gastoGenerado.rows[0].id;
+
+                        await pool.query(
+                            `INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado, estado)
+                             VALUES ($1, 1, $2, $3, 'Pendiente')`,
+                            [gastoId, montoUsd, mesIndividual]
+                        );
+
+                        await pool.query(
+                            `UPDATE junta_general_aviso_detalles
+                             SET gasto_generado_id = $1,
+                                 proveedor_id = $2,
+                                 estado = 'GENERADO',
+                                 nota = 'Gasto generado en junta individual.'
+                             WHERE id = $3`,
+                            [gastoId, proveedorId, detalleId]
+                        );
+
+                        await pool.query(
+                            `INSERT INTO junta_general_notificaciones (condominio_id, tipo, titulo, mensaje, metadata_jsonb)
+                             VALUES ($1, 'AVISO_GENERAL_RECIBIDO', $2, $3, $4::jsonb)`,
+                            [
+                                condominioIndividual.id,
+                                'Nuevo aviso de Junta General',
+                                `Se agregó un gasto automático por ${formatMonthText(mes_actual)} por USD ${montoUsd.toFixed(2)}.`,
+                                JSON.stringify({ aviso_id: avisoId, detalle_id: detalleId, gasto_id: gastoId, junta_general_id: condo_id }),
+                            ]
+                        );
+                    }
+                }
+
+                await pool.query("UPDATE gastos_cuotas SET estado = 'Procesado' FROM gastos WHERE gastos_cuotas.gasto_id = gastos.id AND gastos.condominio_id = $1 AND gastos_cuotas.mes_asignado = $2", [condo_id, mes_actual]);
+                const proximoMesGeneral = addMonths(mes_actual, 1);
+                await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [proximoMesGeneral, condo_id]);
+                await pool.query('COMMIT');
+                return res.json({
+                    status: 'success',
+                    message: avisoId
+                        ? `Aviso general generado y distribuido a juntas individuales. Avanzando a ${formatMonthText(proximoMesGeneral)}.`
+                        : `No se encontraron montos para distribuir. Avanzando a ${formatMonthText(proximoMesGeneral)}.`,
+                    aviso_general_id: avisoId,
+                });
+            }
+
             const propRes = await pool.query<IPropiedadCierreRow>(
                 'SELECT id, identificador, alicuota, saldo_actual FROM propiedades WHERE condominio_id = $1',
                 [condo_id]

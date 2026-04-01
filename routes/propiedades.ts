@@ -12,6 +12,7 @@ interface AuthDependencies {
 
 interface ICondominioIdRow {
     id: number;
+    tipo?: string | null;
 }
 
 interface IPropiedadAdminRow extends Record<string, unknown> {
@@ -254,9 +255,22 @@ const normalizeDoc = (value: unknown): string => normalizeWhitespace(value).toUp
 
 const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
 
-    const getCondominioIdByAdmin = async (adminUserId: number): Promise<number | null> => {
-        const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [adminUserId]);
-        return c.rows[0]?.id || null;
+    const getCondominioByAdmin = async (adminUserId: number): Promise<ICondominioIdRow | null> => {
+        const c = await pool.query<ICondominioIdRow>('SELECT id, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1', [adminUserId]);
+        return c.rows[0] || null;
+    };
+
+    const resolveCondominioIdForInmuebles = async (adminUserId: number, res: Response): Promise<number | null> => {
+        const condo = await getCondominioByAdmin(adminUserId);
+        if (!condo?.id) {
+            res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            return null;
+        }
+        if (String(condo.tipo || '').trim().toLowerCase() === 'junta general') {
+            res.status(403).json({ error: 'La Junta General no puede visualizar ni gestionar inmuebles.' });
+            return null;
+        }
+        return condo.id;
     };
 
     const isValidEmail = (value: string | null | undefined): boolean => {
@@ -313,10 +327,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
     app.get('/propiedades-admin', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getCondominioIdByAdmin(user.id);
-            if (!condominioId) {
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
-            }
+            const condominioId = await resolveCondominioIdForInmuebles(user.id, res);
+            if (!condominioId) return;
             const r = await pool.query<IPropiedadAdminRow>(`
                 SELECT p.id, p.identificador, p.alicuota,
                     ROUND(COALESCE(saldo_calc.saldo_calculado, p.saldo_actual, 0)::numeric, 2) AS saldo_actual,
@@ -327,31 +339,53 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                 FROM propiedades p
                 LEFT JOIN LATERAL (
                     SELECT
-                        COALESCE((
-                            SELECT SUM(COALESCE(r.monto_usd, 0))
-                            FROM recibos r
-                            WHERE r.propiedad_id = p.id
-                        ), 0)
-                        + COALESCE((
-                            SELECT SUM(
-                                CASE
-                                    WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
-                                        THEN COALESCE(h.monto, 0)
-                                    WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
-                                        THEN -COALESCE(h.monto, 0)
-                                    ELSE 0
-                                END
-                            )
-                            FROM historial_saldos_inmuebles h
-                            WHERE h.propiedad_id = p.id
-                        ), 0)
-                        - COALESCE((
-                             SELECT SUM(COALESCE(pa.monto_usd, 0))
-                             FROM pagos pa
-                             WHERE pa.propiedad_id = p.id
-                               AND pa.estado = 'Validado'
-                               AND COALESCE(pa.es_ajuste_historico, false) = false
-                         ), 0) AS saldo_calculado
+                        CASE
+                            WHEN EXISTS (SELECT 1 FROM recibos r WHERE r.propiedad_id = p.id)
+                              OR EXISTS (
+                                    SELECT 1
+                                    FROM historial_saldos_inmuebles h
+                                    WHERE h.propiedad_id = p.id
+                                      AND (
+                                        h.tipo IN ('CARGAR_DEUDA', 'DEUDA', 'AGREGAR_FAVOR', 'FAVOR')
+                                        OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
+                                        OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+                                      )
+                                )
+                              OR EXISTS (
+                                    SELECT 1
+                                    FROM pagos pa
+                                    WHERE pa.propiedad_id = p.id
+                                      AND pa.estado = 'Validado'
+                                      AND COALESCE(pa.es_ajuste_historico, false) = false
+                                )
+                            THEN
+                                COALESCE((
+                                    SELECT SUM(COALESCE(r.monto_usd, 0))
+                                    FROM recibos r
+                                    WHERE r.propiedad_id = p.id
+                                ), 0)
+                                + COALESCE((
+                                    SELECT SUM(
+                                        CASE
+                                            WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
+                                                THEN COALESCE(h.monto, 0)
+                                            WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+                                                THEN -COALESCE(h.monto, 0)
+                                            ELSE 0
+                                        END
+                                    )
+                                    FROM historial_saldos_inmuebles h
+                                    WHERE h.propiedad_id = p.id
+                                ), 0)
+                                - COALESCE((
+                                     SELECT SUM(COALESCE(pa.monto_usd, 0))
+                                     FROM pagos pa
+                                     WHERE pa.propiedad_id = p.id
+                                       AND pa.estado = 'Validado'
+                                       AND COALESCE(pa.es_ajuste_historico, false) = false
+                                 ), 0)
+                            ELSE NULL
+                        END AS saldo_calculado
                  ) saldo_calc ON TRUE
                 LEFT JOIN usuarios_propiedades up1 ON p.id = up1.propiedad_id AND up1.rol = 'Propietario' LEFT JOIN users u1 ON up1.user_id = u1.id 
                 LEFT JOIN usuarios_propiedades up2 ON p.id = up2.propiedad_id AND up2.rol = 'Inquilino' LEFT JOIN users u2 ON up2.user_id = u2.id
@@ -371,10 +405,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
     app.get('/propiedades-admin/propietarios-existentes', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getCondominioIdByAdmin(user.id);
-            if (!condominioId) {
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
-            }
+            const condominioId = await resolveCondominioIdForInmuebles(user.id, res);
+            if (!condominioId) return;
 
             const result = await pool.query<IPropietarioExistenteRow>(`
                 SELECT DISTINCT
@@ -408,10 +440,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getCondominioIdByAdmin(user.id);
-            if (!condominioId) {
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
-            }
+            const condominioId = await resolveCondominioIdForInmuebles(user.id, res);
+            if (!condominioId) return;
 
             const propRes = await pool.query<IPropiedadIdRow>(
                 'SELECT id FROM propiedades WHERE id = $1 AND condominio_id = $2 LIMIT 1',
@@ -472,10 +502,10 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             const user = asAuthUser(req.user);
             await pool.query('BEGIN');
 
-            const condominioId = await getCondominioIdByAdmin(user.id);
+            const condominioId = await resolveCondominioIdForInmuebles(user.id, res);
             if (!condominioId) {
                 await pool.query('ROLLBACK');
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+                return;
             }
 
             const propRes = await pool.query<IPropiedadIdRow>(
@@ -594,10 +624,10 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             const user = asAuthUser(req.user);
             await pool.query('BEGIN');
 
-            const condominioId = await getCondominioIdByAdmin(user.id);
+            const condominioId = await resolveCondominioIdForInmuebles(user.id, res);
             if (!condominioId) {
                 await pool.query('ROLLBACK');
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+                return;
             }
 
             const copropRes = await pool.query<{ id: number; user_id: number }>(
@@ -678,10 +708,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getCondominioIdByAdmin(user.id);
-            if (!condominioId) {
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
-            }
+            const condominioId = await resolveCondominioIdForInmuebles(user.id, res);
+            if (!condominioId) return;
 
             const result = await pool.query<{ id: number }>(
                 `DELETE FROM usuarios_propiedades up
@@ -709,10 +737,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
     app.delete('/propiedades-admin/eliminar-todos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getCondominioIdByAdmin(user.id);
-            if (!condominioId) {
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
-            }
+            const condominioId = await resolveCondominioIdForInmuebles(user.id, res);
+            if (!condominioId) return;
 
             const gastosRes = await pool.query<ICountRow>('SELECT COUNT(*)::text AS count FROM gastos WHERE condominio_id = $1', [condominioId]);
             const totalGastos = parseInt(gastosRes.rows[0]?.count || '0', 10) || 0;
@@ -941,9 +967,10 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             const user = asAuthUser(req.user);
             await pool.query('BEGIN');
 
-            const condoId = await getCondominioIdByAdmin(user.id);
+            const condoId = await resolveCondominioIdForInmuebles(user.id, res);
             if (!condoId) {
-                throw new Error('No existe un condominio asociado a este usuario administrador.');
+                await pool.query('ROLLBACK');
+                return;
             }
             // 1) Regla de alícuotas no-mixtas.
             const alicuotasLote: number[] = propiedades.map((item) => {
@@ -1159,10 +1186,10 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         try {
             const user = asAuthUser(req.user);
             await pool.query('BEGIN');
-            const condominioId = await getCondominioIdByAdmin(user.id);
+            const condominioId = await resolveCondominioIdForInmuebles(user.id, res);
             if (!condominioId) {
                 await pool.query('ROLLBACK');
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+                return;
             }
 
             let userId: number | null = null;
@@ -1423,10 +1450,8 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getCondominioIdByAdmin(user.id);
-            if (!condominioId) {
-                return res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
-            }
+            const condominioId = await resolveCondominioIdForInmuebles(user.id, res);
+            if (!condominioId) return;
 
             const propRes = await pool.query<IPropiedadIdRow>(
                 'SELECT id FROM propiedades WHERE id = $1 AND condominio_id = $2 LIMIT 1',

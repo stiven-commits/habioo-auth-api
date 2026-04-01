@@ -12,6 +12,7 @@ interface AuthDependencies {
 
 interface ICondominioIdRow {
     id: number;
+    tipo?: string | null;
 }
 
 interface IZonaBaseRow {
@@ -62,13 +63,28 @@ const asAuthUser = (value: unknown): AuthUser => {
 };
 
 const registerZonasRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
+    const resolveCondominioIdForZonas = async (adminUserId: number, res: Response): Promise<number | null> => {
+        const c = await pool.query<ICondominioIdRow>('SELECT id, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1', [adminUserId]);
+        const condo = c.rows[0];
+        if (!condo?.id) {
+            res.status(400).json({ error: 'No existe un condominio asociado a este usuario administrador.' });
+            return null;
+        }
+        if (String(condo.tipo || '').trim().toLowerCase() === 'junta general') {
+            res.status(403).json({ error: 'La Junta General no puede visualizar ni gestionar zonas de inmuebles.' });
+            return null;
+        }
+        return condo.id;
+    };
+
     app.get('/zonas', verifyToken, async (req: Request, res: Response) => {
         try {
             const authUser = asAuthUser(req.user);
-            const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [authUser.id]);
+            const condominioId = await resolveCondominioIdForZonas(authUser.id, res);
+            if (!condominioId) return;
             const zRes = await pool.query<IZonaBaseRow>(
                 'SELECT z.id, z.nombre, z.activa, (SELECT COUNT(*) FROM gastos g WHERE g.zona_id = z.id) > 0 as tiene_gastos FROM zonas z WHERE z.condominio_id = $1 ORDER BY z.activa DESC, z.nombre ASC',
-                [c.rows[0].id]
+                [condominioId]
             );
             const zonas: IZonaResponseRow[] = zRes.rows;
             for (const z of zonas) {
@@ -76,7 +92,7 @@ const registerZonasRoutes = (app: Application, { pool, verifyToken }: AuthDepend
                 z.propiedades = pRes.rows;
                 z.propiedades_ids = pRes.rows.map((p: IPropiedadRow) => p.id);
             }
-            const aRes = await pool.query<IPropiedadRow>('SELECT id, identificador FROM propiedades WHERE condominio_id = $1 ORDER BY identificador ASC', [c.rows[0].id]);
+            const aRes = await pool.query<IPropiedadRow>('SELECT id, identificador FROM propiedades WHERE condominio_id = $1 ORDER BY identificador ASC', [condominioId]);
             res.json({ status: 'success', zonas, todas_propiedades: aRes.rows });
         } catch (err: unknown) {
             const error = err as Error;
@@ -88,8 +104,9 @@ const registerZonasRoutes = (app: Application, { pool, verifyToken }: AuthDepend
         const { nombre, propiedades_ids } = req.body;
         try {
             const authUser = asAuthUser(req.user);
-            const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [authUser.id]);
-            const z = await pool.query<InsertZonaRow>('INSERT INTO zonas (condominio_id, nombre, activa) VALUES ($1, $2, true) RETURNING id', [c.rows[0].id, nombre]);
+            const condominioId = await resolveCondominioIdForZonas(authUser.id, res);
+            if (!condominioId) return;
+            const z = await pool.query<InsertZonaRow>('INSERT INTO zonas (condominio_id, nombre, activa) VALUES ($1, $2, true) RETURNING id', [condominioId, nombre]);
             if (propiedades_ids) {
                 for (const p of propiedades_ids) {
                     await pool.query('INSERT INTO propiedades_zonas (zona_id, propiedad_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [z.rows[0].id, p]);
@@ -105,8 +122,11 @@ const registerZonasRoutes = (app: Application, { pool, verifyToken }: AuthDepend
     app.put('/zonas/:id', verifyToken, async (req: Request<ZonasParams, unknown, UpdateZonaBody>, res: Response) => {
         const { nombre, activa, propiedades_ids } = req.body;
         try {
+            const authUser = asAuthUser(req.user);
+            const condominioId = await resolveCondominioIdForZonas(authUser.id, res);
+            if (!condominioId) return;
             await pool.query('BEGIN');
-            await pool.query('UPDATE zonas SET nombre = $1, activa = $2 WHERE id = $3', [nombre, activa, req.params.id]);
+            await pool.query('UPDATE zonas SET nombre = $1, activa = $2 WHERE id = $3 AND condominio_id = $4', [nombre, activa, req.params.id, condominioId]);
             if (Array.isArray(propiedades_ids)) {
                 await pool.query('DELETE FROM propiedades_zonas WHERE zona_id = $1', [req.params.id]);
                 for (const pId of propiedades_ids) {
@@ -124,7 +144,10 @@ const registerZonasRoutes = (app: Application, { pool, verifyToken }: AuthDepend
 
     app.delete('/zonas/:id', verifyToken, async (req: Request<ZonasParams>, res: Response) => {
         try {
-            await pool.query('DELETE FROM zonas WHERE id = $1', [req.params.id]);
+            const authUser = asAuthUser(req.user);
+            const condominioId = await resolveCondominioIdForZonas(authUser.id, res);
+            if (!condominioId) return;
+            await pool.query('DELETE FROM zonas WHERE id = $1 AND condominio_id = $2', [req.params.id, condominioId]);
             res.json({ status: 'success' });
         } catch (err: unknown) {
             const error = err as Error;
