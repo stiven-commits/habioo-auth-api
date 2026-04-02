@@ -78,6 +78,44 @@ const ensureJuntaGeneralSchema = async (pool: Pool): Promise<void> => {
             `);
 
             await pool.query(`
+                CREATE OR REPLACE FUNCTION validar_rif_miembro_junta_general()
+                RETURNS trigger AS $$
+                DECLARE
+                    rif_general text;
+                    norm_miembro text;
+                    norm_general text;
+                BEGIN
+                    SELECT rif INTO rif_general
+                    FROM condominios
+                    WHERE id = NEW.junta_general_id
+                    LIMIT 1;
+
+                    norm_miembro := UPPER(REGEXP_REPLACE(COALESCE(NEW.rif, ''), '[^A-Z0-9]', '', 'g'));
+                    norm_general := UPPER(REGEXP_REPLACE(COALESCE(rif_general, ''), '[^A-Z0-9]', '', 'g'));
+
+                    IF norm_miembro <> '' AND norm_general <> '' AND norm_miembro = norm_general THEN
+                        RAISE EXCEPTION 'RIF_MIEMBRO_IGUAL_JUNTA_GENERAL';
+                    END IF;
+
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+            `);
+
+            await pool.query(`
+                DROP TRIGGER IF EXISTS tr_validar_rif_miembro_junta_general
+                ON junta_general_miembros
+            `);
+
+            await pool.query(`
+                CREATE TRIGGER tr_validar_rif_miembro_junta_general
+                BEFORE INSERT OR UPDATE OF rif, junta_general_id
+                ON junta_general_miembros
+                FOR EACH ROW
+                EXECUTE FUNCTION validar_rif_miembro_junta_general()
+            `);
+
+            await pool.query(`
                 CREATE TABLE IF NOT EXISTS junta_general_avisos (
                     id SERIAL PRIMARY KEY,
                     junta_general_id integer NOT NULL REFERENCES condominios(id) ON DELETE CASCADE,

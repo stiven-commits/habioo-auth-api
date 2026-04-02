@@ -9,6 +9,7 @@ interface AuthDependencies {
 interface AuthUser {
     id: number;
     cedula: string;
+    condominio_id?: number;
 }
 
 interface MiembroBody {
@@ -98,11 +99,34 @@ const randomCode = (): string => {
 };
 
 const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
+    const resolveCondominioSesion = async (auth: AuthUser) => {
+        const condoId = toPositiveInt(auth.condominio_id);
+        if (condoId) {
+            const byId = await pool.query<{
+                id: number;
+                nombre: string | null;
+                nombre_legal: string | null;
+                rif: string | null;
+                tipo: string | null;
+                estado_venezuela: string | null;
+            }>(
+                `SELECT id, nombre, nombre_legal, rif, tipo, estado_venezuela
+                 FROM condominios
+                 WHERE id = $1
+                 LIMIT 1`,
+                [condoId]
+            );
+            if (byId.rows[0]) return byId.rows[0];
+        }
+
+        return getCondominioByAdminUserId(pool, auth.id);
+    };
+
     app.get('/juntas-generales/miembros', verifyToken, async (req: Request, res: Response) => {
         try {
             const auth = asAuthUser(req.user);
             await ensureJuntaGeneralSchema(pool);
-            const condo = await getCondominioByAdminUserId(pool, auth.id);
+            const condo = await resolveCondominioSesion(auth);
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
             if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
 
@@ -133,7 +157,7 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         try {
             const auth = asAuthUser(req.user);
             await ensureJuntaGeneralSchema(pool);
-            const condo = await getCondominioByAdminUserId(pool, auth.id);
+            const condo = await resolveCondominioSesion(auth);
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
             if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
 
@@ -163,7 +187,8 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 `SELECT id, nombre, nombre_legal, rif
                         , tipo, junta_general_id
                  FROM condominios
-                 WHERE UPPER(REPLACE(COALESCE(rif, ''), '-', '')) = UPPER(REPLACE($1, '-', ''))
+                 WHERE UPPER(REGEXP_REPLACE(COALESCE(rif, ''), '[^A-Z0-9]', '', 'g'))
+                       = UPPER(REGEXP_REPLACE($1, '[^A-Z0-9]', '', 'g'))
                  LIMIT 1`,
                 [rif]
             );
@@ -236,7 +261,10 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 
             return res.status(201).json({ status: 'success', data: { id: inserted.rows[0].id }, message: 'Miembro registrado.' });
         } catch (error) {
-            const message = error instanceof Error ? error.message : 'Error al registrar miembro.';
+            const raw = error instanceof Error ? error.message : 'Error al registrar miembro.';
+            const message = raw.includes('RIF_MIEMBRO_IGUAL_JUNTA_GENERAL')
+                ? 'No puedes registrar una junta individual con el mismo RIF de la Junta General.'
+                : raw;
             return res.status(500).json({ status: 'error', message });
         }
     });
@@ -245,7 +273,7 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         try {
             const auth = asAuthUser(req.user);
             await ensureJuntaGeneralSchema(pool);
-            const condo = await getCondominioByAdminUserId(pool, auth.id);
+            const condo = await resolveCondominioSesion(auth);
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
             if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
 
@@ -303,7 +331,8 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     `
                     SELECT id, tipo, junta_general_id
                     FROM condominios
-                    WHERE UPPER(REPLACE(COALESCE(rif, ''), '-', '')) = UPPER(REPLACE($1, '-', ''))
+                    WHERE UPPER(REGEXP_REPLACE(COALESCE(rif, ''), '[^A-Z0-9]', '', 'g'))
+                          = UPPER(REGEXP_REPLACE($1, '[^A-Z0-9]', '', 'g'))
                     LIMIT 1
                     `,
                     [rifMaybe]
@@ -336,7 +365,10 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             if (!updated.rowCount) return res.status(404).json({ status: 'error', message: 'Miembro no encontrado.' });
             return res.json({ status: 'success', message: 'Miembro actualizado.' });
         } catch (error) {
-            const message = error instanceof Error ? error.message : 'Error al actualizar miembro.';
+            const raw = error instanceof Error ? error.message : 'Error al actualizar miembro.';
+            const message = raw.includes('RIF_MIEMBRO_IGUAL_JUNTA_GENERAL')
+                ? 'No puedes usar el mismo RIF de la Junta General.'
+                : raw;
             return res.status(500).json({ status: 'error', message });
         }
     });
@@ -345,7 +377,7 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         try {
             const auth = asAuthUser(req.user);
             await ensureJuntaGeneralSchema(pool);
-            const condo = await getCondominioByAdminUserId(pool, auth.id);
+            const condo = await resolveCondominioSesion(auth);
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
             if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
 
@@ -416,7 +448,7 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         try {
             const auth = asAuthUser(req.user);
             await ensureJuntaGeneralSchema(pool);
-            const condo = await getCondominioByAdminUserId(pool, auth.id);
+            const condo = await resolveCondominioSesion(auth);
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
             if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
 
@@ -456,7 +488,7 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         try {
             const auth = asAuthUser(req.user);
             await ensureJuntaGeneralSchema(pool);
-            const condo = await getCondominioByAdminUserId(pool, auth.id);
+            const condo = await resolveCondominioSesion(auth);
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
             if (isJuntaGeneralTipo(condo.tipo)) return res.status(400).json({ status: 'error', message: 'Una Junta General no puede vincularse como individual.' });
 
@@ -595,7 +627,7 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         try {
             const auth = asAuthUser(req.user);
             await ensureJuntaGeneralSchema(pool);
-            const condo = await getCondominioByAdminUserId(pool, auth.id);
+            const condo = await resolveCondominioSesion(auth);
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
             if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
 
@@ -648,7 +680,7 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         try {
             const auth = asAuthUser(req.user);
             await ensureJuntaGeneralSchema(pool);
-            const condo = await getCondominioByAdminUserId(pool, auth.id);
+            const condo = await resolveCondominioSesion(auth);
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
 
             const list = await pool.query(
@@ -673,7 +705,7 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         try {
             const auth = asAuthUser(req.user);
             await ensureJuntaGeneralSchema(pool);
-            const condo = await getCondominioByAdminUserId(pool, auth.id);
+            const condo = await resolveCondominioSesion(auth);
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
 
             const id = toPositiveInt(req.params?.id);
