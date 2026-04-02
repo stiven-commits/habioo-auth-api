@@ -16,6 +16,7 @@ interface MiembroBody {
     nombre_referencia?: string;
     rif?: string;
     cuota_participacion?: number | string | null;
+    zona_id?: number | string | null;
 }
 
 interface AceptarInvitacionBody {
@@ -136,12 +137,18 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 const montoGenerado = toNumber(m.saldo_usd_generado as string | number | null);
                 const montoPagado = toNumber(m.saldo_usd_pagado as string | number | null);
                 const deuda = Math.max(0, montoGenerado - montoPagado);
+                const montoGeneradoBs = toNumber(m.saldo_bs_generado as string | number | null);
+                const montoPagadoBs = toNumber(m.saldo_bs_pagado as string | number | null);
+                const deudaBs = Math.max(0, montoGeneradoBs - montoPagadoBs);
                 const morosidad = montoGenerado > 0 ? (deuda / montoGenerado) * 100 : 0;
                 return {
                     ...m,
                     saldo_usd_generado: Number(montoGenerado.toFixed(2)),
                     saldo_usd_pagado: Number(montoPagado.toFixed(2)),
                     saldo_usd_pendiente: Number(deuda.toFixed(2)),
+                    saldo_bs_generado: Number(montoGeneradoBs.toFixed(2)),
+                    saldo_bs_pagado: Number(montoPagadoBs.toFixed(2)),
+                    saldo_bs_pendiente: Number(deudaBs.toFixed(2)),
                     porcentaje_morosidad: Number(morosidad.toFixed(2)),
                 };
             });
@@ -166,11 +173,31 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const cuota = req.body?.cuota_participacion === null || req.body?.cuota_participacion === undefined
                 ? null
                 : toNumber(req.body?.cuota_participacion);
+            const zonaIdRaw = req.body?.zona_id;
+            const zonaId = zonaIdRaw === null || zonaIdRaw === undefined || String(zonaIdRaw).trim() === ''
+                ? null
+                : toPositiveInt(zonaIdRaw);
 
             if (!nombre) return res.status(400).json({ status: 'error', message: 'nombre_referencia es requerido.' });
             if (!rif) return res.status(400).json({ status: 'error', message: 'rif es requerido.' });
             if (!isValidJuntaRif(rif)) return res.status(400).json({ status: 'error', message: 'El RIF de la junta debe comenzar con J y contener solo números luego del prefijo.' });
             if (cuota !== null && cuota < 0) return res.status(400).json({ status: 'error', message: 'cuota_participacion no puede ser negativa.' });
+            if (zonaIdRaw !== null && zonaIdRaw !== undefined && String(zonaIdRaw).trim() !== '' && !zonaId) {
+                return res.status(400).json({ status: 'error', message: 'zona_id inválida.' });
+            }
+            if (zonaId) {
+                const zonaValida = await pool.query<{ id: number }>(
+                    `SELECT id
+                     FROM zonas
+                     WHERE id = $1
+                       AND condominio_id = $2
+                     LIMIT 1`,
+                    [zonaId, condo.id]
+                );
+                if (!zonaValida.rows[0]) {
+                    return res.status(400).json({ status: 'error', message: 'La zona seleccionada no existe en la Junta General.' });
+                }
+            }
             const generalRif = normalizeJuntaRif(condo.rif || '');
             if (generalRif && generalRif === rif) {
                 return res.status(409).json({ status: 'error', message: 'No puedes registrar una junta individual con el mismo RIF de la Junta General.' });
@@ -211,16 +238,18 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     nombre_referencia,
                     rif,
                     cuota_participacion,
+                    zona_id,
                     activo,
                     es_fantasma,
                     vinculado_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5, true, $6, $7
+                    $1, $2, $3, $4, $5, $6, true, $7, $8
                 )
                 ON CONFLICT (junta_general_id, rif)
                 DO UPDATE SET
                     nombre_referencia = EXCLUDED.nombre_referencia,
                     cuota_participacion = EXCLUDED.cuota_participacion,
+                    zona_id = EXCLUDED.zona_id,
                     condominio_individual_id = COALESCE(EXCLUDED.condominio_individual_id, junta_general_miembros.condominio_individual_id),
                     es_fantasma = CASE WHEN EXCLUDED.condominio_individual_id IS NULL THEN true ELSE false END,
                     vinculado_at = CASE WHEN EXCLUDED.condominio_individual_id IS NULL THEN junta_general_miembros.vinculado_at ELSE now() END,
@@ -234,6 +263,7 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     nombre,
                     rif,
                     cuota,
+                    zonaId,
                     linked ? false : true,
                     linked ? new Date().toISOString() : null,
                 ]
@@ -285,12 +315,32 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 ? null
                 : toNumber(req.body?.cuota_participacion);
             const rifMaybe = req.body?.rif !== undefined ? normalizeJuntaRif(req.body?.rif) : null;
+            const zonaIdRaw = req.body?.zona_id;
+            const zonaId = zonaIdRaw === null || zonaIdRaw === undefined || String(zonaIdRaw).trim() === ''
+                ? null
+                : toPositiveInt(zonaIdRaw);
 
             if (!nombre) return res.status(400).json({ status: 'error', message: 'nombre_referencia es requerido.' });
             if (cuota !== null && cuota < 0) return res.status(400).json({ status: 'error', message: 'cuota_participacion inválida.' });
             if (rifMaybe !== null && !rifMaybe) return res.status(400).json({ status: 'error', message: 'rif inválido.' });
             if (rifMaybe !== null && !isValidJuntaRif(rifMaybe)) {
                 return res.status(400).json({ status: 'error', message: 'El RIF de la junta debe comenzar con J y contener solo números luego del prefijo.' });
+            }
+            if (zonaIdRaw !== null && zonaIdRaw !== undefined && String(zonaIdRaw).trim() !== '' && !zonaId) {
+                return res.status(400).json({ status: 'error', message: 'zona_id inválida.' });
+            }
+            if (zonaId) {
+                const zonaValida = await pool.query<{ id: number }>(
+                    `SELECT id
+                     FROM zonas
+                     WHERE id = $1
+                       AND condominio_id = $2
+                     LIMIT 1`,
+                    [zonaId, condo.id]
+                );
+                if (!zonaValida.rows[0]) {
+                    return res.status(400).json({ status: 'error', message: 'La zona seleccionada no existe en la Junta General.' });
+                }
             }
 
             const currentMember = await pool.query<{
@@ -355,11 +405,12 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 SET nombre_referencia = $1,
                     cuota_participacion = $2,
                     rif = COALESCE($3, rif),
+                    zona_id = $4,
                     updated_at = now()
-                WHERE id = $4
-                  AND junta_general_id = $5
+                WHERE id = $5
+                  AND junta_general_id = $6
                 `,
-                [nombre, cuota, rifMaybe, id, condo.id]
+                [nombre, cuota, rifMaybe, zonaId, id, condo.id]
             );
 
             if (!updated.rowCount) return res.status(404).json({ status: 'error', message: 'Miembro no encontrado.' });
@@ -636,6 +687,9 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 const generado = toNumber(m.saldo_usd_generado as string | number | null);
                 const pagado = toNumber(m.saldo_usd_pagado as string | number | null);
                 const pendiente = Math.max(0, generado - pagado);
+                const generadoBs = toNumber(m.saldo_bs_generado as string | number | null);
+                const pagadoBs = toNumber(m.saldo_bs_pagado as string | number | null);
+                const pendienteBs = Math.max(0, generadoBs - pagadoBs);
                 const morosidad = generado > 0 ? (pendiente / generado) * 100 : 0;
                 return {
                     miembro_id: m.id,
@@ -647,6 +701,9 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     saldo_usd_generado: Number(generado.toFixed(2)),
                     saldo_usd_pagado: Number(pagado.toFixed(2)),
                     saldo_usd_pendiente: Number(pendiente.toFixed(2)),
+                    saldo_bs_generado: Number(generadoBs.toFixed(2)),
+                    saldo_bs_pagado: Number(pagadoBs.toFixed(2)),
+                    saldo_bs_pendiente: Number(pendienteBs.toFixed(2)),
                     porcentaje_morosidad: Number(morosidad.toFixed(2)),
                     estado_cuenta: pendiente <= 0.005 ? 'SOLVENTE' : pagado > 0 ? 'ABONADO' : 'PENDIENTE',
                 };
@@ -655,6 +712,9 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const totalGenerado = resumen.reduce((acc, r) => acc + r.saldo_usd_generado, 0);
             const totalPagado = resumen.reduce((acc, r) => acc + r.saldo_usd_pagado, 0);
             const totalPendiente = resumen.reduce((acc, r) => acc + r.saldo_usd_pendiente, 0);
+            const totalGeneradoBs = resumen.reduce((acc, r) => acc + r.saldo_bs_generado, 0);
+            const totalPagadoBs = resumen.reduce((acc, r) => acc + r.saldo_bs_pagado, 0);
+            const totalPendienteBs = resumen.reduce((acc, r) => acc + r.saldo_bs_pendiente, 0);
 
             return res.json({
                 status: 'success',
@@ -666,12 +726,137 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         total_usd_generado: Number(totalGenerado.toFixed(2)),
                         total_usd_pagado: Number(totalPagado.toFixed(2)),
                         total_usd_pendiente: Number(totalPendiente.toFixed(2)),
+                        total_bs_generado: Number(totalGeneradoBs.toFixed(2)),
+                        total_bs_pagado: Number(totalPagadoBs.toFixed(2)),
+                        total_bs_pendiente: Number(totalPendienteBs.toFixed(2)),
                         porcentaje_morosidad_global: Number((totalGenerado > 0 ? (totalPendiente / totalGenerado) * 100 : 0).toFixed(2)),
                     },
                 },
             });
         } catch (error) {
             const message = error instanceof Error ? error.message : 'Error al cargar resumen.';
+            return res.status(500).json({ status: 'error', message });
+        }
+    });
+
+    app.get('/juntas-generales/conciliacion', verifyToken, async (req: Request, res: Response) => {
+        try {
+            const auth = asAuthUser(req.user);
+            await ensureJuntaGeneralSchema(pool);
+            const condo = await resolveCondominioSesion(auth);
+            if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
+
+            const mes = String(req.query?.mes || '').trim();
+            const miembroId = toPositiveInt(req.query?.miembro_id);
+            const estado = String(req.query?.estado || '').trim().toUpperCase();
+
+            const conciliacionRes = await pool.query<{
+                detalle_id: number;
+                aviso_id: number;
+                mes_origen: string;
+                miembro_id: number | null;
+                junta_nombre: string;
+                rif: string | null;
+                gasto_id: number | null;
+                concepto: string | null;
+                monto_usd: string | number;
+                monto_bs: string | number;
+                pagado_usd: string | number;
+                pagado_bs: string | number;
+                pendiente_usd: string | number;
+                pendiente_bs: string | number;
+                estado_detalle: string | null;
+                estado_conciliacion: string;
+            }>(
+                `
+                SELECT
+                    d.id AS detalle_id,
+                    a.id AS aviso_id,
+                    a.mes_origen,
+                    m.id AS miembro_id,
+                    COALESCE(ci.nombre_legal, ci.nombre, m.nombre_referencia, 'Junta Individual') AS junta_nombre,
+                    COALESCE(ci.rif, m.rif) AS rif,
+                    g.id AS gasto_id,
+                    g.concepto,
+                    d.monto_usd,
+                    d.monto_bs,
+                    COALESCE(g.monto_pagado_usd, 0) AS pagado_usd,
+                    CASE
+                        WHEN COALESCE(d.monto_usd, 0) > 0
+                            THEN COALESCE(g.monto_pagado_usd, 0) * (COALESCE(d.monto_bs, 0) / NULLIF(d.monto_usd, 0))
+                        ELSE 0
+                    END AS pagado_bs,
+                    GREATEST(COALESCE(d.monto_usd, 0) - COALESCE(g.monto_pagado_usd, 0), 0) AS pendiente_usd,
+                    GREATEST(
+                        COALESCE(d.monto_bs, 0) -
+                        CASE
+                            WHEN COALESCE(d.monto_usd, 0) > 0
+                                THEN COALESCE(g.monto_pagado_usd, 0) * (COALESCE(d.monto_bs, 0) / NULLIF(d.monto_usd, 0))
+                            ELSE 0
+                        END,
+                        0
+                    ) AS pendiente_bs,
+                    d.estado AS estado_detalle,
+                    CASE
+                        WHEN COALESCE(g.id, 0) = 0 THEN 'PENDIENTE_VINCULACION'
+                        WHEN GREATEST(COALESCE(d.monto_usd, 0) - COALESCE(g.monto_pagado_usd, 0), 0) <= 0.005 THEN 'CONCILIADO'
+                        WHEN COALESCE(g.monto_pagado_usd, 0) > 0 THEN 'ABONADO'
+                        ELSE 'PENDIENTE'
+                    END AS estado_conciliacion
+                FROM junta_general_aviso_detalles d
+                INNER JOIN junta_general_avisos a ON a.id = d.aviso_id
+                LEFT JOIN junta_general_miembros m ON m.id = d.miembro_id
+                LEFT JOIN condominios ci ON ci.id = d.condominio_individual_id
+                LEFT JOIN gastos g ON g.id = d.gasto_generado_id
+                WHERE a.junta_general_id = $1
+                  AND ($2::text = '' OR a.mes_origen = $2)
+                  AND ($3::int IS NULL OR m.id = $3)
+                  AND (
+                    $4::text = ''
+                    OR CASE
+                        WHEN COALESCE(g.id, 0) = 0 THEN 'PENDIENTE_VINCULACION'
+                        WHEN GREATEST(COALESCE(d.monto_usd, 0) - COALESCE(g.monto_pagado_usd, 0), 0) <= 0.005 THEN 'CONCILIADO'
+                        WHEN COALESCE(g.monto_pagado_usd, 0) > 0 THEN 'ABONADO'
+                        ELSE 'PENDIENTE'
+                    END = $4
+                  )
+                ORDER BY a.mes_origen DESC, d.id DESC
+                LIMIT 500
+                `,
+                [condo.id, mes, miembroId, estado]
+            );
+
+            const rows = conciliacionRes.rows.map((r) => ({
+                ...r,
+                monto_usd: Number(toNumber(r.monto_usd).toFixed(2)),
+                monto_bs: Number(toNumber(r.monto_bs).toFixed(2)),
+                pagado_usd: Number(toNumber(r.pagado_usd).toFixed(2)),
+                pagado_bs: Number(toNumber(r.pagado_bs).toFixed(2)),
+                pendiente_usd: Number(toNumber(r.pendiente_usd).toFixed(2)),
+                pendiente_bs: Number(toNumber(r.pendiente_bs).toFixed(2)),
+            }));
+
+            const metricas = {
+                total_registros: rows.length,
+                total_monto_usd: Number(rows.reduce((acc, r) => acc + Number(r.monto_usd || 0), 0).toFixed(2)),
+                total_monto_bs: Number(rows.reduce((acc, r) => acc + Number(r.monto_bs || 0), 0).toFixed(2)),
+                total_pagado_usd: Number(rows.reduce((acc, r) => acc + Number(r.pagado_usd || 0), 0).toFixed(2)),
+                total_pagado_bs: Number(rows.reduce((acc, r) => acc + Number(r.pagado_bs || 0), 0).toFixed(2)),
+                total_pendiente_usd: Number(rows.reduce((acc, r) => acc + Number(r.pendiente_usd || 0), 0).toFixed(2)),
+                total_pendiente_bs: Number(rows.reduce((acc, r) => acc + Number(r.pendiente_bs || 0), 0).toFixed(2)),
+            };
+
+            return res.json({
+                status: 'success',
+                data: {
+                    filtros: { mes: mes || null, miembro_id: miembroId || null, estado: estado || null },
+                    metricas,
+                    registros: rows,
+                },
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Error al cargar conciliación.';
             return res.status(500).json({ status: 'error', message });
         }
     });

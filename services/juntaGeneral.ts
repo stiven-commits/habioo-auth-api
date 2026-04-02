@@ -18,6 +18,8 @@ export interface JuntaGeneralMiembroRow extends QueryResultRow {
     nombre_referencia: string;
     rif: string;
     cuota_participacion: string | number | null;
+    zona_id: number | null;
+    zona_nombre: string | null;
     activo: boolean;
     es_fantasma: boolean;
     codigo_invitacion: string | null;
@@ -29,6 +31,8 @@ export interface JuntaGeneralMiembroRow extends QueryResultRow {
     condominio_admin_user_id: number | null;
     saldo_usd_generado: string | number | null;
     saldo_usd_pagado: string | number | null;
+    saldo_bs_generado: string | number | null;
+    saldo_bs_pagado: string | number | null;
 }
 
 let ensureJuntaGeneralSchemaPromise: Promise<void> | null = null;
@@ -72,9 +76,15 @@ const ensureJuntaGeneralSchema = async (pool: Pool): Promise<void> => {
                 WHERE codigo_invitacion IS NOT NULL
             `);
 
+            await pool.query("ALTER TABLE junta_general_miembros ADD COLUMN IF NOT EXISTS zona_id integer NULL REFERENCES zonas(id) ON DELETE SET NULL");
+
             await pool.query(`
                 CREATE INDEX IF NOT EXISTS idx_junta_general_miembros_general
                 ON junta_general_miembros (junta_general_id)
+            `);
+            await pool.query(`
+                CREATE INDEX IF NOT EXISTS idx_junta_general_miembros_zona
+                ON junta_general_miembros (zona_id)
             `);
 
             await pool.query(`
@@ -218,6 +228,8 @@ const listJuntaGeneralMiembrosActivos = async (
             m.nombre_referencia,
             m.rif,
             m.cuota_participacion,
+            m.zona_id,
+            z.nombre AS zona_nombre,
             m.activo,
             m.es_fantasma,
             m.codigo_invitacion,
@@ -228,16 +240,28 @@ const listJuntaGeneralMiembrosActivos = async (
             c.tipo AS condominio_tipo,
             c.admin_user_id AS condominio_admin_user_id,
             COALESCE(SUM(d.monto_usd), 0) AS saldo_usd_generado,
-            COALESCE(SUM(CASE WHEN g.id IS NULL THEN 0 ELSE LEAST(COALESCE(g.monto_pagado_usd, 0), d.monto_usd) END), 0) AS saldo_usd_pagado
+            COALESCE(SUM(CASE WHEN g.id IS NULL THEN 0 ELSE LEAST(COALESCE(g.monto_pagado_usd, 0), d.monto_usd) END), 0) AS saldo_usd_pagado,
+            COALESCE(SUM(d.monto_bs), 0) AS saldo_bs_generado,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN g.id IS NULL THEN 0
+                        WHEN COALESCE(d.monto_usd, 0) <= 0 THEN 0
+                        ELSE LEAST(COALESCE(g.monto_pagado_usd, 0), d.monto_usd) * (COALESCE(d.monto_bs, 0) / NULLIF(d.monto_usd, 0))
+                    END
+                ),
+                0
+            ) AS saldo_bs_pagado
         FROM junta_general_miembros m
         LEFT JOIN condominios c ON c.id = m.condominio_individual_id
+        LEFT JOIN zonas z ON z.id = m.zona_id AND z.condominio_id = m.junta_general_id
         LEFT JOIN junta_general_aviso_detalles d ON d.miembro_id = m.id
         LEFT JOIN gastos g ON g.id = d.gasto_generado_id
         WHERE m.junta_general_id = $1
           AND ($2::boolean = true OR m.activo = true)
         GROUP BY
             m.id, m.junta_general_id, m.condominio_individual_id, m.nombre_referencia, m.rif,
-            m.cuota_participacion, m.activo, m.es_fantasma, m.codigo_invitacion, m.codigo_expira_at,
+            m.cuota_participacion, m.zona_id, z.nombre, m.activo, m.es_fantasma, m.codigo_invitacion, m.codigo_expira_at,
             m.vinculado_at,
             c.nombre_legal, c.rif, c.tipo, c.admin_user_id
         ORDER BY m.id ASC

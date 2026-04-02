@@ -1,4 +1,4 @@
-import type { Application, NextFunction, Request, Response } from 'express';
+﻿import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 
 const fs: typeof import('fs') = require('fs');
@@ -9,6 +9,7 @@ const sharp: typeof import('sharp') = require('sharp');
 interface AuthUser {
     id: number;
     cedula: string;
+    condominio_id?: number;
 }
 
 interface AuthDependencies {
@@ -46,6 +47,7 @@ interface ICondominioConfigRow {
 interface ICondominioMesRow {
     id: number;
     mes_actual: string | null;
+    tipo?: string | null;
 }
 
 interface IInsertedIdRow {
@@ -103,6 +105,16 @@ interface IPreliminarGastoRow {
 
 interface IAlicuotaRow {
     alicuota: string | number;
+}
+
+interface IJuntaMiembroPreliminar {
+    id: number;
+    nombre: string;
+    rif: string;
+    cuota_participacion: number;
+    vinculada: boolean;
+    es_fantasma: boolean;
+    activo: boolean;
 }
 
 interface IPropiedadCierreRow {
@@ -212,6 +224,38 @@ const asAuthUser = (value: unknown): AuthUser => {
     return value as AuthUser;
 };
 
+const resolveCondominioBySession = async (pool: Pool, user: AuthUser): Promise<ICondominioConfigRow | null> => {
+    const tokenCondoId = typeof user.condominio_id === 'number' && Number.isFinite(user.condominio_id) && user.condominio_id > 0
+        ? user.condominio_id
+        : null;
+
+    if (tokenCondoId) {
+        const byId = await pool.query<ICondominioConfigRow>(
+            `SELECT id, mes_actual, metodo_division, metodo_division_manual, tipo,
+                    nombre, nombre_legal, rif, estado_venezuela,
+                    admin_nombre, admin_rif, admin_correo, logo_url,
+                    aviso_msg_1, aviso_msg_2, aviso_msg_3, aviso_msg_4
+             FROM condominios
+             WHERE id = $1
+             LIMIT 1`,
+            [tokenCondoId]
+        );
+        if (byId.rows[0]) return byId.rows[0];
+    }
+
+    const byAdmin = await pool.query<ICondominioConfigRow>(
+        `SELECT id, mes_actual, metodo_division, metodo_division_manual, tipo,
+                nombre, nombre_legal, rif, estado_venezuela,
+                admin_nombre, admin_rif, admin_correo, logo_url,
+                aviso_msg_1, aviso_msg_2, aviso_msg_3, aviso_msg_4
+         FROM condominios
+         WHERE admin_user_id = $1
+         LIMIT 1`,
+        [user.id]
+    );
+    return byAdmin.rows[0] || null;
+};
+
 const asString = (value: unknown): string => {
     if (typeof value !== 'string') {
         throw new TypeError('Invalid string value');
@@ -221,6 +265,11 @@ const asString = (value: unknown): string => {
 
 const asError = (value: unknown): Error => {
     return value instanceof Error ? value : new Error(String(value));
+};
+const toPositiveInt = (value: unknown): number | null => {
+    const n = parseInt(String(value ?? ''), 10);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n;
 };
 
 const toNumber = (value: string | number | null | undefined): number => parseFloat(String(value ?? 0)) || 0;
@@ -279,12 +328,12 @@ const ensureMetodoDivisionManualColumn = async (pool: Pool): Promise<void> => {
 const fetchBcvRateToday = async (): Promise<number> => {
     const response = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
     if (!response.ok) {
-        throw new Error('No se pudo obtener la tasa BCV del día.');
+        throw new Error('No se pudo obtener la tasa BCV del dÃ­a.');
     }
     const data = await response.json() as IBcvApiResponse;
     const rate = toNumber(data?.promedio);
     if (!Number.isFinite(rate) || rate <= 0) {
-        throw new Error('La tasa BCV del día es inválida.');
+        throw new Error('La tasa BCV del dÃ­a es invÃ¡lida.');
     }
     return rate;
 };
@@ -334,6 +383,25 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         storage: multer.memoryStorage(),
         limits: { fileSize: 10 * 1024 * 1024 },
     });
+
+    const validateJerarquiaGastoInput = (input: {
+        esJuntaGeneral: boolean;
+        tipo: string;
+        zonaId: unknown;
+        propiedadId: unknown;
+    }): string | null => {
+        if (!input.esJuntaGeneral) return null;
+        const hasPropiedad = input.propiedadId !== null && input.propiedadId !== undefined && String(input.propiedadId).trim() !== '';
+        const tipo = String(input.tipo || '').trim();
+        if (tipo === 'Individual' || hasPropiedad) {
+            return 'La Junta General no puede asociar gastos a inmuebles individuales.';
+        }
+        const hasZona = input.zonaId !== null && input.zonaId !== undefined && String(input.zonaId).trim() !== '';
+        if ((tipo === 'Zona' || tipo === 'No Comun') && !hasZona) {
+            return 'Para gastos por zona debes indicar una zona válida.';
+        }
+        return null;
+    };
 
     app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount: 1 }, { name: 'soportes', maxCount: 4 }]), async (req: Request<{}, unknown, CreateGastoBody>, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
@@ -387,12 +455,13 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const t_c = parseLocaleNumber(tasa_cambio);
             const fechaGastoSafe = toIsoDateOrNull(fecha_gasto);
 
-            const condoRes = await pool.query<ICondominioMesRow>('SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            const condoRes = await pool.query<ICondominioMesRow>('SELECT id, mes_actual, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             if (condoRes.rows.length === 0) {
                 return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para el administrador.' });
             }
             const condominio_id = condoRes.rows[0].id;
             const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0].mes_actual);
+            const esJuntaGeneral = isJuntaGeneralTipo(condoRes.rows[0].tipo);
 
             const monto_usd = (m_bs / t_c).toFixed(2);
             const monto_cuota_usd = (parseFloat(monto_usd) / parseInt(String(total_cuotas), 10)).toFixed(2);
@@ -402,6 +471,15 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
             const dbTipo = tipo || 'Comun';
             const dbClasificacion = String(clasificacion || '').trim().toLowerCase() === 'fijo' ? 'Fijo' : 'Variable';
+            const invalidJerarquiaMsg = validateJerarquiaGastoInput({
+                esJuntaGeneral,
+                tipo: dbTipo,
+                zonaId: zona_id,
+                propiedadId: propiedad_id,
+            });
+            if (invalidJerarquiaMsg) {
+                return res.status(403).json({ status: 'error', message: invalidJerarquiaMsg });
+            }
             const zId = dbTipo === 'Zona' || dbTipo === 'No Comun' ? (zona_id || null) : null;
             const pId = dbTipo === 'Individual' ? (propiedad_id || null) : null;
             const numeroDocSafe = String(numero_documento || '').trim();
@@ -441,12 +519,13 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
         let inTransaction = false;
         try {
-            const condoRes = await pool.query<ICondominioMesRow>('SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+            const condoRes = await pool.query<ICondominioMesRow>('SELECT id, mes_actual, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             if (condoRes.rows.length === 0) {
                 return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para el administrador.' });
             }
             const condominio_id = condoRes.rows[0].id;
             const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0].mes_actual);
+            const esJuntaGeneral = isJuntaGeneralTipo(condoRes.rows[0].tipo);
 
             const ownGastoRes = await pool.query<IGastoImagenesRow>(
                 'SELECT id, condominio_id, factura_img, imagenes FROM gastos WHERE id = $1 LIMIT 1',
@@ -529,6 +608,15 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
             const dbTipo = tipo || 'Comun';
             const dbClasificacion = String(clasificacion || '').trim().toLowerCase() === 'fijo' ? 'Fijo' : 'Variable';
+            const invalidJerarquiaMsg = validateJerarquiaGastoInput({
+                esJuntaGeneral,
+                tipo: dbTipo,
+                zonaId: zona_id,
+                propiedadId: propiedad_id,
+            });
+            if (invalidJerarquiaMsg) {
+                return res.status(403).json({ status: 'error', message: invalidJerarquiaMsg });
+            }
             const zId = dbTipo === 'Zona' || dbTipo === 'No Comun' ? (zona_id || null) : null;
             const pId = dbTipo === 'Individual' ? (propiedad_id || null) : null;
             const numeroDocSafe = String(numero_documento || '').trim();
@@ -658,13 +746,16 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const user = asAuthUser(req.user);
             await ensureMetodoDivisionManualColumn(pool);
             await ensureJuntaGeneralSchema(pool);
-            const condoRes = await pool.query<ICondominioConfigRow>('SELECT id, mes_actual, metodo_division, metodo_division_manual, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            const { id: condominio_id, metodo_division: metodoDivisionActual } = condoRes.rows[0];
-            const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0]?.mes_actual);
-            if (!condoRes.rows[0]?.mes_actual) {
+            const condo = await resolveCondominioBySession(pool, user);
+            if (!condo) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            }
+            const { id: condominio_id, metodo_division: metodoDivisionActual } = condo;
+            const mes_actual = asYyyyMmOrPrevious(condo?.mes_actual);
+            if (!condo?.mes_actual) {
                 await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [mes_actual, condominio_id]);
             }
-            const metodoDivisionManual = Boolean(condoRes.rows[0]?.metodo_division_manual);
+            const metodoDivisionManual = Boolean(condo?.metodo_division_manual);
             const gastosRes = await pool.query<IPreliminarGastoRow>(
                 `
             SELECT g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, p.nombre as proveedor, g.nota, g.monto_usd as monto_total_usd, gc.mes_asignado,
@@ -675,10 +766,22 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 [condominio_id, mes_actual]
             );
             const total_usd = gastosRes.rows.filter((g) => g.mes_asignado === mes_actual).reduce((sum, item) => sum + parseFloat(String(item.monto_cuota_usd)), 0);
-            const esJuntaGeneral = isJuntaGeneralTipo(condoRes.rows[0]?.tipo);
+            const esJuntaGeneral = isJuntaGeneralTipo(condo?.tipo);
+            const miembrosGeneral = esJuntaGeneral ? await listJuntaGeneralMiembrosActivos(pool, condominio_id) : [];
             const alicuotas = esJuntaGeneral
-                ? (await listJuntaGeneralMiembrosActivos(pool, condominio_id)).map((r) => parseFloat(String(r.cuota_participacion || 0)))
+                ? miembrosGeneral.map((r) => parseFloat(String(r.cuota_participacion || 0)))
                 : (await pool.query<IAlicuotaRow>('SELECT alicuota FROM propiedades WHERE condominio_id = $1 ORDER BY alicuota ASC', [condominio_id])).rows.map((r) => parseFloat(String(r.alicuota)));
+            const miembrosDistribucion: IJuntaMiembroPreliminar[] = esJuntaGeneral
+                ? miembrosGeneral.map((m) => ({
+                    id: Number(m.id || 0),
+                    nombre: String(m.condominio_nombre || m.nombre_referencia || `Junta ${m.id}`),
+                    rif: String(m.condominio_rif || m.rif || ''),
+                    cuota_participacion: Number(toNumber(m.cuota_participacion as string | number | null).toFixed(6)),
+                    vinculada: Boolean(m.condominio_individual_id),
+                    es_fantasma: Boolean(m.es_fantasma || !m.condominio_individual_id),
+                    activo: Boolean(m.activo !== false),
+                }))
+                : [];
             let metodoDivisionEfectivo: 'Alicuota' | 'Partes Iguales' = metodoDivisionActual === 'Partes Iguales' ? 'Partes Iguales' : 'Alicuota';
 
             if (!metodoDivisionManual && alicuotas.length > 0) {
@@ -697,26 +800,31 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 total_usd: total_usd.toFixed(2),
                 alicuotas_disponibles: alicuotas,
                 jerarquia_objetivo: esJuntaGeneral ? 'Juntas Individuales' : 'Inmuebles',
+                miembros_distribucion: miembrosDistribucion,
             });
         } catch (err: unknown) {
             const error = asError(err);
             res.status(500).json({ error: error.message });
         }
     });
-    // ðŸ’¡ NUEVA RUTA: CAMBIAR REGLA DE DIVISIÃ“N DE GASTOS
+    // Ã°Å¸â€™Â¡ NUEVA RUTA: CAMBIAR REGLA DE DIVISIÃƒâ€œN DE GASTOS
     app.put('/metodo-division', verifyToken, async (req: Request<{}, unknown, MetodoDivisionBody>, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
         const { metodo } = req.body;
         if (!['Alicuota', 'Partes Iguales'].includes(metodo)) {
-            return res.status(400).json({ error: 'MÃ©todo invÃ¡lido.' });
+            return res.status(400).json({ error: 'MÃƒÂ©todo invÃƒÂ¡lido.' });
         }
         try {
             await ensureMetodoDivisionManualColumn(pool);
+            const condo = await resolveCondominioBySession(pool, user);
+            if (!condo) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            }
             await pool.query(
-                'UPDATE condominios SET metodo_division = $1, metodo_division_manual = true WHERE admin_user_id = $2',
-                [metodo, user.id]
+                'UPDATE condominios SET metodo_division = $1, metodo_division_manual = true WHERE id = $2',
+                [metodo, condo.id]
             );
-            res.json({ status: 'success', message: `MÃ©todo actualizado a ${metodo}` });
+            res.json({ status: 'success', message: `MÃƒÂ©todo actualizado a ${metodo}` });
         } catch (err: unknown) {
             const error = asError(err);
             res.status(500).json({ error: error.message });
@@ -728,23 +836,19 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const user = asAuthUser(req.user);
             await pool.query('BEGIN');
 
-            const condoRes = await pool.query<ICondominioConfigRow>(
-                `SELECT
-                    id, mes_actual, metodo_division, tipo, estado_venezuela, nombre, nombre_legal, rif,
-                    admin_nombre, admin_rif, admin_correo, logo_url,
-                    aviso_msg_1, aviso_msg_2, aviso_msg_3, aviso_msg_4
-                 FROM condominios
-                 WHERE admin_user_id = $1
-                 LIMIT 1`,
-                [user.id]
-            );
+            const condo = await resolveCondominioBySession(pool, user);
+            if (!condo) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            }
+            const condoRes = { rows: [condo] as ICondominioConfigRow[] };
             const { id: condo_id, metodo_division } = condoRes.rows[0];
             const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0]?.mes_actual);
             if (!condoRes.rows[0]?.mes_actual) {
                 await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [mes_actual, condo_id]);
             }
 
-            // ðŸ’¡ 1. Agregamos "saldo_actual" a la bÃºsqueda de propiedades
+            // Ã°Å¸â€™Â¡ 1. Agregamos "saldo_actual" a la bÃƒÂºsqueda de propiedades
             const esJuntaGeneral = isJuntaGeneralTipo(condoRes.rows[0]?.tipo);
             if (esJuntaGeneral) {
                 await ensureJuntaGeneralSchema(pool);
@@ -770,18 +874,161 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                      WHERE g.condominio_id = $1
                        AND gc.mes_asignado = $2
                        AND gc.estado = 'Pendiente'
-                       AND g.tipo IN ('Comun', 'Extra')`,
-                    [condo_id, mes_actual]
-                );
+                       AND g.tipo IN ('Comun', 'Extra', 'Zona', 'No Comun')`,
+                     [condo_id, mes_actual]
+                 );
                 const totalAvisoUsd = cuotasResGeneral.rows.reduce((acc, c) => acc + toNumber(c.monto_cuota_usd), 0);
                 const totalAvisoBs = cuotasResGeneral.rows.reduce((acc, c) => acc + (toNumber(c.monto_cuota_usd) * Math.max(toNumber(c.tasa_cambio), 0)), 0);
                 const tasaReferencia = totalAvisoUsd > 0 ? totalAvisoBs / totalAvisoUsd : 0;
                 const miembros = await listJuntaGeneralMiembrosActivos(pool, condo_id);
                 const miembrosActivos = miembros.filter((m) => Boolean(m.activo !== false));
                 const metodoGeneral = (metodo_division === 'Partes Iguales' ? 'Partes Iguales' : 'Alicuota') as 'Partes Iguales' | 'Alicuota';
+                const warnings: string[] = [];
+                if (totalAvisoUsd <= 0) {
+                    warnings.push('No hay gastos pendientes (comunes, extraordinarios o por zona) para distribuir en este periodo.');
+                }
+                if (totalAvisoUsd > 0 && miembrosActivos.length === 0) {
+                    await pool.query('ROLLBACK');
+                    return res.status(422).json({
+                        status: 'error',
+                        message: 'No se puede cerrar el mes: no hay juntas individuales activas para distribuir el aviso general.',
+                        warnings,
+                    });
+                }
+                if (totalAvisoUsd > 0 && metodoGeneral === 'Alicuota') {
+                    const totalAlicuotas = miembrosActivos.reduce(
+                        (acc, m) => acc + Math.max(0, toNumber(m.cuota_participacion as string | number | null)),
+                        0
+                    );
+                    if (totalAlicuotas <= 0) {
+                        await pool.query('ROLLBACK');
+                        return res.status(422).json({
+                            status: 'error',
+                            message: 'No se puede cerrar el mes con metodo por alicuota: la suma de alicuotas activas es 0.',
+                            warnings,
+                        });
+                    }
+                }
+                const distribucionResumen = {
+                    metodo_division: metodoGeneral,
+                    total_miembros: miembrosActivos.length,
+                    total_usd: Number(totalAvisoUsd.toFixed(2)),
+                    generados: 0,
+                    fantasma: 0,
+                    error: 0,
+                    detalles: [] as Array<{
+                        miembro_id: number | null;
+                        nombre_junta: string;
+                        rif: string;
+                        monto_usd: number;
+                        monto_bs: number;
+                        estado: 'GENERADO' | 'FANTASMA' | 'ERROR';
+                        nota?: string;
+                        condominio_individual_id?: number | null;
+                        gasto_generado_id?: number | null;
+                    }>,
+                };
 
                 let avisoId: number | null = null;
                 if (totalAvisoUsd > 0 && miembrosActivos.length > 0) {
+                    const asignacionPorMiembro = new Map<number, {
+                        miembro: Record<string, unknown>;
+                        monto_usd: number;
+                        monto_bs: number;
+                    }>();
+                    const erroresDistribucion: string[] = [];
+
+                    const acumularAsignacion = (miembro: Record<string, unknown>, montoUsd: number, montoBs: number): void => {
+                        const miembroId = Number(miembro.id || 0);
+                        if (!miembroId) return;
+                        const prev = asignacionPorMiembro.get(miembroId);
+                        if (prev) {
+                            prev.monto_usd = Number((prev.monto_usd + montoUsd).toFixed(2));
+                            prev.monto_bs = Number((prev.monto_bs + montoBs).toFixed(2));
+                            return;
+                        }
+                        asignacionPorMiembro.set(miembroId, {
+                            miembro,
+                            monto_usd: Number(montoUsd.toFixed(2)),
+                            monto_bs: Number(montoBs.toFixed(2)),
+                        });
+                    };
+
+                    for (const cuota of cuotasResGeneral.rows) {
+                        const cuotaUsd = Number(toNumber(cuota.monto_cuota_usd).toFixed(2));
+                        if (cuotaUsd <= 0) continue;
+
+                        const tipoCuota = String(cuota.tipo || 'Comun').trim();
+                        const zonaCuotaId = toPositiveInt(cuota.zona_id);
+                        const aplicaPorZona = (tipoCuota === 'Zona' || tipoCuota === 'No Comun');
+
+                        let candidatos = miembrosActivos;
+                        if (aplicaPorZona) {
+                            if (!zonaCuotaId) {
+                                erroresDistribucion.push(`El gasto "${String(cuota.concepto || 'Sin concepto')}" requiere una zona válida.`);
+                                continue;
+                            }
+                            candidatos = miembrosActivos.filter((m) => toPositiveInt(m.zona_id) === zonaCuotaId);
+                            if (candidatos.length === 0) {
+                                const zonaNombre = String(cuota.zona_nombre || `#${zonaCuotaId}`);
+                                erroresDistribucion.push(`No hay juntas individuales activas asignadas a la zona "${zonaNombre}" para distribuir "${String(cuota.concepto || 'Sin concepto')}".`);
+                                continue;
+                            }
+                        }
+
+                        const totalPesos = candidatos.reduce((acc, m) => {
+                            if (metodoGeneral === 'Partes Iguales') return acc + 1;
+                            return acc + Math.max(0, toNumber(m.cuota_participacion as string | number | null));
+                        }, 0);
+
+                        if (totalPesos <= 0) {
+                            const contexto = aplicaPorZona ? ` en zona ${String(cuota.zona_nombre || cuota.zona_id || '')}` : '';
+                            erroresDistribucion.push(`No se puede distribuir por alicuota el gasto "${String(cuota.concepto || 'Sin concepto')}"${contexto}: la suma de alicuotas es 0.`);
+                            continue;
+                        }
+
+                        let acumuladoCuotaUsd = 0;
+                        const cuotaTasa = Math.max(toNumber(cuota.tasa_cambio), 0);
+                        for (let idx = 0; idx < candidatos.length; idx += 1) {
+                            const m = candidatos[idx];
+                            const basePeso = metodoGeneral === 'Partes Iguales'
+                                ? 1
+                                : Math.max(0, toNumber(m.cuota_participacion as string | number | null));
+                            const peso = totalPesos > 0 ? (basePeso / totalPesos) : 0;
+                            let montoUsdAsignado = Number((cuotaUsd * peso).toFixed(2));
+                            if (idx === candidatos.length - 1) {
+                                montoUsdAsignado = Number((cuotaUsd - acumuladoCuotaUsd).toFixed(2));
+                            }
+                            acumuladoCuotaUsd = Number((acumuladoCuotaUsd + montoUsdAsignado).toFixed(2));
+                            const montoBsAsignado = Number((montoUsdAsignado * cuotaTasa).toFixed(2));
+                            acumularAsignacion(m as Record<string, unknown>, montoUsdAsignado, montoBsAsignado);
+                        }
+                    }
+
+                    if (erroresDistribucion.length > 0) {
+                        await pool.query('ROLLBACK');
+                        return res.status(422).json({
+                            status: 'error',
+                            message: erroresDistribucion[0],
+                            warnings: [...warnings, ...erroresDistribucion.slice(1)],
+                        });
+                    }
+
+                    const miembrosConMonto = Array.from(asignacionPorMiembro.values())
+                        .filter((it) => it.monto_usd > 0)
+                        .sort((a, b) => Number(a.miembro.id || 0) - Number(b.miembro.id || 0));
+                    if (miembrosConMonto.length === 0) {
+                        await pool.query('ROLLBACK');
+                        return res.status(422).json({
+                            status: 'error',
+                            message: 'No se pudo distribuir el aviso: no hay juntas objetivo para los gastos del periodo.',
+                            warnings,
+                        });
+                    }
+                    const totalDistribuidoUsd = Number(miembrosConMonto.reduce((acc, it) => acc + it.monto_usd, 0).toFixed(2));
+                    const totalDistribuidoBs = Number(miembrosConMonto.reduce((acc, it) => acc + it.monto_bs, 0).toFixed(2));
+                    distribucionResumen.total_usd = totalDistribuidoUsd;
+
                     const avisoRes = await pool.query<IInsertedIdRow>(
                         `INSERT INTO junta_general_avisos (junta_general_id, mes_origen, metodo_division, total_usd, total_bs, tasa_referencia, created_by_user_id)
                          VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -790,33 +1037,23 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                             condo_id,
                             mes_actual,
                             metodoGeneral,
-                            Number(totalAvisoUsd.toFixed(2)),
-                            Number(totalAvisoBs.toFixed(2)),
+                            totalDistribuidoUsd,
+                            totalDistribuidoBs,
                             Number(tasaReferencia.toFixed(6)),
                             user.id,
                         ]
                     );
                     avisoId = avisoRes.rows[0].id;
 
-                    const totalCuotas = miembrosActivos.reduce((acc, m) => acc + (metodoGeneral === 'Partes Iguales' ? 1 : Math.max(0, toNumber(m.cuota_participacion as string | number | null))), 0);
-                    let acumuladoUsd = 0;
                     const generalNombre = String(condoRes.rows[0]?.nombre_legal || condoRes.rows[0]?.nombre || 'Junta General').trim();
                     const generalRif = normalizeRif(condoRes.rows[0]?.rif || '');
                     const estadoGeneral = String(condoRes.rows[0]?.estado_venezuela || 'Distrito Capital');
                     const conceptoGeneral = `Aviso Junta General - ${formatMonthText(mes_actual)}`;
 
-                    for (let idx = 0; idx < miembrosActivos.length; idx += 1) {
-                        const m = miembrosActivos[idx];
-                        const basePeso = metodoGeneral === 'Partes Iguales'
-                            ? 1
-                            : Math.max(0, toNumber(m.cuota_participacion as string | number | null));
-                        const peso = totalCuotas > 0 ? (basePeso / totalCuotas) : 0;
-                        let montoUsd = Number((totalAvisoUsd * peso).toFixed(2));
-                        if (idx === miembrosActivos.length - 1) {
-                            montoUsd = Number((totalAvisoUsd - acumuladoUsd).toFixed(2));
-                        }
-                        acumuladoUsd = Number((acumuladoUsd + montoUsd).toFixed(2));
-                        const montoBs = Number((montoUsd * tasaReferencia).toFixed(2));
+                    for (const item of miembrosConMonto) {
+                        const m = item.miembro;
+                        const montoUsd = Number(item.monto_usd.toFixed(2));
+                        const montoBs = Number(item.monto_bs.toFixed(2));
 
                         const detalleRes = await pool.query<IInsertedIdRow>(
                             `INSERT INTO junta_general_aviso_detalles (aviso_id, miembro_id, condominio_individual_id, monto_usd, monto_bs, estado)
@@ -825,6 +1062,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                             [avisoId, m.id as number, (m.condominio_individual_id as number | null) ?? null, montoUsd, montoBs, 'PENDIENTE']
                         );
                         const detalleId = detalleRes.rows[0].id;
+                        const nombreJunta = String((m.condominio_nombre as string | null) || (m.nombre_referencia as string | null) || 'Junta Individual').trim();
+                        const rifJunta = String((m.condominio_rif as string | null) || (m.rif as string | null) || '').trim();
 
                         const condominioIndividualId = (m.condominio_individual_id as number | null) ?? null;
                         if (!condominioIndividualId) {
@@ -835,6 +1074,18 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                                  WHERE id = $1`,
                                 [detalleId]
                             );
+                            distribucionResumen.fantasma += 1;
+                            distribucionResumen.detalles.push({
+                                miembro_id: Number(m.id || 0) || null,
+                                nombre_junta: nombreJunta,
+                                rif: rifJunta,
+                                monto_usd: Number(montoUsd.toFixed(2)),
+                                monto_bs: Number(montoBs.toFixed(2)),
+                                estado: 'FANTASMA',
+                                nota: 'Junta individual no vinculada en Habioo.',
+                                condominio_individual_id: null,
+                                gasto_generado_id: null,
+                            });
                             continue;
                         }
 
@@ -854,6 +1105,18 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                                  WHERE id = $1`,
                                 [detalleId]
                             );
+                            distribucionResumen.error += 1;
+                            distribucionResumen.detalles.push({
+                                miembro_id: Number(m.id || 0) || null,
+                                nombre_junta: nombreJunta,
+                                rif: rifJunta,
+                                monto_usd: Number(montoUsd.toFixed(2)),
+                                monto_bs: Number(montoBs.toFixed(2)),
+                                estado: 'ERROR',
+                                nota: 'Condominio individual no encontrado.',
+                                condominio_individual_id: condominioIndividualId,
+                                gasto_generado_id: null,
+                            });
                             continue;
                         }
 
@@ -869,7 +1132,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                             estadoVenezuela: String(condominioIndividual.estado_venezuela || estadoGeneral || 'Distrito Capital'),
                         });
 
-                        const notaOrigen = `Cargo automático por aviso #${avisoId} de la Junta General (${formatMonthText(mes_actual)}).`;
+                        const notaOrigen = `Cargo automatico por aviso #${avisoId} de la Junta General (${formatMonthText(mes_actual)}).`;
                         const gastoGenerado = await pool.query<IInsertedIdRow>(
                             `INSERT INTO gastos (
                                 condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas,
@@ -911,6 +1174,18 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                              WHERE id = $3`,
                             [gastoId, proveedorId, detalleId]
                         );
+                        distribucionResumen.generados += 1;
+                        distribucionResumen.detalles.push({
+                            miembro_id: Number(m.id || 0) || null,
+                            nombre_junta: nombreJunta,
+                            rif: rifJunta,
+                            monto_usd: Number(montoUsd.toFixed(2)),
+                            monto_bs: Number(montoBs.toFixed(2)),
+                            estado: 'GENERADO',
+                            nota: 'Gasto generado en junta individual.',
+                            condominio_individual_id: condominioIndividual.id,
+                            gasto_generado_id: gastoId,
+                        });
 
                         await pool.query(
                             `INSERT INTO junta_general_notificaciones (condominio_id, tipo, titulo, mensaje, metadata_jsonb)
@@ -918,11 +1193,17 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                             [
                                 condominioIndividual.id,
                                 'Nuevo aviso de Junta General',
-                                `Se agregó un gasto automático por ${formatMonthText(mes_actual)} por USD ${montoUsd.toFixed(2)}.`,
+                                `Se agrego un gasto automatico por ${formatMonthText(mes_actual)} por USD ${montoUsd.toFixed(2)}.`,
                                 JSON.stringify({ aviso_id: avisoId, detalle_id: detalleId, gasto_id: gastoId, junta_general_id: condo_id }),
                             ]
                         );
                     }
+                }
+                if (avisoId && distribucionResumen.fantasma > 0) {
+                    warnings.push(`Quedaron ${distribucionResumen.fantasma} juntas pendientes por vinculacion en Habioo.`);
+                }
+                if (avisoId && distribucionResumen.error > 0) {
+                    warnings.push(`Se detectaron ${distribucionResumen.error} juntas con error de procesamiento. Revisa el detalle de distribucion.`);
                 }
 
                 await pool.query("UPDATE gastos_cuotas SET estado = 'Procesado' FROM gastos WHERE gastos_cuotas.gasto_id = gastos.id AND gastos.condominio_id = $1 AND gastos_cuotas.mes_asignado = $2", [condo_id, mes_actual]);
@@ -935,6 +1216,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                         ? `Aviso general generado y distribuido a juntas individuales. Avanzando a ${formatMonthText(proximoMesGeneral)}.`
                         : `No se encontraron montos para distribuir. Avanzando a ${formatMonthText(proximoMesGeneral)}.`,
                     aviso_general_id: avisoId,
+                    distribucion: avisoId ? distribucionResumen : null,
+                    warnings,
                 });
             }
 
@@ -1071,7 +1354,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
             for (const p of propRes.rows) {
                 let total_deuda = 0;
-                const viejoSaldo = parseFloat(String(p.saldo_actual || 0)); // ðŸ’¡ Capturamos la plata que tenÃ­a a favor
+                const viejoSaldo = parseFloat(String(p.saldo_actual || 0)); // Ã°Å¸â€™Â¡ Capturamos la plata que tenÃƒÂ­a a favor
                 const gastosSnapshotRows: {
                     id: number;
                     concepto: string;
@@ -1236,12 +1519,12 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                         [deudaFinal, p.id]
                     );
 
-                    // ðŸŒŸ 3. RECONCILIACIÃ“N AUTOMÃTICA (El Autopago) ðŸŒŸ
+                    // Ã°Å¸Å’Å¸ 3. RECONCILIACIÃƒâ€œN AUTOMÃƒÂTICA (El Autopago) Ã°Å¸Å’Å¸
                     if (viejoSaldo < 0) {
                         const saldoAFavor = Math.abs(viejoSaldo);
 
                         if (saldoAFavor >= total_deuda) {
-                            // TenÃ­a suficiente dinero a favor para pagar el recibo entero
+                            // TenÃƒÂ­a suficiente dinero a favor para pagar el recibo entero
                             await pool.query("UPDATE recibos SET monto_pagado_usd = monto_usd, estado = 'Pagado' WHERE id = $1", [nuevoReciboId]);
                             await pool.query(
                                 `UPDATE recibos
@@ -1255,7 +1538,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                                 [nuevoReciboId]
                             );
                         } else {
-                            // Su saldo a favor no alcanzÃ³ para todo, se abona lo que tenÃ­a
+                            // Su saldo a favor no alcanzÃƒÂ³ para todo, se abona lo que tenÃƒÂ­a
                             await pool.query("UPDATE recibos SET monto_pagado_usd = $1, estado = 'Abonado' WHERE id = $2", [saldoAFavor, nuevoReciboId]);
                             await pool.query(
                                 `UPDATE recibos
@@ -1315,4 +1598,5 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 };
 
 module.exports = { registerGastosRoutes };
+
 

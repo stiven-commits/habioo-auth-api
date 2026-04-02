@@ -1,6 +1,8 @@
 ﻿import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 
+const { ensureJuntaGeneralSchema }: { ensureJuntaGeneralSchema: (pool: Pool) => Promise<void> } = require('../services/juntaGeneral');
+
 interface AuthUser {
     id: number;
     cedula?: string;
@@ -208,6 +210,12 @@ interface PagoProveedorDetalleRow {
 
 interface GastoMontoRow {
     id?: number;
+    condominio_id?: number;
+    concepto?: string | null;
+    origen_tipo?: string | null;
+    origen_junta_general_id?: number | null;
+    origen_aviso_general_id?: number | null;
+    origen_detalle_general_id?: number | null;
     monto_usd: number | string;
     monto_pagado_usd: number | string;
 }
@@ -221,6 +229,11 @@ interface IPagoProveedorRollbackRow {
     fecha_pago: string | Date;
     referencia: string | null;
     condominio_id: number;
+    concepto: string | null;
+    origen_tipo: string | null;
+    origen_junta_general_id: number | null;
+    origen_aviso_general_id: number | null;
+    origen_detalle_general_id: number | null;
 }
 
 interface IGastoPagoFondoRollbackRow {
@@ -1396,7 +1409,12 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                     pp.monto_usd,
                     pp.fecha_pago,
                     pp.referencia,
-                    g.condominio_id
+                    g.condominio_id,
+                    g.concepto,
+                    g.origen_tipo,
+                    g.origen_junta_general_id,
+                    g.origen_aviso_general_id,
+                    g.origen_detalle_general_id
                 FROM pagos_proveedores pp
                 JOIN gastos g ON g.id = pp.gasto_id
                 JOIN condominios c ON c.id = g.condominio_id
@@ -1578,14 +1596,100 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 await pool.query('DELETE FROM gastos_pagos_fondos WHERE id = ANY($1::int[])', [gpfIds]);
             }
 
-            await pool.query(
+            const gastoRollbackRes = await pool.query<GastoMontoRow>(
                 `
                 UPDATE gastos
                 SET monto_pagado_usd = GREATEST(0, COALESCE(monto_pagado_usd, 0) - $1)
                 WHERE id = $2
+                RETURNING id, monto_usd, monto_pagado_usd
                 `,
                 [round2(parseLocaleNumber(pago.monto_usd)), pago.gasto_id]
             );
+
+            if (
+                String(pago.origen_tipo || '').toUpperCase() === 'JUNTA_GENERAL' &&
+                Number.isFinite(pago.origen_detalle_general_id as number) &&
+                (pago.origen_detalle_general_id as number) > 0
+            ) {
+                await ensureJuntaGeneralSchema(pool);
+                const gastoRollback = gastoRollbackRes.rows[0];
+                const detalleId = Number(pago.origen_detalle_general_id);
+                const detalleRes = await pool.query<{
+                    id: number;
+                    monto_usd: string | number;
+                    monto_bs: string | number;
+                    junta_nombre: string;
+                    junta_rif: string | null;
+                }>(
+                    `
+                    SELECT
+                        d.id,
+                        d.monto_usd,
+                        d.monto_bs,
+                        COALESCE(ci.nombre_legal, ci.nombre, m.nombre_referencia, 'Junta Individual') AS junta_nombre,
+                        COALESCE(ci.rif, m.rif) AS junta_rif
+                    FROM junta_general_aviso_detalles d
+                    LEFT JOIN junta_general_miembros m ON m.id = d.miembro_id
+                    LEFT JOIN condominios ci ON ci.id = d.condominio_individual_id
+                    WHERE d.id = $1
+                    LIMIT 1
+                    FOR UPDATE
+                    `,
+                    [detalleId]
+                );
+
+                const detalle = detalleRes.rows[0];
+                if (detalle && gastoRollback) {
+                    const totalDetalleUsd = round2(parseLocaleNumber(detalle.monto_usd || 0));
+                    const pagadoDetalleUsd = round2(Math.min(parseLocaleNumber(gastoRollback.monto_pagado_usd || 0), totalDetalleUsd));
+                    const pendienteDetalleUsd = round2(Math.max(0, totalDetalleUsd - pagadoDetalleUsd));
+                    const estadoDetalle = pendienteDetalleUsd <= 0.005 ? 'PAGADO' : pagadoDetalleUsd > 0 ? 'ABONADO' : 'PENDIENTE';
+                    const notaDetalle = `Pago revertido desde egresos. Pagado USD ${pagadoDetalleUsd.toFixed(2)} de USD ${totalDetalleUsd.toFixed(2)}.`;
+
+                    await pool.query(
+                        `
+                        UPDATE junta_general_aviso_detalles
+                        SET estado = $1,
+                            nota = $2
+                        WHERE id = $3
+                        `,
+                        [estadoDetalle, notaDetalle, detalleId]
+                    );
+
+                    const juntaGeneralId = Number(pago.origen_junta_general_id || 0);
+                    if (juntaGeneralId > 0) {
+                        const totalDetalleBs = round2(parseLocaleNumber(detalle.monto_bs || 0));
+                        const pagadoDetalleBs = totalDetalleUsd > 0 ? round2((pagadoDetalleUsd / totalDetalleUsd) * totalDetalleBs) : 0;
+                        const pendienteDetalleBs = round2(Math.max(0, totalDetalleBs - pagadoDetalleBs));
+                        const montoReversionUsd = round2(parseLocaleNumber(pago.monto_usd || 0));
+                        const montoReversionBs = round2(parseLocaleNumber(pago.monto_bs || 0));
+
+                        await pool.query(
+                            `
+                            INSERT INTO junta_general_notificaciones (condominio_id, tipo, titulo, mensaje, metadata_jsonb)
+                            VALUES ($1, 'PAGO_GENERAL_REVERTIDO', $2, $3, $4::jsonb)
+                            `,
+                            [
+                                juntaGeneralId,
+                                'Pago revertido en junta individual',
+                                `${detalle.junta_nombre} revirtio un pago de USD ${montoReversionUsd.toFixed(2)} (Bs ${montoReversionBs.toFixed(2)}). Pendiente actual: USD ${pendienteDetalleUsd.toFixed(2)} / Bs ${pendienteDetalleBs.toFixed(2)}.`,
+                                JSON.stringify({
+                                    gasto_id: pago.gasto_id,
+                                    concepto: pago.concepto || null,
+                                    pago_proveedor_id: pagoProveedorId,
+                                    aviso_id: pago.origen_aviso_general_id || null,
+                                    detalle_id: detalleId,
+                                    junta_rif: detalle.junta_rif || null,
+                                    monto_revertido_usd: montoReversionUsd,
+                                    monto_revertido_bs: montoReversionBs,
+                                    saldo_pendiente_usd: pendienteDetalleUsd,
+                                    saldo_pendiente_bs: pendienteDetalleBs,
+                                }),
+                            ]
+                        );
+                    }
+                }
+            }
 
             await pool.query('DELETE FROM pagos_proveedores WHERE id = $1', [pagoProveedorId]);
 
@@ -1886,7 +1990,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 UPDATE gastos
                 SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1
                 WHERE id = $2
-                RETURNING id, monto_usd, monto_pagado_usd
+                RETURNING id, condominio_id, concepto, origen_tipo, origen_junta_general_id, origen_aviso_general_id, origen_detalle_general_id, monto_usd, monto_pagado_usd
                 `,
                 [montoTotalPagoUsd, gasto_id]
             );
@@ -2044,6 +2148,88 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                     `INSERT INTO gastos_pagos_fondos (${gpfInsertCols.join(', ')}) VALUES (${gpfPlaceholders})`,
                     gpfInsertVals
                 );
+            }
+
+            if (
+                String(gastoActualizado.origen_tipo || '').toUpperCase() === 'JUNTA_GENERAL' &&
+                Number.isFinite(gastoActualizado.origen_detalle_general_id as number) &&
+                (gastoActualizado.origen_detalle_general_id as number) > 0
+            ) {
+                await ensureJuntaGeneralSchema(pool);
+                const detalleId = Number(gastoActualizado.origen_detalle_general_id);
+                const detalleRes = await pool.query<{
+                    id: number;
+                    monto_usd: string | number;
+                    monto_bs: string | number;
+                    junta_nombre: string;
+                    junta_rif: string | null;
+                }>(
+                    `
+                    SELECT
+                        d.id,
+                        d.monto_usd,
+                        d.monto_bs,
+                        COALESCE(ci.nombre_legal, ci.nombre, m.nombre_referencia, 'Junta Individual') AS junta_nombre,
+                        COALESCE(ci.rif, m.rif) AS junta_rif
+                    FROM junta_general_aviso_detalles d
+                    LEFT JOIN junta_general_miembros m ON m.id = d.miembro_id
+                    LEFT JOIN condominios ci ON ci.id = d.condominio_individual_id
+                    WHERE d.id = $1
+                    LIMIT 1
+                    FOR UPDATE
+                    `,
+                    [detalleId]
+                );
+
+                const detalle = detalleRes.rows[0];
+                if (detalle) {
+                    const totalDetalleUsd = round2(parseLocaleNumber(detalle.monto_usd || 0));
+                    const pagadoDetalleUsd = round2(Math.min(montoPagadoGastoUsd, totalDetalleUsd));
+                    const pendienteDetalleUsd = round2(Math.max(0, totalDetalleUsd - pagadoDetalleUsd));
+                    const estadoDetalle = pendienteDetalleUsd <= 0.005 ? 'PAGADO' : pagadoDetalleUsd > 0 ? 'ABONADO' : 'PENDIENTE';
+                    const notaDetalle = `Pago registrado desde junta individual. Pagado USD ${pagadoDetalleUsd.toFixed(2)} de USD ${totalDetalleUsd.toFixed(2)}.`;
+
+                    await pool.query(
+                        `
+                        UPDATE junta_general_aviso_detalles
+                        SET estado = $1,
+                            nota = $2
+                        WHERE id = $3
+                        `,
+                        [estadoDetalle, notaDetalle, detalleId]
+                    );
+
+                    const juntaGeneralId = Number(gastoActualizado.origen_junta_general_id || 0);
+                    if (juntaGeneralId > 0) {
+                        const totalDetalleBs = round2(parseLocaleNumber(detalle.monto_bs || 0));
+                        const pagadoDetalleBs = totalDetalleUsd > 0 ? round2((pagadoDetalleUsd / totalDetalleUsd) * totalDetalleBs) : 0;
+                        const pendienteDetalleBs = round2(Math.max(0, totalDetalleBs - pagadoDetalleBs));
+
+                        await pool.query(
+                            `
+                            INSERT INTO junta_general_notificaciones (condominio_id, tipo, titulo, mensaje, metadata_jsonb)
+                            VALUES ($1, 'PAGO_GENERAL_RECIBIDO', $2, $3, $4::jsonb)
+                            `,
+                            [
+                                juntaGeneralId,
+                                'Pago recibido de junta individual',
+                                `${detalle.junta_nombre} registro un pago de USD ${montoTotalPagoUsd.toFixed(2)} (Bs ${totalBs.toFixed(2)}). Pendiente actual: USD ${pendienteDetalleUsd.toFixed(2)} / Bs ${pendienteDetalleBs.toFixed(2)}.`,
+                                JSON.stringify({
+                                    gasto_id: gastoActualizado.id,
+                                    concepto: gastoActualizado.concepto || null,
+                                    pago_proveedor_id: pagoProveedorId,
+                                    aviso_id: gastoActualizado.origen_aviso_general_id || null,
+                                    detalle_id: detalleId,
+                                    junta_rif: detalle.junta_rif || null,
+                                    monto_pagado_usd: montoTotalPagoUsd,
+                                    monto_pagado_bs: totalBs,
+                                    saldo_pendiente_usd: pendienteDetalleUsd,
+                                    saldo_pendiente_bs: pendienteDetalleBs,
+                                }),
+                            ]
+                        );
+                    }
+                }
             }
 
             await pool.query('COMMIT');
