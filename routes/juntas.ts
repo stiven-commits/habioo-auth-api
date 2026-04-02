@@ -46,7 +46,11 @@ const {
         tipo: string | null;
         estado_venezuela: string | null;
     } | null>;
-    listJuntaGeneralMiembrosActivos: (pool: Pool, juntaGeneralId: number) => Promise<Array<Record<string, unknown>>>;
+    listJuntaGeneralMiembrosActivos: (
+        pool: Pool,
+        juntaGeneralId: number,
+        options?: { includeInactive?: boolean }
+    ) => Promise<Array<Record<string, unknown>>>;
     ensureProveedorForJuntaGeneral: (pool: Pool, input: {
         condominioId: number;
         juntaGeneralNombre: string;
@@ -78,6 +82,14 @@ const toPositiveInt = (value: unknown): number | null => {
     return n;
 };
 
+const normalizeJuntaRif = (value: unknown): string => {
+    const normalized = normalizeRif(value);
+    if (!normalized) return '';
+    return normalized.startsWith('J') ? normalized : `J${normalized.replace(/^[VEPG]/, '')}`;
+};
+
+const isValidJuntaRif = (value: string): boolean => /^J[0-9]+$/.test(value);
+
 const randomCode = (): string => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let out = '';
@@ -94,7 +106,8 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
             if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
 
-            const miembros = await listJuntaGeneralMiembrosActivos(pool, condo.id);
+            const includeInactivos = String(req.query?.include_inactivos || '').trim().toLowerCase() === 'true';
+            const miembros = await listJuntaGeneralMiembrosActivos(pool, condo.id, { includeInactive: includeInactivos });
             const data = miembros.map((m) => {
                 const montoGenerado = toNumber(m.saldo_usd_generado as string | number | null);
                 const montoPagado = toNumber(m.saldo_usd_pagado as string | number | null);
@@ -125,23 +138,45 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
 
             const nombre = String(req.body?.nombre_referencia || '').trim();
-            const rif = normalizeRif(req.body?.rif);
+            const rif = normalizeJuntaRif(req.body?.rif);
             const cuota = req.body?.cuota_participacion === null || req.body?.cuota_participacion === undefined
                 ? null
                 : toNumber(req.body?.cuota_participacion);
 
             if (!nombre) return res.status(400).json({ status: 'error', message: 'nombre_referencia es requerido.' });
             if (!rif) return res.status(400).json({ status: 'error', message: 'rif es requerido.' });
+            if (!isValidJuntaRif(rif)) return res.status(400).json({ status: 'error', message: 'El RIF de la junta debe comenzar con J y contener solo números luego del prefijo.' });
             if (cuota !== null && cuota < 0) return res.status(400).json({ status: 'error', message: 'cuota_participacion no puede ser negativa.' });
+            const generalRif = normalizeJuntaRif(condo.rif || '');
+            if (generalRif && generalRif === rif) {
+                return res.status(409).json({ status: 'error', message: 'No puedes registrar una junta individual con el mismo RIF de la Junta General.' });
+            }
 
-            const linkedCondo = await pool.query<{ id: number; nombre: string | null; nombre_legal: string | null; rif: string | null }>(
+            const linkedCondo = await pool.query<{
+                id: number;
+                nombre: string | null;
+                nombre_legal: string | null;
+                rif: string | null;
+                tipo: string | null;
+                junta_general_id: number | null;
+            }>(
                 `SELECT id, nombre, nombre_legal, rif
+                        , tipo, junta_general_id
                  FROM condominios
                  WHERE UPPER(REPLACE(COALESCE(rif, ''), '-', '')) = UPPER(REPLACE($1, '-', ''))
                  LIMIT 1`,
                 [rif]
             );
             const linked = linkedCondo.rows[0] || null;
+            if (linked?.id === condo.id) {
+                return res.status(409).json({ status: 'error', message: 'No puedes agregar la misma Junta General como miembro individual.' });
+            }
+            if (linked && isJuntaGeneralTipo(linked.tipo)) {
+                return res.status(409).json({ status: 'error', message: `El RIF ${rif} pertenece a una Junta General y no puede registrarse como miembro individual.` });
+            }
+            if (linked && linked.junta_general_id && linked.junta_general_id !== condo.id) {
+                return res.status(409).json({ status: 'error', message: `La junta con RIF ${rif} ya está vinculada a otra Junta General.` });
+            }
 
             const inserted = await pool.query<{ id: number }>(
                 `
@@ -221,11 +256,69 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const cuota = req.body?.cuota_participacion === null || req.body?.cuota_participacion === undefined
                 ? null
                 : toNumber(req.body?.cuota_participacion);
-            const rifMaybe = req.body?.rif !== undefined ? normalizeRif(req.body?.rif) : null;
+            const rifMaybe = req.body?.rif !== undefined ? normalizeJuntaRif(req.body?.rif) : null;
 
             if (!nombre) return res.status(400).json({ status: 'error', message: 'nombre_referencia es requerido.' });
             if (cuota !== null && cuota < 0) return res.status(400).json({ status: 'error', message: 'cuota_participacion inválida.' });
             if (rifMaybe !== null && !rifMaybe) return res.status(400).json({ status: 'error', message: 'rif inválido.' });
+            if (rifMaybe !== null && !isValidJuntaRif(rifMaybe)) {
+                return res.status(400).json({ status: 'error', message: 'El RIF de la junta debe comenzar con J y contener solo números luego del prefijo.' });
+            }
+
+            const currentMember = await pool.query<{
+                id: number;
+                rif: string;
+                condominio_individual_id: number | null;
+                condominio_rif: string | null;
+            }>(
+                `
+                SELECT m.id, m.rif, m.condominio_individual_id, c.rif AS condominio_rif
+                FROM junta_general_miembros m
+                LEFT JOIN condominios c ON c.id = m.condominio_individual_id
+                WHERE m.id = $1
+                  AND m.junta_general_id = $2
+                LIMIT 1
+                `,
+                [id, condo.id]
+            );
+            const current = currentMember.rows[0];
+            if (!current) return res.status(404).json({ status: 'error', message: 'Miembro no encontrado.' });
+
+            if (current.condominio_individual_id && rifMaybe) {
+                const rifCondominio = normalizeJuntaRif(current.condominio_rif || '');
+                if (rifCondominio && rifCondominio !== rifMaybe) {
+                    return res.status(409).json({
+                        status: 'error',
+                        message: 'Este miembro ya está vinculado a una junta en Habioo. El RIF debe coincidir con la junta vinculada.',
+                    });
+                }
+            }
+
+            if (rifMaybe) {
+                const linkedCondo = await pool.query<{
+                    id: number;
+                    tipo: string | null;
+                    junta_general_id: number | null;
+                }>(
+                    `
+                    SELECT id, tipo, junta_general_id
+                    FROM condominios
+                    WHERE UPPER(REPLACE(COALESCE(rif, ''), '-', '')) = UPPER(REPLACE($1, '-', ''))
+                    LIMIT 1
+                    `,
+                    [rifMaybe]
+                );
+                const linked = linkedCondo.rows[0] || null;
+                if (linked && linked.id === condo.id) {
+                    return res.status(409).json({ status: 'error', message: 'No puedes usar el RIF de la Junta General como miembro individual.' });
+                }
+                if (linked && isJuntaGeneralTipo(linked.tipo)) {
+                    return res.status(409).json({ status: 'error', message: `El RIF ${rifMaybe} pertenece a una Junta General.` });
+                }
+                if (linked && linked.junta_general_id && linked.junta_general_id !== condo.id) {
+                    return res.status(409).json({ status: 'error', message: `La junta con RIF ${rifMaybe} ya está vinculada a otra Junta General.` });
+                }
+            }
 
             const updated = await pool.query(
                 `
@@ -259,16 +352,61 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const id = toPositiveInt(req.params?.id);
             if (!id) return res.status(400).json({ status: 'error', message: 'ID inválido.' });
 
-            const updated = await pool.query(
+            await pool.query('BEGIN');
+
+            const memberRes = await pool.query<{ id: number; condominio_individual_id: number | null }>(
+                `SELECT id, condominio_individual_id
+                 FROM junta_general_miembros
+                 WHERE id = $1
+                   AND junta_general_id = $2
+                 LIMIT 1`,
+                [id, condo.id]
+            );
+            const member = memberRes.rows[0];
+            if (!member) {
+                await pool.query('ROLLBACK');
+                return res.status(404).json({ status: 'error', message: 'Miembro no encontrado.' });
+            }
+
+            const hasHistoryRes = await pool.query<{ total: string }>(
+                `SELECT COUNT(*)::text AS total
+                 FROM junta_general_aviso_detalles
+                 WHERE miembro_id = $1`,
+                [id]
+            );
+            const hasHistory = parseInt(hasHistoryRes.rows[0]?.total || '0', 10) > 0;
+
+            if (!hasHistory) {
+                await pool.query(
+                    `DELETE FROM junta_general_miembros
+                     WHERE id = $1
+                       AND junta_general_id = $2`,
+                    [id, condo.id]
+                );
+                if (member.condominio_individual_id) {
+                    await pool.query(
+                        `UPDATE condominios
+                         SET junta_general_id = NULL
+                         WHERE id = $1
+                           AND junta_general_id = $2`,
+                        [member.condominio_individual_id, condo.id]
+                    );
+                }
+                await pool.query('COMMIT');
+                return res.json({ status: 'success', message: 'Vinculación eliminada correctamente.' });
+            }
+
+            await pool.query(
                 `UPDATE junta_general_miembros
                  SET activo = false, updated_at = now(), codigo_invitacion = NULL, codigo_expira_at = NULL
                  WHERE id = $1 AND junta_general_id = $2`,
                 [id, condo.id]
             );
-            if (!updated.rowCount) return res.status(404).json({ status: 'error', message: 'Miembro no encontrado.' });
+            await pool.query('COMMIT');
 
-            return res.json({ status: 'success', message: 'Miembro desactivado.' });
+            return res.json({ status: 'success', message: 'La junta se desactivó porque ya tiene historial de avisos.' });
         } catch (error) {
+            await pool.query('ROLLBACK');
             const message = error instanceof Error ? error.message : 'Error al desactivar miembro.';
             return res.status(500).json({ status: 'error', message });
         }
@@ -369,6 +507,20 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             if (invite.codigo_expira_at && new Date(invite.codigo_expira_at).getTime() < Date.now()) {
                 await pool.query('ROLLBACK');
                 return res.status(400).json({ status: 'error', message: 'El código de invitación ha expirado.' });
+            }
+
+            const inviteRif = normalizeJuntaRif(invite.rif);
+            const condoRif = normalizeJuntaRif(condo.rif || '');
+            if (!condoRif) {
+                await pool.query('ROLLBACK');
+                return res.status(409).json({ status: 'error', message: 'Tu junta no tiene RIF configurado. Actualízalo en el perfil para aceptar la invitación.' });
+            }
+            if (inviteRif && inviteRif !== condoRif) {
+                await pool.query('ROLLBACK');
+                return res.status(409).json({
+                    status: 'error',
+                    message: `El código corresponde al RIF ${inviteRif}. Tu junta está registrada con RIF ${condoRif}.`,
+                });
             }
 
             await pool.query(

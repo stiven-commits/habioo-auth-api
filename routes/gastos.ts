@@ -337,7 +337,6 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
     app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount: 1 }, { name: 'soportes', maxCount: 4 }]), async (req: Request<{}, unknown, CreateGastoBody>, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
-        if (!user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
 
         const { proveedor_id, concepto, numero_documento, monto_bs, tasa_cambio, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, remove_factura_img } = req.body;
 
@@ -432,7 +431,6 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
     app.put('/gastos/:id', verifyToken, upload.fields([{ name: 'factura_img', maxCount: 1 }, { name: 'soportes', maxCount: 4 }]), async (req: Request<UpdateGastoParams, unknown, CreateGastoBody>, res: Response) => {
         const user = asAuthUser(req.user);
-        if (!user.cedula.startsWith('J')) return res.status(403).json({ status: 'error', message: 'Acceso denegado' });
 
         const gastoId = parseInt(String(req.params.id || ''), 10);
         if (!Number.isFinite(gastoId) || gastoId <= 0) {
@@ -595,7 +593,6 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
     app.get('/gastos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
-        if (!user.cedula.startsWith('J')) return res.status(403).json({ status: 'error' });
         try {
             const result = await pool.query<IGastoListRow>(
                 `

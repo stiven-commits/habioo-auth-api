@@ -161,7 +161,16 @@ const getCondominioByAdminUserId = async (pool: Pool, adminUserId: number): Prom
     return res.rows[0] || null;
 };
 
-const listJuntaGeneralMiembrosActivos = async (pool: Pool, juntaGeneralId: number): Promise<JuntaGeneralMiembroRow[]> => {
+interface ListMiembrosOptions {
+    includeInactive?: boolean;
+}
+
+const listJuntaGeneralMiembrosActivos = async (
+    pool: Pool,
+    juntaGeneralId: number,
+    options?: ListMiembrosOptions
+): Promise<JuntaGeneralMiembroRow[]> => {
+    const includeInactive = options?.includeInactive === true;
     const res = await pool.query<JuntaGeneralMiembroRow>(
         `
         SELECT
@@ -187,7 +196,7 @@ const listJuntaGeneralMiembrosActivos = async (pool: Pool, juntaGeneralId: numbe
         LEFT JOIN junta_general_aviso_detalles d ON d.miembro_id = m.id
         LEFT JOIN gastos g ON g.id = d.gasto_generado_id
         WHERE m.junta_general_id = $1
-          AND m.activo = true
+          AND ($2::boolean = true OR m.activo = true)
         GROUP BY
             m.id, m.junta_general_id, m.condominio_individual_id, m.nombre_referencia, m.rif,
             m.cuota_participacion, m.activo, m.es_fantasma, m.codigo_invitacion, m.codigo_expira_at,
@@ -195,7 +204,7 @@ const listJuntaGeneralMiembrosActivos = async (pool: Pool, juntaGeneralId: numbe
             c.nombre_legal, c.rif, c.tipo, c.admin_user_id
         ORDER BY m.id ASC
         `,
-        [juntaGeneralId]
+        [juntaGeneralId, includeInactive]
     );
 
     return res.rows;

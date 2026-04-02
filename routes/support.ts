@@ -1,4 +1,4 @@
-import type { Application, NextFunction, Request, Response } from 'express';
+﻿import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 import type { AuthenticatedUser } from '../types/auth';
 
@@ -60,9 +60,11 @@ interface SoporteEntrarBody {
 interface AdminCondominioRow {
     condominio_id: number;
     nombre_junta: string;
-    admin_user_id: number;
-    admin_nombre: string;
-    admin_cedula: string;
+    tipo_junta: string | null;
+    rif_junta: string | null;
+    admin_user_id: number | null;
+    admin_nombre: string | null;
+    admin_cedula: string | null;
 }
 
 interface SoporteSessionInfo {
@@ -106,7 +108,12 @@ const safeSupportMinutes = (): number => {
 };
 
 const normalizeDoc = (value: unknown): string => String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-const normalizeRif = (value: unknown): string => String(value || '').trim().toUpperCase().replace(/[^VEJPG0-9]/g, '');
+const normalizeRif = (value: unknown): string => String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+const normalizeJuntaRif = (value: unknown): string => {
+    const normalized = normalizeRif(value);
+    if (!normalized) return '';
+    return normalized.startsWith('J') ? normalized : `J${normalized}`;
+};
 const toNumber = (value: unknown): number => {
     const parsed = Number.parseFloat(String(value ?? '0').replace(',', '.'));
     return Number.isFinite(parsed) ? parsed : 0;
@@ -200,7 +207,7 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
             const tipoRaw = String(req.body?.tipo || '').trim();
             const tipo = tipoRaw === 'Junta General' ? 'Junta General' : 'Junta Individual';
             const nombreJunta = String(req.body?.nombre_junta || '').trim();
-            const rifJunta = normalizeRif(req.body?.rif_junta);
+            const rifJunta = normalizeJuntaRif(req.body?.rif_junta);
             const adminNombre = String(req.body?.admin_nombre || '').trim();
             const adminCedula = normalizeDoc(req.body?.admin_cedula);
             const adminPassword = String(req.body?.admin_password || '').trim() || adminCedula;
@@ -218,11 +225,14 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
             if (!rifJunta) {
                 return res.status(400).json({ status: 'error', message: 'rif_junta es requerido.' });
             }
-            if (!adminNombre) {
-                return res.status(400).json({ status: 'error', message: 'admin_nombre es requerido.' });
+            if (!rifJunta.startsWith('J')) {
+                return res.status(400).json({ status: 'error', message: 'El RIF de la junta debe comenzar con J.' });
             }
-            if (!adminCedula) {
-                return res.status(400).json({ status: 'error', message: 'admin_cedula es requerido.' });
+            if ((adminNombre && !adminCedula) || (!adminNombre && adminCedula)) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Para crear administradora debes indicar nombre y cédula, o dejar ambos vacíos.',
+                });
             }
             if (tipo === 'Junta General' && juntaGeneralId) {
                 return res.status(400).json({ status: 'error', message: 'Una Junta General no puede depender de otra junta general.' });
@@ -233,13 +243,18 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
 
             await pool.query('BEGIN');
 
-            const existingUser = await pool.query<{ id: number }>(
-                'SELECT id FROM users WHERE cedula = $1 LIMIT 1',
-                [adminCedula]
-            );
-            if (existingUser.rows.length > 0) {
-                await pool.query('ROLLBACK');
-                return res.status(409).json({ status: 'error', message: `Ya existe un usuario con cédula ${adminCedula}.` });
+            const shouldCreateAdminUser = Boolean(adminNombre && adminCedula);
+            let adminUserId: number | null = null;
+
+            if (shouldCreateAdminUser) {
+                const existingUser = await pool.query<{ id: number }>(
+                    'SELECT id FROM users WHERE cedula = $1 LIMIT 1',
+                    [adminCedula]
+                );
+                if (existingUser.rows.length > 0) {
+                    await pool.query('ROLLBACK');
+                    return res.status(409).json({ status: 'error', message: `Ya existe un usuario con cédula ${adminCedula}.` });
+                }
             }
 
             const existingCondo = await pool.query<{ id: number }>(
@@ -274,15 +289,17 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
                 }
             }
 
-            const salt = await bcrypt.genSalt(10);
-            const hashedPassword = await bcrypt.hash(adminPassword, salt);
-            const userInsert = await pool.query<CreatedUserRow>(
-                `INSERT INTO users (cedula, nombre, password, email, telefono)
-                 VALUES ($1, $2, $3, $4, $5)
-                 RETURNING id`,
-                [adminCedula, adminNombre, hashedPassword, adminEmail, adminTelefono]
-            );
-            const adminUserId = userInsert.rows[0].id;
+            if (shouldCreateAdminUser) {
+                const salt = await bcrypt.genSalt(10);
+                const hashedPassword = await bcrypt.hash(adminPassword, salt);
+                const userInsert = await pool.query<CreatedUserRow>(
+                    `INSERT INTO users (cedula, nombre, password, email, telefono)
+                     VALUES ($1, $2, $3, $4, $5)
+                     RETURNING id`,
+                    [adminCedula, adminNombre, hashedPassword, adminEmail, adminTelefono]
+                );
+                adminUserId = userInsert.rows[0].id;
+            }
 
             const condoInsert = await pool.query<CreatedCondominioRow>(
                 `INSERT INTO condominios (
@@ -373,11 +390,13 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
                 SELECT
                   c.id AS condominio_id,
                   COALESCE(NULLIF(BTRIM(c.nombre_legal), ''), NULLIF(BTRIM(c.nombre), ''), 'Condominio') AS nombre_junta,
+                  c.tipo AS tipo_junta,
+                  NULLIF(BTRIM(c.rif), '') AS rif_junta,
                   u.id AS admin_user_id,
-                  COALESCE(NULLIF(BTRIM(u.nombre), ''), 'Administrador') AS admin_nombre,
-                  COALESCE(NULLIF(BTRIM(u.cedula), ''), 'J000000000') AS admin_cedula
+                  NULLIF(BTRIM(u.nombre), '') AS admin_nombre,
+                  NULLIF(BTRIM(u.cedula), '') AS admin_cedula
                 FROM condominios c
-                INNER JOIN users u ON u.id = c.admin_user_id
+                LEFT JOIN users u ON u.id = c.admin_user_id
                 WHERE c.id = $1
                 LIMIT 1
                 `,
@@ -385,8 +404,92 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
             );
             const selected = adminRes.rows[0];
             if (!selected) {
-                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado o sin administrador asignado.' });
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
             }
+
+            let effectiveAdminUserId = selected.admin_user_id;
+            let effectiveAdminNombre = selected.admin_nombre;
+            let effectiveAdminCedula = selected.admin_cedula;
+
+            if (!effectiveAdminUserId) {
+                await pool.query('BEGIN');
+                try {
+                    const lockedCondo = await pool.query<AdminCondominioRow>(
+                        `
+                        SELECT
+                          c.id AS condominio_id,
+                          COALESCE(NULLIF(BTRIM(c.nombre_legal), ''), NULLIF(BTRIM(c.nombre), ''), 'Condominio') AS nombre_junta,
+                          c.tipo AS tipo_junta,
+                          NULLIF(BTRIM(c.rif), '') AS rif_junta,
+                          u.id AS admin_user_id,
+                          NULLIF(BTRIM(u.nombre), '') AS admin_nombre,
+                          NULLIF(BTRIM(u.cedula), '') AS admin_cedula
+                        FROM condominios c
+                        LEFT JOIN users u ON u.id = c.admin_user_id
+                        WHERE c.id = $1
+                        FOR UPDATE OF c
+                        `,
+                        [condominioId]
+                    );
+                    const current = lockedCondo.rows[0];
+                    if (!current) {
+                        await pool.query('ROLLBACK');
+                        return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+                    }
+
+                    if (current.admin_user_id) {
+                        effectiveAdminUserId = current.admin_user_id;
+                        effectiveAdminNombre = current.admin_nombre;
+                        effectiveAdminCedula = current.admin_cedula;
+                    } else {
+                        const baseCedula = normalizeDoc(current.rif_junta || `J${current.condominio_id}`);
+                        let generatedCedula = baseCedula || `J${current.condominio_id}`;
+                        let seq = 1;
+                        while (true) {
+                            const existsUser = await pool.query<{ id: number }>(
+                                'SELECT id FROM users WHERE cedula = $1 LIMIT 1',
+                                [generatedCedula]
+                            );
+                            if (existsUser.rows.length === 0) break;
+                            generatedCedula = `${baseCedula || `J${current.condominio_id}`}${seq}`;
+                            seq += 1;
+                        }
+
+                        const generatedNombre = `Administrador ${current.nombre_junta}`;
+                        const generatedPassword = generatedCedula;
+                        const salt = await bcrypt.genSalt(10);
+                        const hashedPassword = await bcrypt.hash(generatedPassword, salt);
+                        const createdUser = await pool.query<CreatedUserRow>(
+                            `INSERT INTO users (cedula, nombre, password, email, telefono)
+                             VALUES ($1, $2, $3, NULL, NULL)
+                             RETURNING id`,
+                            [generatedCedula, generatedNombre, hashedPassword]
+                        );
+                        const newAdminId = createdUser.rows[0].id;
+
+                        await pool.query(
+                            `UPDATE condominios
+                             SET admin_user_id = $1
+                             WHERE id = $2`,
+                            [newAdminId, current.condominio_id]
+                        );
+
+                        effectiveAdminUserId = newAdminId;
+                        effectiveAdminNombre = generatedNombre;
+                        effectiveAdminCedula = generatedCedula;
+                    }
+
+                    await pool.query('COMMIT');
+                } catch (error: unknown) {
+                    await pool.query('ROLLBACK');
+                    const message = error instanceof Error ? error.message : 'No se pudo preparar el acceso de soporte.';
+                    return res.status(500).json({ status: 'error', message });
+                }
+            }
+
+            const safeAdminUserId = effectiveAdminUserId || authUser.id;
+            const safeAdminNombre = String(effectiveAdminNombre || authUser.nombre || 'Soporte Habioo');
+            const safeAdminCedula = String(effectiveAdminCedula || authUser.cedula || 'J000000000');
 
             const supportMinutes = safeSupportMinutes();
             const expiresAt = new Date(Date.now() + supportMinutes * 60_000);
@@ -405,7 +508,7 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
                 [
                     sessionJti,
                     authUser.id,
-                    selected.admin_user_id,
+                    safeAdminUserId,
                     selected.condominio_id,
                     motivo,
                     ipOrigen,
@@ -415,9 +518,9 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
             );
 
             const tokenPayload: AuthenticatedUser = {
-                id: selected.admin_user_id,
-                cedula: selected.admin_cedula,
-                nombre: selected.admin_nombre,
+                id: safeAdminUserId,
+                cedula: safeAdminCedula,
+                nombre: safeAdminNombre,
                 condominio_id: selected.condominio_id,
                 is_admin: true,
                 is_superuser: false,
@@ -447,14 +550,15 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
                 status: 'success',
                 token,
                 user: {
-                    id: selected.admin_user_id,
-                    cedula: selected.admin_cedula,
-                    nombre: selected.admin_nombre,
+                    id: safeAdminUserId,
+                    cedula: safeAdminCedula,
+                    nombre: safeAdminNombre,
                 },
                 session,
                 condominio: {
                     id: selected.condominio_id,
                     nombre: selected.nombre_junta,
+                    tipo: selected.tipo_junta,
                 },
             });
         } catch (error: unknown) {
