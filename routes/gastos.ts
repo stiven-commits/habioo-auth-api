@@ -383,6 +383,33 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         storage: multer.memoryStorage(),
         limits: { fileSize: 10 * 1024 * 1024 },
     });
+    const logJuntaGeneralAuditoria = async (input: {
+        juntaGeneralId: number;
+        actorUserId?: number | null;
+        actorCondominioId?: number | null;
+        accion: string;
+        detalle?: Record<string, unknown> | null;
+        before?: Record<string, unknown> | null;
+        after?: Record<string, unknown> | null;
+    }): Promise<void> => {
+        await pool.query(
+            `
+            INSERT INTO junta_general_auditoria_eventos (
+                junta_general_id, miembro_id, actor_user_id, actor_condominio_id,
+                accion, detalle_jsonb, before_jsonb, after_jsonb
+            ) VALUES ($1, NULL, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb)
+            `,
+            [
+                input.juntaGeneralId,
+                input.actorUserId ?? null,
+                input.actorCondominioId ?? null,
+                input.accion,
+                JSON.stringify(input.detalle ?? null),
+                JSON.stringify(input.before ?? null),
+                JSON.stringify(input.after ?? null),
+            ],
+        );
+    };
 
     const validateJerarquiaGastoInput = (input: {
         esJuntaGeneral: boolean;
@@ -824,6 +851,26 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 'UPDATE condominios SET metodo_division = $1, metodo_division_manual = true WHERE id = $2',
                 [metodo, condo.id]
             );
+            if (isJuntaGeneralTipo(condo.tipo)) {
+                await ensureJuntaGeneralSchema(pool);
+                await logJuntaGeneralAuditoria({
+                    juntaGeneralId: condo.id,
+                    actorUserId: user.id,
+                    actorCondominioId: condo.id,
+                    accion: 'METODO_DIVISION_ACTUALIZADO',
+                    detalle: {
+                        jerarquia_objetivo: 'Juntas Individuales',
+                    },
+                    before: {
+                        metodo_division: String(condo.metodo_division || 'Alicuota'),
+                        metodo_division_manual: Boolean(condo.metodo_division_manual),
+                    },
+                    after: {
+                        metodo_division: metodo,
+                        metodo_division_manual: true,
+                    },
+                });
+            }
             res.json({ status: 'success', message: `MÃƒÂ©todo actualizado a ${metodo}` });
         } catch (err: unknown) {
             const error = asError(err);
@@ -1209,6 +1256,30 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 await pool.query("UPDATE gastos_cuotas SET estado = 'Procesado' FROM gastos WHERE gastos_cuotas.gasto_id = gastos.id AND gastos.condominio_id = $1 AND gastos_cuotas.mes_asignado = $2", [condo_id, mes_actual]);
                 const proximoMesGeneral = addMonths(mes_actual, 1);
                 await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [proximoMesGeneral, condo_id]);
+                await logJuntaGeneralAuditoria({
+                    juntaGeneralId: condo_id,
+                    actorUserId: user.id,
+                    actorCondominioId: condo_id,
+                    accion: avisoId ? 'AVISO_GENERAL_GENERADO_Y_DISTRIBUIDO' : 'CIERRE_GENERAL_SIN_DISTRIBUCION',
+                    detalle: {
+                        aviso_id: avisoId,
+                        mes_origen: mes_actual,
+                        mes_siguiente: proximoMesGeneral,
+                        metodo_division: metodoGeneral,
+                        total_miembros: distribucionResumen.total_miembros,
+                        total_usd: Number(distribucionResumen.total_usd.toFixed(2)),
+                        generados: distribucionResumen.generados,
+                        fantasma: distribucionResumen.fantasma,
+                        error: distribucionResumen.error,
+                        warnings,
+                    },
+                    before: {
+                        mes_actual,
+                    },
+                    after: {
+                        mes_actual: proximoMesGeneral,
+                    },
+                });
                 await pool.query('COMMIT');
                 return res.json({
                     status: 'success',

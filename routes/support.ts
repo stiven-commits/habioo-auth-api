@@ -52,6 +52,10 @@ interface CreatedUserRow {
     id: number;
 }
 
+interface SuperuserFlagRow {
+    is_superuser: boolean | null;
+}
+
 interface SoporteEntrarBody {
     condominio_id?: number | string;
     motivo?: string;
@@ -133,12 +137,26 @@ const {
 } = require('../services/juntaGeneral');
 
 const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
+    const ensureSupportAuthorized = async (authUser: AuthenticatedUser, res: Response): Promise<boolean> => {
+        if (isSuperUserToken(authUser)) return true;
+
+        const userId = Number.parseInt(String(authUser?.id ?? ''), 10);
+        if (Number.isFinite(userId) && userId > 0) {
+            const dbCheck = await pool.query<SuperuserFlagRow>(
+                'SELECT is_superuser FROM users WHERE id = $1 LIMIT 1',
+                [userId]
+            );
+            if (Boolean(dbCheck.rows[0]?.is_superuser)) return true;
+        }
+
+        res.status(403).json({ status: 'error', message: 'No autorizado.' });
+        return false;
+    };
+
     app.get('/support/condominios', verifyToken, async (req: Request, res: Response) => {
         try {
             const authUser = asAuthenticatedUser(req.user);
-            if (!isSuperUserToken(authUser)) {
-                return res.status(403).json({ status: 'error', message: 'No autorizado.' });
-            }
+            if (!(await ensureSupportAuthorized(authUser, res))) return;
 
             const result = await pool.query<SoporteCondominioRow>(
                 `
@@ -172,9 +190,7 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
     app.get('/support/juntas-generales', verifyToken, async (req: Request, res: Response) => {
         try {
             const authUser = asAuthenticatedUser(req.user);
-            if (!isSuperUserToken(authUser)) {
-                return res.status(403).json({ status: 'error', message: 'No autorizado.' });
-            }
+            if (!(await ensureSupportAuthorized(authUser, res))) return;
 
             const result = await pool.query<JuntaGeneralOptionRow>(
                 `
@@ -198,9 +214,7 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
     app.post('/support/condominios/crear', verifyToken, async (req: Request<{}, unknown, SupportCrearCondominioBody>, res: Response) => {
         try {
             const authUser = asAuthenticatedUser(req.user);
-            if (!isSuperUserToken(authUser)) {
-                return res.status(403).json({ status: 'error', message: 'No autorizado.' });
-            }
+            if (!(await ensureSupportAuthorized(authUser, res))) return;
 
             await ensureJuntaGeneralSchema(pool);
 
@@ -376,9 +390,7 @@ const registerSupportRoutes = (app: Application, { pool, verifyToken }: AuthDepe
     app.post('/support/entrar', verifyToken, async (req: Request<{}, unknown, SoporteEntrarBody>, res: Response) => {
         try {
             const authUser = asAuthenticatedUser(req.user);
-            if (!isSuperUserToken(authUser)) {
-                return res.status(403).json({ status: 'error', message: 'No autorizado.' });
-            }
+            if (!(await ensureSupportAuthorized(authUser, res))) return;
 
             const condominioId = parsePositiveInt(req.body?.condominio_id);
             if (!condominioId) {

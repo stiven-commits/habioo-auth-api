@@ -1,6 +1,14 @@
 import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 
+const {
+    getCondominioByAdminUserId,
+    isJuntaGeneralTipo,
+}: {
+    getCondominioByAdminUserId: (pool: Pool, adminUserId: number) => Promise<{ id: number; tipo: string | null } | null>;
+    isJuntaGeneralTipo: (tipo: unknown) => boolean;
+} = require('../services/juntaGeneral');
+
 interface AuthUser {
     id: number;
 }
@@ -151,11 +159,17 @@ const registerFondosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const user = asAuthUser(req.user);
             const fondoId = asString(req.params.id);
             const visible = Boolean(req.body?.visible_propietarios);
-            const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            const condoId = condoRes.rows[0]?.id;
+            const condo = await getCondominioByAdminUserId(pool, user.id);
+            const condoId = condo?.id;
 
             if (!condoId) {
                 return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            }
+            if (isJuntaGeneralTipo(condo?.tipo)) {
+                return res.status(403).json({
+                    status: 'error',
+                    message: 'La Junta General no gestiona visibilidad de fondos por inmueble.',
+                });
             }
 
             const updated = await pool.query<IFondoRow>(

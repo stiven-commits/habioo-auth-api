@@ -1,9 +1,14 @@
-import type { Application, NextFunction, Request, Response } from 'express';
+﻿import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 const fs: typeof import('fs') = require('fs');
 const path: typeof import('path') = require('path');
 const multer: typeof import('multer') = require('multer');
 const sharp: typeof import('sharp') = require('sharp');
+const {
+    isJuntaGeneralTipo,
+}: {
+    isJuntaGeneralTipo: (tipo: unknown) => boolean;
+} = require('../services/juntaGeneral');
 
 interface AuthUser {
     id: number;
@@ -16,6 +21,7 @@ interface AuthDependencies {
 
 interface ICondominioRow {
     id: number;
+    tipo: string | null;
 }
 
 interface IPropiedadUsuarioRow {
@@ -30,6 +36,8 @@ interface IAmenidadRow {
     descripcion: string | null;
     costo_usd: string | number;
     deposito_usd: string | number;
+    zona_id: number | null;
+    zona_nombre: string | null;
     activo: boolean;
 }
 
@@ -46,6 +54,7 @@ interface CreateAmenidadBody {
     descripcion?: string | null;
     costo_usd?: string | number | null;
     deposito_usd?: string | number | null;
+    zona_id?: string | number | null;
 }
 
 interface ReservarBody {
@@ -129,19 +138,33 @@ const toIsoDate = (value: unknown): string => {
         return `${y}-${m}-${d}`;
     }
 
-    throw new Error('fecha_reserva inválida. Use dd/mm/yyyy o yyyy-mm-dd.');
+    throw new Error('fecha_reserva invÃ¡lida. Use dd/mm/yyyy o yyyy-mm-dd.');
 };
 
 const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
+    void pool.query('ALTER TABLE amenidades ADD COLUMN IF NOT EXISTS zona_id integer NULL REFERENCES zonas(id) ON DELETE SET NULL');
     const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
     const alquileresUploadsDir = path.join(__dirname, '..', 'uploads', 'alquileres');
     if (!fs.existsSync(alquileresUploadsDir)) {
         fs.mkdirSync(alquileresUploadsDir, { recursive: true });
     }
 
-    const getAdminCondominioId = async (userId: number): Promise<number | null> => {
-        const r = await pool.query<ICondominioRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [userId]);
-        return r.rows[0]?.id ?? null;
+    const getAdminCondominio = async (userId: number): Promise<ICondominioRow | null> => {
+        const r = await pool.query<ICondominioRow>('SELECT id, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1', [userId]);
+        return r.rows[0] ?? null;
+    };
+
+    const ensureAdminCondominio = async (
+        userId: number,
+        res: Response,
+        unauthorizedMessage: string,
+    ): Promise<number | null> => {
+        const condo = await getAdminCondominio(userId);
+        if (!condo?.id) {
+            res.status(403).json({ status: 'error', message: unauthorizedMessage });
+            return null;
+        }
+        return condo.id;
     };
 
     const getOwnerPropiedad = async (userId: number): Promise<IPropiedadUsuarioRow | null> => {
@@ -187,11 +210,12 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
         try {
             const user = asAuthUser(req.user);
 
-            const [adminCondoId, ownerData] = await Promise.all([
-                getAdminCondominioId(user.id),
+            const [adminCondo, ownerData] = await Promise.all([
+                getAdminCondominio(user.id),
                 getOwnerPropiedad(user.id),
             ]);
 
+            const adminCondoId = adminCondo?.id ?? null;
             const condominioId = adminCondoId ?? ownerData?.condominio_id ?? null;
             if (!condominioId) {
                 return res.status(403).json({ status: 'error', message: 'No autorizado para ver alquileres.' });
@@ -200,11 +224,23 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             const isAdmin = adminCondoId !== null;
             const amenidades = await pool.query<IAmenidadRow>(
                 `
-                SELECT id, condominio_id, nombre, descripcion, costo_usd, deposito_usd, activo
-                FROM amenidades
-                WHERE condominio_id = $1
-                  AND ($2::boolean = true OR activo = true)
-                ORDER BY nombre ASC, id ASC
+                SELECT
+                    a.id,
+                    a.condominio_id,
+                    a.nombre,
+                    a.descripcion,
+                    a.costo_usd,
+                    a.deposito_usd,
+                    a.zona_id,
+                    z.nombre AS zona_nombre,
+                    a.activo
+                FROM amenidades a
+                LEFT JOIN zonas z
+                  ON z.id = a.zona_id
+                 AND z.condominio_id = a.condominio_id
+                WHERE a.condominio_id = $1
+                  AND ($2::boolean = true OR a.activo = true)
+                ORDER BY a.nombre ASC, a.id ASC
                 `,
                 [condominioId, isAdmin]
             );
@@ -218,9 +254,13 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
     app.post('/alquileres', verifyToken, async (req: Request<{}, unknown, CreateAmenidadBody>, res: Response) => {
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getAdminCondominioId(user.id);
+            const condominioId = await ensureAdminCondominio(
+                user.id,
+                res,
+                'Solo administradores pueden crear alquileres.',
+            );
             if (!condominioId) {
-                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden crear alquileres.' });
+                return;
             }
 
             const nombre = String(req.body?.nombre || '').trim();
@@ -228,24 +268,38 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             const costoUsd = parseNumeric(req.body?.costo_usd);
             const depositoUsdRaw = req.body?.deposito_usd;
             const depositoUsd = String(depositoUsdRaw ?? '').trim() === '' ? 0 : parseNumeric(depositoUsdRaw);
+            const zonaIdRaw = req.body?.zona_id;
+            const zonaId = String(zonaIdRaw ?? '').trim() === '' ? null : parseInt(String(zonaIdRaw), 10);
 
             if (!nombre) {
                 return res.status(400).json({ status: 'error', message: 'nombre es requerido.' });
             }
             if (!Number.isFinite(costoUsd) || costoUsd < 0) {
-                return res.status(400).json({ status: 'error', message: 'costo_usd inválido.' });
+                return res.status(400).json({ status: 'error', message: 'costo_usd invÃ¡lido.' });
             }
             if (!Number.isFinite(depositoUsd) || depositoUsd < 0) {
-                return res.status(400).json({ status: 'error', message: 'deposito_usd inválido.' });
+                return res.status(400).json({ status: 'error', message: 'deposito_usd invÃ¡lido.' });
+            }
+            if (zonaId !== null && (!Number.isFinite(zonaId) || zonaId <= 0)) {
+                return res.status(400).json({ status: 'error', message: 'zona_id invÃ¡lido.' });
+            }
+            if (zonaId !== null) {
+                const zonaRes = await pool.query<{ id: number }>(
+                    'SELECT id FROM zonas WHERE id = $1 AND condominio_id = $2 LIMIT 1',
+                    [zonaId, condominioId]
+                );
+                if (!zonaRes.rows[0]?.id) {
+                    return res.status(400).json({ status: 'error', message: 'La zona seleccionada no pertenece a este condominio.' });
+                }
             }
 
             const insertRes = await pool.query<IReservacionInsertRow>(
                 `
-                INSERT INTO amenidades (condominio_id, nombre, descripcion, costo_usd, deposito_usd, activo)
-                VALUES ($1, $2, $3, $4, $5, true)
+                INSERT INTO amenidades (condominio_id, nombre, descripcion, costo_usd, deposito_usd, zona_id, activo)
+                VALUES ($1, $2, $3, $4, $5, $6, true)
                 RETURNING id
                 `,
-                [condominioId, nombre, descripcion || null, costoUsd, depositoUsd]
+                [condominioId, nombre, descripcion || null, costoUsd, depositoUsd, zonaId]
             );
 
             return res.status(201).json({
@@ -261,14 +315,18 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
     app.put('/alquileres/:id', verifyToken, async (req: Request<{}, unknown, CreateAmenidadBody>, res: Response) => {
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getAdminCondominioId(user.id);
+            const condominioId = await ensureAdminCondominio(
+                user.id,
+                res,
+                'Solo administradores pueden editar alquileres.',
+            );
             if (!condominioId) {
-                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden editar alquileres.' });
+                return;
             }
 
             const amenidadId = parseInt(String((req.params as Record<string, string | undefined>)?.id || ''), 10);
             if (!Number.isFinite(amenidadId) || amenidadId <= 0) {
-                return res.status(400).json({ status: 'error', message: 'ID de amenidad inválido.' });
+                return res.status(400).json({ status: 'error', message: 'ID de amenidad invÃ¡lido.' });
             }
 
             const nombre = String(req.body?.nombre || '').trim();
@@ -276,15 +334,29 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             const costoUsd = parseNumeric(req.body?.costo_usd);
             const depositoUsdRaw = req.body?.deposito_usd;
             const depositoUsd = String(depositoUsdRaw ?? '').trim() === '' ? 0 : parseNumeric(depositoUsdRaw);
+            const zonaIdRaw = req.body?.zona_id;
+            const zonaId = String(zonaIdRaw ?? '').trim() === '' ? null : parseInt(String(zonaIdRaw), 10);
 
             if (!nombre) {
                 return res.status(400).json({ status: 'error', message: 'nombre es requerido.' });
             }
             if (!Number.isFinite(costoUsd) || costoUsd < 0) {
-                return res.status(400).json({ status: 'error', message: 'costo_usd inválido.' });
+                return res.status(400).json({ status: 'error', message: 'costo_usd invÃ¡lido.' });
             }
             if (!Number.isFinite(depositoUsd) || depositoUsd < 0) {
-                return res.status(400).json({ status: 'error', message: 'deposito_usd inválido.' });
+                return res.status(400).json({ status: 'error', message: 'deposito_usd invÃ¡lido.' });
+            }
+            if (zonaId !== null && (!Number.isFinite(zonaId) || zonaId <= 0)) {
+                return res.status(400).json({ status: 'error', message: 'zona_id invÃ¡lido.' });
+            }
+            if (zonaId !== null) {
+                const zonaRes = await pool.query<{ id: number }>(
+                    'SELECT id FROM zonas WHERE id = $1 AND condominio_id = $2 LIMIT 1',
+                    [zonaId, condominioId]
+                );
+                if (!zonaRes.rows[0]?.id) {
+                    return res.status(400).json({ status: 'error', message: 'La zona seleccionada no pertenece a este condominio.' });
+                }
             }
 
             const belongsRes = await pool.query<{ id: number }>(
@@ -301,11 +373,12 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
                 SET nombre = $1,
                     descripcion = $2,
                     costo_usd = $3,
-                    deposito_usd = $4
-                WHERE id = $5
-                  AND condominio_id = $6
+                    deposito_usd = $4,
+                    zona_id = $5
+                WHERE id = $6
+                  AND condominio_id = $7
                 `,
-                [nombre, descripcion || null, costoUsd, depositoUsd, amenidadId, condominioId]
+                [nombre, descripcion || null, costoUsd, depositoUsd, zonaId, amenidadId, condominioId]
             );
 
             return res.json({
@@ -321,14 +394,18 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
     app.patch('/alquileres/:id/estado', verifyToken, async (req: Request<{}, unknown, ToggleEstadoBody>, res: Response) => {
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getAdminCondominioId(user.id);
+            const condominioId = await ensureAdminCondominio(
+                user.id,
+                res,
+                'Solo administradores pueden cambiar el estado.',
+            );
             if (!condominioId) {
-                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden cambiar el estado.' });
+                return;
             }
 
             const amenidadId = parseInt(String((req.params as Record<string, string | undefined>)?.id || ''), 10);
             if (!Number.isFinite(amenidadId) || amenidadId <= 0) {
-                return res.status(400).json({ status: 'error', message: 'ID de amenidad inválido.' });
+                return res.status(400).json({ status: 'error', message: 'ID de amenidad invÃ¡lido.' });
             }
 
             if (typeof req.body?.activo !== 'boolean') {
@@ -362,9 +439,20 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
     app.get('/alquileres/reservaciones', verifyToken, async (req: Request, res: Response) => {
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getAdminCondominioId(user.id);
+            const adminCondo = await getAdminCondominio(user.id);
+            const condominioId = await ensureAdminCondominio(
+                user.id,
+                res,
+                'Solo administradores pueden ver reservaciones.',
+            );
             if (!condominioId) {
-                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden ver reservaciones.' });
+                return;
+            }
+            if (adminCondo && isJuntaGeneralTipo(adminCondo.tipo)) {
+                return res.status(403).json({
+                    status: 'error',
+                    message: 'La Junta General no gestiona solicitudes de alquiler por inmueble.',
+                });
             }
 
             const colsRes = await pool.query<IColumnInfoRow>(
@@ -475,14 +563,25 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
     app.put('/alquileres/reservaciones/:id/estado', verifyToken, async (req: Request<{}, unknown, UpdateReservacionEstadoBody>, res: Response) => {
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getAdminCondominioId(user.id);
+            const adminCondo = await getAdminCondominio(user.id);
+            const condominioId = await ensureAdminCondominio(
+                user.id,
+                res,
+                'Solo administradores pueden actualizar reservaciones.',
+            );
             if (!condominioId) {
-                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden actualizar reservaciones.' });
+                return;
+            }
+            if (adminCondo && isJuntaGeneralTipo(adminCondo.tipo)) {
+                return res.status(403).json({
+                    status: 'error',
+                    message: 'La Junta General no gestiona solicitudes de alquiler por inmueble.',
+                });
             }
 
             const reservacionId = parseInt(String((req.params as Record<string, string | undefined>)?.id || ''), 10);
             if (!Number.isFinite(reservacionId) || reservacionId <= 0) {
-                return res.status(400).json({ status: 'error', message: 'ID de reservación inválido.' });
+                return res.status(400).json({ status: 'error', message: 'ID de reservaciÃ³n invÃ¡lido.' });
             }
 
             const estado = String(req.body?.estado || '').trim();
@@ -490,7 +589,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             if (!estadosValidos.has(estado)) {
                 return res.status(400).json({
                     status: 'error',
-                    message: "Estado inválido. Use: 'Aprobada', 'Rechazada' o 'Confirmada'.",
+                    message: "Estado invÃ¡lido. Use: 'Aprobada', 'Rechazada' o 'Confirmada'.",
                 });
             }
 
@@ -508,12 +607,12 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             );
 
             if (updateRes.rows.length === 0) {
-                return res.status(404).json({ status: 'error', message: 'Reservación no encontrada.' });
+                return res.status(404).json({ status: 'error', message: 'ReservaciÃ³n no encontrada.' });
             }
 
             return res.json({
                 status: 'success',
-                message: 'Estado de reservación actualizado correctamente.',
+                message: 'Estado de reservaciÃ³n actualizado correctamente.',
                 data: updateRes.rows[0],
             });
         } catch (err: unknown) {
@@ -524,14 +623,25 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
     app.put('/alquileres/reservaciones/:id/aprobar-pago', verifyToken, async (req: Request, res: Response) => {
         try {
             const user = asAuthUser(req.user);
-            const condominioId = await getAdminCondominioId(user.id);
+            const adminCondo = await getAdminCondominio(user.id);
+            const condominioId = await ensureAdminCondominio(
+                user.id,
+                res,
+                'Solo administradores pueden aprobar pagos de reservaciones.',
+            );
             if (!condominioId) {
-                return res.status(403).json({ status: 'error', message: 'Solo administradores pueden aprobar pagos de reservaciones.' });
+                return;
+            }
+            if (adminCondo && isJuntaGeneralTipo(adminCondo.tipo)) {
+                return res.status(403).json({
+                    status: 'error',
+                    message: 'La Junta General no gestiona solicitudes de alquiler por inmueble.',
+                });
             }
 
             const reservacionId = parseInt(String((req.params as Record<string, string | undefined>)?.id || ''), 10);
             if (!Number.isFinite(reservacionId) || reservacionId <= 0) {
-                return res.status(400).json({ status: 'error', message: 'ID de reservación inválido.' });
+                return res.status(400).json({ status: 'error', message: 'ID de reservaciÃ³n invÃ¡lido.' });
             }
 
             await pool.query('BEGIN');
@@ -575,7 +685,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             );
             if (reservacionRes.rows.length === 0) {
                 await pool.query('ROLLBACK');
-                return res.status(404).json({ status: 'error', message: 'Reservación no encontrada.' });
+                return res.status(404).json({ status: 'error', message: 'ReservaciÃ³n no encontrada.' });
             }
 
             const row = reservacionRes.rows[0];
@@ -590,7 +700,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
                 await pool.query('ROLLBACK');
                 return res.status(400).json({
                     status: 'error',
-                    message: 'La reservación no tiene un pago temporal válido (monto_bs_pagado, tasa_cambio y comprobante_url).',
+                    message: 'La reservaciÃ³n no tiene un pago temporal vÃ¡lido (monto_bs_pagado, tasa_cambio y comprobante_url).',
                 });
             }
 
@@ -692,7 +802,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             await pool.query('COMMIT');
             return res.json({
                 status: 'success',
-                message: 'Pago de reservación aprobado correctamente.',
+                message: 'Pago de reservaciÃ³n aprobado correctamente.',
                 data: {
                     id: updateRes.rows[0]?.id ?? reservacionId,
                     estado: updateRes.rows[0]?.estado ?? nuevoEstado,
@@ -798,7 +908,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
 
             const reservacionId = parseInt(String((req.params as Record<string, string | undefined>)?.id || ''), 10);
             if (!Number.isFinite(reservacionId) || reservacionId <= 0) {
-                return res.status(400).json({ status: 'error', message: 'ID de reservación inválido.' });
+                return res.status(400).json({ status: 'error', message: 'ID de reservaciÃ³n invÃ¡lido.' });
             }
 
             const reservaRes = await pool.query<{ id: number; estado: string; propiedad_id: number }>(
@@ -813,7 +923,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             );
             const reserva = reservaRes.rows[0];
             if (!reserva) {
-                return res.status(404).json({ status: 'error', message: 'Reservación no encontrada para este propietario.' });
+                return res.status(404).json({ status: 'error', message: 'ReservaciÃ³n no encontrada para este propietario.' });
             }
             const estadoReserva = String(reserva.estado || '').trim().toUpperCase();
             if (estadoReserva !== 'APROBADA' && estadoReserva !== 'PAGO_PARCIAL') {
@@ -827,10 +937,10 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             const bancoDestinoIdRaw = String((req.body as Record<string, unknown>)?.banco_destino_id || '').trim();
 
             if (!Number.isFinite(montoBs) || montoBs <= 0) {
-                return res.status(400).json({ status: 'error', message: 'monto_bs_pagado inválido.' });
+                return res.status(400).json({ status: 'error', message: 'monto_bs_pagado invÃ¡lido.' });
             }
             if (!Number.isFinite(tasaCambio) || tasaCambio <= 0) {
-                return res.status(400).json({ status: 'error', message: 'tasa_cambio inválida.' });
+                return res.status(400).json({ status: 'error', message: 'tasa_cambio invÃ¡lida.' });
             }
             if (!referencia) {
                 return res.status(400).json({ status: 'error', message: 'referencia es requerida.' });
@@ -840,12 +950,12 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             try {
                 fechaPago = toIsoDate(fechaPagoRaw || new Date());
             } catch {
-                return res.status(400).json({ status: 'error', message: 'fecha_pago inválida.' });
+                return res.status(400).json({ status: 'error', message: 'fecha_pago invÃ¡lida.' });
             }
 
             const bancoDestinoId = parseInt(bancoDestinoIdRaw, 10);
             if (!Number.isFinite(bancoDestinoId) || bancoDestinoId <= 0) {
-                return res.status(400).json({ status: 'error', message: 'banco_destino_id inválido.' });
+                return res.status(400).json({ status: 'error', message: 'banco_destino_id invÃ¡lido.' });
             }
 
             const uploadedFile = req.file as Express.Multer.File | undefined;
@@ -957,7 +1067,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             );
 
             if (updateRes.rows.length === 0) {
-                return res.status(404).json({ status: 'error', message: 'No se pudo actualizar la reservación.' });
+                return res.status(404).json({ status: 'error', message: 'No se pudo actualizar la reservaciÃ³n.' });
             }
 
             return res.json({
@@ -985,7 +1095,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             const amenidadId = parseInt(String(req.body?.amenidad_id || ''), 10);
             const fechaReserva = toIsoDate(req.body?.fecha_reserva);
             if (!Number.isFinite(amenidadId) || amenidadId <= 0) {
-                return res.status(400).json({ status: 'error', message: 'amenidad_id inválido.' });
+                return res.status(400).json({ status: 'error', message: 'amenidad_id invÃ¡lido.' });
             }
 
             const solvenciaRes = await pool.query<{ saldo_actual: string | number }>(
@@ -994,7 +1104,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
             );
             const saldoActual = parseFloat(String(solvenciaRes.rows[0]?.saldo_actual ?? 0)) || 0;
             if (saldoActual > 0) {
-                return res.status(403).json({ status: 'error', message: 'Debes estar al día con tus pagos para reservar espacios.' });
+                return res.status(403).json({ status: 'error', message: 'Debes estar al dÃ­a con tus pagos para reservar espacios.' });
             }
 
             const amenidadRes = await pool.query<IAmenidadRow>(
@@ -1047,7 +1157,7 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
 
             return res.status(201).json({
                 status: 'success',
-                message: 'Reservación creada correctamente.',
+                message: 'ReservaciÃ³n creada correctamente.',
                 data: { id: reservaRes.rows[0]?.id ?? null, monto_total_usd: montoTotal },
             });
         } catch (err: unknown) {
@@ -1057,3 +1167,4 @@ const registerAlquileresRoutes = (app: Application, { pool, verifyToken }: AuthD
 };
 
 module.exports = { registerAlquileresRoutes };
+

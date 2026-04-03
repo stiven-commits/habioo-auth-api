@@ -1,5 +1,12 @@
 ﻿import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool, PoolClient } from 'pg';
+const {
+    getCondominioByAdminUserId,
+    isJuntaGeneralTipo,
+}: {
+    getCondominioByAdminUserId: (pool: Pool, adminUserId: number) => Promise<{ id: number; tipo: string | null } | null>;
+    isJuntaGeneralTipo: (tipo: unknown) => boolean;
+} = require('../services/juntaGeneral');
 
 interface AuthUser {
     id: number;
@@ -269,6 +276,21 @@ const toEpochDay = (ymd: string): number => {
 };
 
 const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
+    const ensureNotJuntaGeneralForInmuebleAjustes = async (adminUserId: number, res: Response): Promise<boolean> => {
+        const condo = await getCondominioByAdminUserId(pool, adminUserId);
+        if (!condo) {
+            res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            return false;
+        }
+        if (isJuntaGeneralTipo(condo.tipo)) {
+            res.status(403).json({
+                status: 'error',
+                message: 'La Junta General no puede revertir ajustes de saldo por inmueble.',
+            });
+            return false;
+        }
+        return true;
+    };
     const getMovimientoFondoTiposPermitidos = async (): Promise<string[]> => {
         try {
             const r = await pool.query<{ def: string }>(
@@ -1124,6 +1146,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         const movimientoId = asPositiveInt(asString(req.params.id), 'movimiento_fondo_id');
         try {
             const user = asAuthUser(req.user);
+            if (!(await ensureNotJuntaGeneralForInmuebleAjustes(user.id, res))) return;
             const condoRes = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
             if (!condoRes.rows.length) {
                 return res.status(403).json({ status: 'error', message: 'No autorizado para revertir ajustes.' });
@@ -1748,3 +1771,4 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 };
 
 module.exports = { registerBancosRoutes };
+

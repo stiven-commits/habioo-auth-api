@@ -33,6 +33,7 @@ export interface JuntaGeneralMiembroRow extends QueryResultRow {
     saldo_usd_pagado: string | number | null;
     saldo_bs_generado: string | number | null;
     saldo_bs_pagado: string | number | null;
+    has_historial_avisos: boolean;
 }
 
 let ensureJuntaGeneralSchemaPromise: Promise<void> | null = null;
@@ -184,6 +185,30 @@ const ensureJuntaGeneralSchema = async (pool: Pool): Promise<void> => {
                 ON junta_general_notificaciones (condominio_id, leida, created_at DESC)
             `);
 
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS junta_general_auditoria_eventos (
+                    id SERIAL PRIMARY KEY,
+                    junta_general_id integer NOT NULL REFERENCES condominios(id) ON DELETE CASCADE,
+                    miembro_id integer NULL REFERENCES junta_general_miembros(id) ON DELETE SET NULL,
+                    actor_user_id integer NULL REFERENCES users(id) ON DELETE SET NULL,
+                    actor_condominio_id integer NULL REFERENCES condominios(id) ON DELETE SET NULL,
+                    accion varchar(80) NOT NULL,
+                    detalle_jsonb jsonb NULL,
+                    before_jsonb jsonb NULL,
+                    after_jsonb jsonb NULL,
+                    created_at timestamp NOT NULL DEFAULT now()
+                )
+            `);
+
+            await pool.query(`
+                CREATE INDEX IF NOT EXISTS idx_junta_general_auditoria_general_fecha
+                ON junta_general_auditoria_eventos (junta_general_id, created_at DESC)
+            `);
+            await pool.query(`
+                CREATE INDEX IF NOT EXISTS idx_junta_general_auditoria_miembro
+                ON junta_general_auditoria_eventos (miembro_id, created_at DESC)
+            `);
+
             await pool.query("ALTER TABLE gastos ADD COLUMN IF NOT EXISTS origen_tipo varchar(40)");
             await pool.query("ALTER TABLE gastos ADD COLUMN IF NOT EXISTS origen_junta_general_id integer NULL REFERENCES condominios(id) ON DELETE SET NULL");
             await pool.query("ALTER TABLE gastos ADD COLUMN IF NOT EXISTS origen_aviso_general_id integer NULL REFERENCES junta_general_avisos(id) ON DELETE SET NULL");
@@ -242,6 +267,7 @@ const listJuntaGeneralMiembrosActivos = async (
             COALESCE(SUM(d.monto_usd), 0) AS saldo_usd_generado,
             COALESCE(SUM(CASE WHEN g.id IS NULL THEN 0 ELSE LEAST(COALESCE(g.monto_pagado_usd, 0), d.monto_usd) END), 0) AS saldo_usd_pagado,
             COALESCE(SUM(d.monto_bs), 0) AS saldo_bs_generado,
+            (COUNT(d.id) > 0) AS has_historial_avisos,
             COALESCE(
                 SUM(
                     CASE

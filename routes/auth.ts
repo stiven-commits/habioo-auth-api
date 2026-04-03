@@ -42,6 +42,34 @@ interface LoginBody {
     password: string;
 }
 
+interface PublicJuntaGeneralRow {
+    id: number;
+    nombre_junta: string;
+    rif_junta: string | null;
+}
+
+interface PublicRegistroCondominioBody {
+    tipo?: 'Junta General' | 'Junta Individual' | string;
+    nombre_junta?: string;
+    rif_junta?: string;
+    admin_nombre?: string;
+    admin_cedula?: string;
+    admin_password?: string;
+    admin_email?: string | null;
+    admin_telefono?: string | null;
+    estado_venezuela?: string | null;
+    junta_general_id?: number | string | null;
+    cuota_participacion?: number | string | null;
+}
+
+interface CreatedCondominioRow {
+    id: number;
+}
+
+interface CreatedUserRow {
+    id: number;
+}
+
 interface AuthUser {
     id: number;
 }
@@ -126,11 +154,43 @@ const toNullableNumber = (value: unknown): number | null => {
     return Number.isFinite(parsed) ? parsed : null;
 };
 
+const parsePositiveInt = (value: unknown): number | null => {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return parsed;
+};
+
+const normalizeDoc = (value: unknown): string => String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+const normalizeRif = (value: unknown): string => String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+const normalizeJuntaRif = (value: unknown): string => {
+    const normalized = normalizeRif(value);
+    if (!normalized) return '';
+    return normalized.startsWith('J') ? normalized : `J${normalized}`;
+};
+
+const toNumber = (value: unknown): number => {
+    const parsed = Number.parseFloat(String(value ?? '0').replace(',', '.'));
+    return Number.isFinite(parsed) ? parsed : 0;
+};
+
 const mapUserForResponse = (user: IUserRow): LoginResponseUser => ({
     id: user.id,
     cedula: user.cedula,
     nombre: user.nombre,
 });
+
+const {
+    ensureJuntaGeneralSchema,
+    ensureProveedorForJuntaGeneral,
+}: {
+    ensureJuntaGeneralSchema: (pool: Pool) => Promise<void>;
+    ensureProveedorForJuntaGeneral: (pool: Pool, input: {
+        condominioId: number;
+        juntaGeneralNombre: string;
+        juntaGeneralRif: string;
+        estadoVenezuela: string;
+    }) => Promise<number>;
+} = require('../services/juntaGeneral');
 
 const registerAuthRoutes = (
     app: Application,
@@ -153,6 +213,186 @@ const registerAuthRoutes = (
         } catch (err: unknown) {
             const error = err as Error;
             res.status(400).json({ status: 'error', error: error.message });
+        }
+    });
+
+    app.get('/condominios/juntas-generales-disponibles', async (_req: Request, res: Response) => {
+        try {
+            const result = await pool.query<PublicJuntaGeneralRow>(
+                `
+                SELECT
+                  c.id,
+                  COALESCE(NULLIF(BTRIM(c.nombre_legal), ''), NULLIF(BTRIM(c.nombre), ''), 'Junta General') AS nombre_junta,
+                  NULLIF(BTRIM(c.rif), '') AS rif_junta
+                FROM condominios c
+                WHERE c.tipo = 'Junta General'
+                ORDER BY c.id DESC
+                `
+            );
+            return res.json({ status: 'success', data: result.rows });
+        } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : 'Error al cargar juntas generales.';
+            return res.status(500).json({ status: 'error', message });
+        }
+    });
+
+    app.post('/condominios/registro', async (req: Request<{}, unknown, PublicRegistroCondominioBody>, res: Response) => {
+        try {
+            await ensureJuntaGeneralSchema(pool);
+
+            const tipoRaw = String(req.body?.tipo || '').trim();
+            const tipo = tipoRaw === 'Junta General' ? 'Junta General' : 'Junta Individual';
+            const nombreJunta = String(req.body?.nombre_junta || '').trim();
+            const rifJunta = normalizeJuntaRif(req.body?.rif_junta);
+            const adminNombre = String(req.body?.admin_nombre || '').trim();
+            const adminCedula = normalizeDoc(req.body?.admin_cedula);
+            const adminPassword = String(req.body?.admin_password || '').trim() || adminCedula;
+            const adminEmail = String(req.body?.admin_email || '').trim() || null;
+            const adminTelefono = String(req.body?.admin_telefono || '').trim() || null;
+            const estadoVenezuela = String(req.body?.estado_venezuela || 'Distrito Capital').trim() || 'Distrito Capital';
+            const juntaGeneralId = parsePositiveInt(req.body?.junta_general_id);
+            const cuotaParticipacion = req.body?.cuota_participacion === null || req.body?.cuota_participacion === undefined
+                ? null
+                : toNumber(req.body?.cuota_participacion);
+
+            if (!nombreJunta) {
+                return res.status(400).json({ status: 'error', message: 'nombre_junta es requerido.' });
+            }
+            if (!rifJunta) {
+                return res.status(400).json({ status: 'error', message: 'rif_junta es requerido.' });
+            }
+            if (!rifJunta.startsWith('J')) {
+                return res.status(400).json({ status: 'error', message: 'El RIF de la junta debe comenzar con J.' });
+            }
+            if (!adminNombre || !adminCedula) {
+                return res.status(400).json({ status: 'error', message: 'Debes indicar nombre y cédula/RIF de la administradora.' });
+            }
+            if (tipo === 'Junta General' && juntaGeneralId) {
+                return res.status(400).json({ status: 'error', message: 'Una Junta General no puede depender de otra junta general.' });
+            }
+            if (tipo === 'Junta Individual' && juntaGeneralId && cuotaParticipacion !== null && cuotaParticipacion < 0) {
+                return res.status(400).json({ status: 'error', message: 'cuota_participacion no puede ser negativa.' });
+            }
+
+            await pool.query('BEGIN');
+
+            const existingUser = await pool.query<{ id: number }>(
+                'SELECT id FROM users WHERE cedula = $1 LIMIT 1',
+                [adminCedula]
+            );
+            if (existingUser.rows.length > 0) {
+                await pool.query('ROLLBACK');
+                return res.status(409).json({ status: 'error', message: `Ya existe un usuario con cédula ${adminCedula}.` });
+            }
+
+            const existingCondo = await pool.query<{ id: number }>(
+                `SELECT id
+                 FROM condominios
+                 WHERE UPPER(REPLACE(COALESCE(rif, ''), '-', '')) = UPPER(REPLACE($1, '-', ''))
+                 LIMIT 1`,
+                [rifJunta]
+            );
+            if (existingCondo.rows.length > 0) {
+                await pool.query('ROLLBACK');
+                return res.status(409).json({ status: 'error', message: `Ya existe una junta registrada con RIF ${rifJunta}.` });
+            }
+
+            let generalData: { id: number; nombre_legal: string | null; nombre: string | null; rif: string | null; tipo: string | null; estado_venezuela: string | null } | null = null;
+            if (tipo === 'Junta Individual' && juntaGeneralId) {
+                const generalRes = await pool.query<{ id: number; nombre_legal: string | null; nombre: string | null; rif: string | null; tipo: string | null; estado_venezuela: string | null }>(
+                    `SELECT id, nombre_legal, nombre, rif, tipo, estado_venezuela
+                     FROM condominios
+                     WHERE id = $1
+                     LIMIT 1`,
+                    [juntaGeneralId]
+                );
+                generalData = generalRes.rows[0] || null;
+                if (!generalData) {
+                    await pool.query('ROLLBACK');
+                    return res.status(404).json({ status: 'error', message: 'La junta general seleccionada no existe.' });
+                }
+                if (generalData.tipo !== 'Junta General') {
+                    await pool.query('ROLLBACK');
+                    return res.status(400).json({ status: 'error', message: 'El condominio seleccionado no es Junta General.' });
+                }
+            }
+
+            const salt = await bcrypt.genSalt(10);
+            const hashedPassword = await bcrypt.hash(adminPassword, salt);
+            const userInsert = await pool.query<CreatedUserRow>(
+                `INSERT INTO users (cedula, nombre, password, email, telefono)
+                 VALUES ($1, $2, $3, $4, $5)
+                 RETURNING id`,
+                [adminCedula, adminNombre, hashedPassword, adminEmail, adminTelefono]
+            );
+            const adminUserId = userInsert.rows[0].id;
+
+            const condoInsert = await pool.query<CreatedCondominioRow>(
+                `INSERT INTO condominios (
+                    nombre, nombre_legal, rif, estado_venezuela, admin_user_id, tipo, junta_general_id, cuota_participacion
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 RETURNING id`,
+                [
+                    nombreJunta,
+                    nombreJunta,
+                    rifJunta,
+                    estadoVenezuela,
+                    adminUserId,
+                    tipo,
+                    tipo === 'Junta Individual' ? (juntaGeneralId || null) : null,
+                    tipo === 'Junta Individual' ? cuotaParticipacion : null,
+                ]
+            );
+            const condominioId = condoInsert.rows[0].id;
+
+            if (tipo === 'Junta Individual' && generalData) {
+                await pool.query(
+                    `
+                    INSERT INTO junta_general_miembros (
+                        junta_general_id, condominio_individual_id, nombre_referencia, rif,
+                        cuota_participacion, activo, es_fantasma, vinculado_at
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, true, false, now()
+                    )
+                    ON CONFLICT (junta_general_id, rif)
+                    DO UPDATE SET
+                        condominio_individual_id = EXCLUDED.condominio_individual_id,
+                        nombre_referencia = EXCLUDED.nombre_referencia,
+                        cuota_participacion = EXCLUDED.cuota_participacion,
+                        activo = true,
+                        es_fantasma = false,
+                        vinculado_at = now(),
+                        updated_at = now()
+                    `,
+                    [generalData.id, condominioId, nombreJunta, rifJunta, cuotaParticipacion]
+                );
+
+                await ensureProveedorForJuntaGeneral(pool, {
+                    condominioId,
+                    juntaGeneralNombre: String(generalData.nombre_legal || generalData.nombre || 'Junta General'),
+                    juntaGeneralRif: String(generalData.rif || ''),
+                    estadoVenezuela: String(estadoVenezuela || generalData.estado_venezuela || 'Distrito Capital'),
+                });
+            }
+
+            await pool.query('COMMIT');
+            return res.status(201).json({
+                status: 'success',
+                data: {
+                    condominio_id: condominioId,
+                    admin_user_id: adminUserId,
+                    tipo,
+                },
+                message: 'Junta de condominio registrada correctamente.',
+            });
+        } catch (error: unknown) {
+            try {
+                await pool.query('ROLLBACK');
+            } catch {
+                // noop: no active transaction
+            }
+            const message = error instanceof Error ? error.message : 'Error al registrar junta.';
+            return res.status(500).json({ status: 'error', message });
         }
     });
 
@@ -301,4 +541,3 @@ const registerAuthRoutes = (
 };
 
 module.exports = { registerAuthRoutes };
-

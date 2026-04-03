@@ -19,6 +19,7 @@ interface IIdRow {
 interface ICondominioAdminRow {
     id: number;
     mes_actual: string | null;
+    tipo: string | null;
 }
 
 interface IMisPropiedadRow extends Record<string, unknown> {
@@ -125,6 +126,23 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
         return `${y}-${m}`;
     };
 
+    const resolveCondoIdForInmuebles = async (adminUserId: number, res: Response): Promise<number | null> => {
+        const condoRes = await pool.query<ICondominioAdminRow>(
+            'SELECT id, mes_actual, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+            [adminUserId],
+        );
+        const condo = condoRes.rows[0];
+        if (!condo?.id) {
+            res.status(403).json({ status: 'error', message: 'No autorizado para consultar módulos de inmuebles.' });
+            return null;
+        }
+        if (String(condo.tipo || '').trim().toLowerCase() === 'junta general') {
+            res.status(403).json({ status: 'error', message: 'La Junta General no puede acceder a módulos de detalle por inmueble.' });
+            return null;
+        }
+        return condo.id;
+    };
+
     app.get('/mis-propiedades', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
@@ -172,16 +190,8 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
     const adminResumenHandler = async (req: Request, res: Response): Promise<Response | void> => {
         try {
             const user = asAuthUser(req.user);
-            const condoRes = await pool.query<IIdRow>(
-                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
-                [user.id],
-            );
-
-            if (condoRes.rows.length === 0) {
-                return res.status(403).json({ status: 'error', message: 'No autorizado para consultar resumen administrativo.' });
-            }
-
-            const condominioId = condoRes.rows[0].id;
+            const condominioId = await resolveCondoIdForInmuebles(user.id, res);
+            if (!condominioId) return;
 
             const [liquidezRes, porCobrarRes, cuentasPorPagarRes, egresosMesRes] = await Promise.all([
                 pool.query<IResumenSumRow>(
@@ -254,14 +264,8 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
     app.get('/admin-graficos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const condoRes = await pool.query<IIdRow>(
-                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
-                [user.id],
-            );
-            if (condoRes.rows.length === 0) {
-                return res.status(403).json({ status: 'error', message: 'No autorizado para consultar graficos administrativos.' });
-            }
-            const condominioId = condoRes.rows[0].id;
+            const condominioId = await resolveCondoIdForInmuebles(user.id, res);
+            if (!condominioId) return;
 
             const [ingresosRes, egresosRes, gastosRubrosRes] = await Promise.all([
                 pool.query<IMonthlySumRow>(
@@ -361,14 +365,8 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
     app.get('/admin-movimientos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const condoRes = await pool.query<IIdRow>(
-                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
-                [user.id],
-            );
-            if (condoRes.rows.length === 0) {
-                return res.status(403).json({ status: 'error', message: 'No autorizado para consultar movimientos administrativos.' });
-            }
-            const condominioId = condoRes.rows[0].id;
+            const condominioId = await resolveCondoIdForInmuebles(user.id, res);
+            if (!condominioId) return;
 
             const [ultimosPagosRes, pagosPendientesRes, reservasPendientesRes, reservasPagoReportadoRes] = await Promise.all([
                 pool.query<IUltimoPagoDashboardRow>(
@@ -436,12 +434,8 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
     app.get('/cuentas-por-cobrar', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const c = await pool.query<IIdRow>(
-                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
-                [user.id],
-            );
-            if (c.rows.length === 0) return res.status(403).json({ error: 'No autorizado' });
-            const condoId = c.rows[0].id;
+            const condoId = await resolveCondoIdForInmuebles(user.id, res);
+            if (!condoId) return;
 
             const query = `
                 SELECT r.*, p.identificador as apto
@@ -480,12 +474,18 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
             await pool.query('BEGIN');
 
             const condoRes = await pool.query<ICondominioAdminRow>(
-                'SELECT id, mes_actual FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                'SELECT id, mes_actual, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1',
                 [user.id],
             );
 
             if (condoRes.rows.length === 0) {
                 throw new Error('Condominio no encontrado para este administrador.');
+            }
+            if (String(condoRes.rows[0].tipo || '').trim().toLowerCase() === 'junta general') {
+                return res.status(403).json({
+                    status: 'error',
+                    message: 'La Junta General no puede ejecutar seeder de inmuebles.',
+                });
             }
 
             const condoId = condoRes.rows[0].id;

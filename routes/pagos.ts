@@ -1,7 +1,15 @@
 ﻿import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 
-const { ensureJuntaGeneralSchema }: { ensureJuntaGeneralSchema: (pool: Pool) => Promise<void> } = require('../services/juntaGeneral');
+const {
+    ensureJuntaGeneralSchema,
+    getCondominioByAdminUserId,
+    isJuntaGeneralTipo,
+}: {
+    ensureJuntaGeneralSchema: (pool: Pool) => Promise<void>;
+    getCondominioByAdminUserId: (pool: Pool, adminUserId: number) => Promise<{ id: number; tipo: string | null } | null>;
+    isJuntaGeneralTipo: (tipo: unknown) => boolean;
+} = require('../services/juntaGeneral');
 
 interface AuthUser {
     id: number;
@@ -305,6 +313,34 @@ const toEpochDay = (ymd: string): number => {
 };
 
 const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleNumber, getPagosOptionalColumns }: AuthDependencies): void => {
+    const logJuntaGeneralAuditoria = async (input: {
+        juntaGeneralId: number;
+        actorUserId?: number | null;
+        actorCondominioId?: number | null;
+        accion: string;
+        detalle?: Record<string, unknown> | null;
+        before?: Record<string, unknown> | null;
+        after?: Record<string, unknown> | null;
+    }): Promise<void> => {
+        await pool.query(
+            `
+            INSERT INTO junta_general_auditoria_eventos (
+                junta_general_id, miembro_id, actor_user_id, actor_condominio_id,
+                accion, detalle_jsonb, before_jsonb, after_jsonb
+            ) VALUES ($1, NULL, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb)
+            `,
+            [
+                input.juntaGeneralId,
+                input.actorUserId ?? null,
+                input.actorCondominioId ?? null,
+                input.accion,
+                JSON.stringify(input.detalle ?? null),
+                JSON.stringify(input.before ?? null),
+                JSON.stringify(input.after ?? null),
+            ],
+        );
+    };
+
     const resolveMovimientoFondoTipo = async (preferred: string[], fallback: string): Promise<string> => {
         try {
             const r = await pool.query<IConstraintDefRow>(`
@@ -754,12 +790,29 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         }
     };
 
+    const ensureInmueblePagosAccess = async (adminUserId: number, res: Response): Promise<boolean> => {
+        const condo = await getCondominioByAdminUserId(pool, adminUserId);
+        if (!condo) {
+            res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            return false;
+        }
+        if (isJuntaGeneralTipo(condo.tipo)) {
+            res.status(403).json({
+                status: 'error',
+                message: 'La Junta General no puede gestionar pagos por inmueble.',
+            });
+            return false;
+        }
+        return true;
+    };
+
     // Ruta de administradores para registrar y aprobar pagos en cascada al instante.
     app.post('/pagos-admin', verifyToken, async (req: Request<{}, unknown, PagosAdminBody>, res: Response, _next: NextFunction) => {
         const { propiedad_id, cuenta_id, monto_origen, tasa_cambio, referencia, fecha_pago, nota, cedula_origen, banco_origen, telefono_origen, moneda, metodo } = req.body;
 
         try {
             const user = asAuthUser(req.user);
+            if (!(await ensureInmueblePagosAccess(user.id, res))) return;
 
             const propiedadIdNum = parseInt(String(propiedad_id), 10);
             if (!Number.isFinite(propiedadIdNum) || propiedadIdNum <= 0) {
@@ -1054,6 +1107,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
     app.get('/pagos/pendientes-aprobacion', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
+            if (!(await ensureInmueblePagosAccess(user.id, res))) return;
 
             const propiedadIdRaw = parseInt(String(req.query.propiedad_id || ''), 10);
             const whereByPropiedad = Number.isFinite(propiedadIdRaw) && propiedadIdRaw > 0 ? 'AND p.id = $2' : '';
@@ -1116,6 +1170,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
         try {
             const user = asAuthUser(req.user);
+            if (!(await ensureInmueblePagosAccess(user.id, res))) return;
 
             await pool.query('BEGIN');
             const pagosCols = await getPagosColumns();
@@ -1182,6 +1237,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
         try {
             const user = asAuthUser(req.user);
+            if (!(await ensureInmueblePagosAccess(user.id, res))) return;
             const pagoRes = await pool.query<IPagoFullRow>(
                 "SELECT id, monto_usd, monto_origen, tasa_cambio, propiedad_id, estado, cuenta_bancaria_id, moneda, referencia FROM pagos WHERE id = $1 AND estado = 'PendienteAprobacion'",
                 [pagoId]
@@ -1216,6 +1272,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
 
         try {
             const user = asAuthUser(req.user);
+            if (!(await ensureInmueblePagosAccess(user.id, res))) return;
             await pool.query('BEGIN');
 
             const pagoRes = await pool.query<IPagoFullRow>(
@@ -1687,6 +1744,30 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                                 }),
                             ]
                         );
+                        await logJuntaGeneralAuditoria({
+                            juntaGeneralId,
+                            actorUserId: user.id,
+                            actorCondominioId: Number(pago.condominio_id || 0) || null,
+                            accion: 'PAGO_GENERAL_REVERTIDO',
+                            detalle: {
+                                gasto_id: pago.gasto_id,
+                                concepto: pago.concepto || null,
+                                pago_proveedor_id: pagoProveedorId,
+                                aviso_id: pago.origen_aviso_general_id || null,
+                                detalle_id: detalleId,
+                                junta_rif: detalle.junta_rif || null,
+                            },
+                            before: {
+                                estado_detalle: 'ABONADO_O_PAGADO',
+                            },
+                            after: {
+                                estado_detalle: estadoDetalle,
+                                monto_revertido_usd: montoReversionUsd,
+                                monto_revertido_bs: montoReversionBs,
+                                saldo_pendiente_usd: pendienteDetalleUsd,
+                                saldo_pendiente_bs: pendienteDetalleBs,
+                            },
+                        });
                     }
                 }
             }
@@ -1909,6 +1990,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         let txStarted = false;
 
         try {
+            const user = asAuthUser(req.user);
             if (!gasto_id) {
                 return res.status(400).json({ status: 'error', message: 'gasto_id es requerido.' });
             }
@@ -2228,6 +2310,30 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                                 }),
                             ]
                         );
+                        await logJuntaGeneralAuditoria({
+                            juntaGeneralId,
+                            actorUserId: user.id,
+                            actorCondominioId: Number(gastoActualizado.condominio_id || 0) || null,
+                            accion: 'PAGO_GENERAL_RECIBIDO',
+                            detalle: {
+                                gasto_id: gastoActualizado.id,
+                                concepto: gastoActualizado.concepto || null,
+                                pago_proveedor_id: pagoProveedorId,
+                                aviso_id: gastoActualizado.origen_aviso_general_id || null,
+                                detalle_id: detalleId,
+                                junta_rif: detalle.junta_rif || null,
+                            },
+                            before: {
+                                estado_detalle: 'PENDIENTE_O_ABONADO',
+                            },
+                            after: {
+                                estado_detalle: estadoDetalle,
+                                monto_pagado_usd: montoTotalPagoUsd,
+                                monto_pagado_bs: totalBs,
+                                saldo_pendiente_usd: pendienteDetalleUsd,
+                                saldo_pendiente_bs: pendienteDetalleBs,
+                            },
+                        });
                     }
                 }
             }

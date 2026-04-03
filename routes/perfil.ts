@@ -61,6 +61,14 @@ interface PerfilCondominioRow {
   admin_user_id: number | null;
 }
 
+interface PerfilJerarquiaRow {
+  id: number;
+  rif: string | null;
+  tipo: string | null;
+  junta_general_id: number | null;
+  cuota_participacion: string | number | null;
+}
+
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -103,6 +111,25 @@ const hasColumn = async (columnName: string): Promise<boolean> => {
     [columnName],
   );
   return colsRes.rows.length > 0;
+};
+
+const hasOwn = (obj: Record<string, unknown>, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(obj, key);
+
+const normalizeComparableText = (value: unknown): string =>
+  String(value ?? '').trim().toLowerCase();
+
+const toNullableInt = (value: unknown): number | null => {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const n = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+};
+
+const toNullableDecimal = (value: unknown): number | null => {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const n = Number.parseFloat(String(value).replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
 };
 
 router.get('/', verifyToken, async (req: Request, res: Response<ApiRes<PerfilCondominioRow>>): Promise<void> => {
@@ -170,6 +197,49 @@ router.put('/', verifyToken, async (req: Request, res: Response<ApiRes>): Promis
       return;
     }
 
+    const body = (req.body as Record<string, unknown>) || {};
+
+    const currentRes = await pool.query<PerfilJerarquiaRow>(
+      `
+        SELECT id, rif, tipo, junta_general_id, cuota_participacion
+        FROM condominios
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [condominioId],
+    );
+    const current = currentRes.rows[0];
+    if (!current) {
+      res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+      return;
+    }
+
+    const attemptedTipo = hasOwn(body, 'tipo') ? normalizeComparableText(body.tipo) : normalizeComparableText(current.tipo);
+    const attemptedJuntaGeneralId = hasOwn(body, 'junta_general_id') ? toNullableInt(body.junta_general_id) : current.junta_general_id;
+    const attemptedCuota = hasOwn(body, 'cuota_participacion') ? toNullableDecimal(body.cuota_participacion) : toNullableDecimal(current.cuota_participacion);
+
+    const currentTipo = normalizeComparableText(current.tipo);
+    const currentJuntaGeneralId = current.junta_general_id;
+    const currentCuota = toNullableDecimal(current.cuota_participacion);
+
+    const cuotaChanged = (() => {
+      if (attemptedCuota === null && currentCuota === null) return false;
+      if (attemptedCuota === null || currentCuota === null) return true;
+      return Math.abs(attemptedCuota - currentCuota) > 0.000001;
+    })();
+
+    if (
+      attemptedTipo !== currentTipo ||
+      attemptedJuntaGeneralId !== currentJuntaGeneralId ||
+      cuotaChanged
+    ) {
+      res.status(403).json({
+        status: 'error',
+        message: 'La jerarquia de la junta no se puede editar desde Perfil. Usa el flujo de vinculacion autorizado.',
+      });
+      return;
+    }
+
     const {
       nombre,
       nombre_legal,
@@ -185,14 +255,11 @@ router.put('/', verifyToken, async (req: Request, res: Response<ApiRes>): Promis
       aviso_msg_2,
       aviso_msg_3,
       aviso_msg_4,
-      tipo,
-      junta_general_id,
       tasa_interes,
       metodo_division,
-      cuota_participacion,
       estado_venezuela,
       mes_actual,
-    } = req.body as Record<string, unknown>;
+    } = body;
 
     await pool.query(
       `
@@ -235,11 +302,11 @@ router.put('/', verifyToken, async (req: Request, res: Response<ApiRes>): Promis
         aviso_msg_2 ?? null,
         aviso_msg_3 ?? null,
         aviso_msg_4 ?? null,
-        tipo ?? null,
-        junta_general_id ?? null,
+        current.tipo ?? null,
+        current.junta_general_id ?? null,
         tasa_interes ?? null,
         metodo_division ?? null,
-        cuota_participacion ?? null,
+        current.cuota_participacion ?? null,
         estado_venezuela ?? null,
         mes_actual ?? null,
         condominioId,

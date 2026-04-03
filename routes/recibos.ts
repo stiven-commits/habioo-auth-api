@@ -10,6 +10,11 @@ interface AuthDependencies {
     verifyToken: (req: Request, res: Response, next: NextFunction) => void | Promise<void>;
 }
 
+interface ICondominioAdminTipoRow {
+    id: number;
+    tipo: string | null;
+}
+
 interface IReciboHistorialRow {
     id: number;
     mes_cobro: string;
@@ -63,9 +68,23 @@ const asError = (value: unknown): Error => {
 };
 
 const registerRecibosRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
+    const adminHasInmueblesScope = async (adminUserId: number): Promise<boolean> => {
+        const cRes = await pool.query<ICondominioAdminTipoRow>(
+            'SELECT id, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+            [adminUserId]
+        );
+        const condo = cRes.rows[0];
+        if (!condo?.id) return true;
+        return String(condo.tipo || '').trim().toLowerCase() !== 'junta general';
+    };
+
     app.get('/recibos-historial', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
+            const canAccessInmuebles = await adminHasInmueblesScope(user.id);
+            if (!canAccessInmuebles) {
+                return res.status(403).json({ status: 'error', message: 'La Junta General no puede visualizar historial de recibos por inmueble.' });
+            }
             const r = await pool.query<IReciboHistorialRow>(
                 `SELECT
                     r.id,
@@ -96,6 +115,10 @@ const registerRecibosRoutes = (app: Application, { pool, verifyToken }: AuthDepe
     app.get('/recibos/:id/aviso', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
+            const canAccessInmuebles = await adminHasInmueblesScope(user.id);
+            if (!canAccessInmuebles) {
+                return res.status(403).json({ status: 'error', message: 'La Junta General no puede visualizar avisos por inmueble.' });
+            }
             const reciboId = parseInt(String(req.params.id || ''), 10);
             if (!Number.isFinite(reciboId) || reciboId <= 0) {
                 return res.status(400).json({ status: 'error', message: 'ID de recibo invalido.' });

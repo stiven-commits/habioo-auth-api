@@ -27,6 +27,19 @@ interface MiembroParams {
     id?: string;
 }
 
+interface AuditoriaEventoRow {
+    id: number;
+    accion: string;
+    created_at: string | Date;
+    detalle_jsonb: Record<string, unknown> | null;
+    before_jsonb: Record<string, unknown> | null;
+    after_jsonb: Record<string, unknown> | null;
+    actor_user_id: number | null;
+    actor_condominio_id: number | null;
+    actor_nombre: string | null;
+    actor_condominio_nombre: string | null;
+}
+
 const {
     normalizeRif,
     isJuntaGeneralTipo,
@@ -100,6 +113,52 @@ const randomCode = (): string => {
 };
 
 const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
+    const logAuditoria = async (input: {
+        juntaGeneralId: number;
+        miembroId?: number | null;
+        actorUserId?: number | null;
+        actorCondominioId?: number | null;
+        accion: string;
+        detalle?: Record<string, unknown> | null;
+        before?: Record<string, unknown> | null;
+        after?: Record<string, unknown> | null;
+    }): Promise<void> => {
+        await pool.query(
+            `
+            INSERT INTO junta_general_auditoria_eventos (
+                junta_general_id, miembro_id, actor_user_id, actor_condominio_id,
+                accion, detalle_jsonb, before_jsonb, after_jsonb
+            ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb)
+            `,
+            [
+                input.juntaGeneralId,
+                input.miembroId ?? null,
+                input.actorUserId ?? null,
+                input.actorCondominioId ?? null,
+                input.accion,
+                JSON.stringify(input.detalle ?? null),
+                JSON.stringify(input.before ?? null),
+                JSON.stringify(input.after ?? null),
+            ]
+        );
+    };
+
+    const pushNotificacion = async (
+        condominioId: number,
+        tipo: string,
+        titulo: string,
+        mensaje: string,
+        metadata?: Record<string, unknown> | null
+    ): Promise<void> => {
+        await pool.query(
+            `
+            INSERT INTO junta_general_notificaciones (condominio_id, tipo, titulo, mensaje, metadata_jsonb)
+            VALUES ($1, $2, $3, $4, $5::jsonb)
+            `,
+            [condominioId, tipo, titulo, mensaje, JSON.stringify(metadata ?? null)]
+        );
+    };
+
     const resolveCondominioSesion = async (auth: AuthUser) => {
         const condoId = toPositiveInt(auth.condominio_id);
         if (condoId) {
@@ -220,6 +279,27 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 [rif]
             );
             const linked = linkedCondo.rows[0] || null;
+            const preExisting = await pool.query<{
+                id: number;
+                nombre_referencia: string;
+                rif: string;
+                cuota_participacion: string | number | null;
+                zona_id: number | null;
+                condominio_individual_id: number | null;
+                activo: boolean;
+                es_fantasma: boolean;
+            }>(
+                `
+                SELECT id, nombre_referencia, rif, cuota_participacion, zona_id, condominio_individual_id, activo, es_fantasma
+                FROM junta_general_miembros
+                WHERE junta_general_id = $1
+                  AND UPPER(REGEXP_REPLACE(COALESCE(rif, ''), '[^A-Z0-9]', '', 'g'))
+                      = UPPER(REGEXP_REPLACE($2, '[^A-Z0-9]', '', 'g'))
+                LIMIT 1
+                `,
+                [condo.id, rif]
+            );
+            const beforeMember = preExisting.rows[0] || null;
             if (linked?.id === condo.id) {
                 return res.status(409).json({ status: 'error', message: 'No puedes agregar la misma Junta General como miembro individual.' });
             }
@@ -289,6 +369,58 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 });
             }
 
+            const afterMemberRes = await pool.query<{
+                id: number;
+                nombre_referencia: string;
+                rif: string;
+                cuota_participacion: string | number | null;
+                zona_id: number | null;
+                condominio_individual_id: number | null;
+                activo: boolean;
+                es_fantasma: boolean;
+            }>(
+                `
+                SELECT id, nombre_referencia, rif, cuota_participacion, zona_id, condominio_individual_id, activo, es_fantasma
+                FROM junta_general_miembros
+                WHERE id = $1
+                LIMIT 1
+                `,
+                [inserted.rows[0].id]
+            );
+            await logAuditoria({
+                juntaGeneralId: condo.id,
+                miembroId: inserted.rows[0].id,
+                actorUserId: auth.id,
+                actorCondominioId: condo.id,
+                accion: beforeMember ? 'MIEMBRO_REACTIVADO_O_ACTUALIZADO' : 'MIEMBRO_CREADO',
+                detalle: {
+                    linked_condominio_id: linked?.id ?? null,
+                    via: 'juntas-generales/miembros',
+                },
+                before: beforeMember,
+                after: afterMemberRes.rows[0] || null,
+            });
+
+            await pushNotificacion(
+                condo.id,
+                beforeMember ? 'MIEMBRO_ACTUALIZADO' : 'MIEMBRO_CREADO',
+                beforeMember ? 'Junta individual actualizada' : 'Junta individual registrada',
+                beforeMember
+                    ? `Se actualizó ${nombre} (${rif}) en la vinculación de Junta General.`
+                    : `Se registró ${nombre} (${rif}) en la vinculación de Junta General.`,
+                { miembro_id: inserted.rows[0].id, rif, condominio_individual_id: linked?.id ?? null }
+            );
+
+            if (linked?.id) {
+                await pushNotificacion(
+                    linked.id,
+                    'VINCULACION_GENERAL',
+                    'Vinculación con Junta General',
+                    `Tu junta fue vinculada con ${String(condo.nombre_legal || condo.nombre || 'Junta General').trim()}.`,
+                    { junta_general_id: condo.id, miembro_id: inserted.rows[0].id }
+                );
+            }
+
             return res.status(201).json({ status: 'success', data: { id: inserted.rows[0].id }, message: 'Miembro registrado.' });
         } catch (error) {
             const raw = error instanceof Error ? error.message : 'Error al registrar miembro.';
@@ -348,19 +480,43 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 rif: string;
                 condominio_individual_id: number | null;
                 condominio_rif: string | null;
+                has_historial_avisos: boolean;
+                nombre_referencia: string;
+                cuota_participacion: string | number | null;
+                zona_id: number | null;
+                activo: boolean;
+                es_fantasma: boolean;
             }>(
                 `
-                SELECT m.id, m.rif, m.condominio_individual_id, c.rif AS condominio_rif
+                SELECT
+                    m.id,
+                    m.rif,
+                    m.condominio_individual_id,
+                    c.rif AS condominio_rif,
+                    (COUNT(d.id) > 0) AS has_historial_avisos,
+                    m.nombre_referencia,
+                    m.cuota_participacion,
+                    m.zona_id,
+                    m.activo,
+                    m.es_fantasma
                 FROM junta_general_miembros m
                 LEFT JOIN condominios c ON c.id = m.condominio_individual_id
+                LEFT JOIN junta_general_aviso_detalles d ON d.miembro_id = m.id
                 WHERE m.id = $1
                   AND m.junta_general_id = $2
+                GROUP BY m.id, m.rif, m.condominio_individual_id, c.rif, m.nombre_referencia, m.cuota_participacion, m.zona_id, m.activo, m.es_fantasma
                 LIMIT 1
                 `,
                 [id, condo.id]
             );
             const current = currentMember.rows[0];
             if (!current) return res.status(404).json({ status: 'error', message: 'Miembro no encontrado.' });
+            if (current.has_historial_avisos) {
+                return res.status(409).json({
+                    status: 'error',
+                    message: 'No puedes editar esta junta porque ya fue incluida en al menos un aviso de cobro.',
+                });
+            }
 
             if (current.condominio_individual_id && rifMaybe) {
                 const rifCondominio = normalizeJuntaRif(current.condominio_rif || '');
@@ -414,6 +570,60 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             );
 
             if (!updated.rowCount) return res.status(404).json({ status: 'error', message: 'Miembro no encontrado.' });
+            const afterMemberRes = await pool.query<{
+                id: number;
+                nombre_referencia: string;
+                rif: string;
+                cuota_participacion: string | number | null;
+                zona_id: number | null;
+                condominio_individual_id: number | null;
+                activo: boolean;
+                es_fantasma: boolean;
+            }>(
+                `
+                SELECT id, nombre_referencia, rif, cuota_participacion, zona_id, condominio_individual_id, activo, es_fantasma
+                FROM junta_general_miembros
+                WHERE id = $1
+                LIMIT 1
+                `,
+                [id]
+            );
+            await logAuditoria({
+                juntaGeneralId: condo.id,
+                miembroId: id,
+                actorUserId: auth.id,
+                actorCondominioId: condo.id,
+                accion: 'MIEMBRO_EDITADO',
+                before: {
+                    id: current.id,
+                    nombre_referencia: current.nombre_referencia,
+                    rif: current.rif,
+                    cuota_participacion: current.cuota_participacion,
+                    zona_id: current.zona_id,
+                    condominio_individual_id: current.condominio_individual_id,
+                    activo: current.activo,
+                    es_fantasma: current.es_fantasma,
+                },
+                after: afterMemberRes.rows[0] || null,
+            });
+
+            await pushNotificacion(
+                condo.id,
+                'MIEMBRO_EDITADO',
+                'Junta individual editada',
+                `Se editaron datos de ${nombre}.`,
+                { miembro_id: id, rif: rifMaybe || current.rif }
+            );
+
+            if (current.condominio_individual_id) {
+                await pushNotificacion(
+                    current.condominio_individual_id,
+                    'VINCULACION_GENERAL',
+                    'Actualización de vinculación',
+                    `La Junta General actualizó tus datos de vinculación (${nombre}).`,
+                    { junta_general_id: condo.id, miembro_id: id }
+                );
+            }
             return res.json({ status: 'success', message: 'Miembro actualizado.' });
         } catch (error) {
             const raw = error instanceof Error ? error.message : 'Error al actualizar miembro.';
@@ -435,10 +645,17 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const id = toPositiveInt(req.params?.id);
             if (!id) return res.status(400).json({ status: 'error', message: 'ID inválido.' });
 
-            await pool.query('BEGIN');
-
-            const memberRes = await pool.query<{ id: number; condominio_individual_id: number | null }>(
-                `SELECT id, condominio_individual_id
+            const memberRes = await pool.query<{
+                id: number;
+                condominio_individual_id: number | null;
+                nombre_referencia: string;
+                rif: string;
+                cuota_participacion: string | number | null;
+                zona_id: number | null;
+                activo: boolean;
+                es_fantasma: boolean;
+            }>(
+                `SELECT id, condominio_individual_id, nombre_referencia, rif, cuota_participacion, zona_id, activo, es_fantasma
                  FROM junta_general_miembros
                  WHERE id = $1
                    AND junta_general_id = $2
@@ -447,7 +664,6 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             );
             const member = memberRes.rows[0];
             if (!member) {
-                await pool.query('ROLLBACK');
                 return res.status(404).json({ status: 'error', message: 'Miembro no encontrado.' });
             }
 
@@ -458,39 +674,69 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 [id]
             );
             const hasHistory = parseInt(hasHistoryRes.rows[0]?.total || '0', 10) > 0;
-
-            if (!hasHistory) {
-                await pool.query(
-                    `DELETE FROM junta_general_miembros
-                     WHERE id = $1
-                       AND junta_general_id = $2`,
-                    [id, condo.id]
-                );
-                if (member.condominio_individual_id) {
-                    await pool.query(
-                        `UPDATE condominios
-                         SET junta_general_id = NULL
-                         WHERE id = $1
-                           AND junta_general_id = $2`,
-                        [member.condominio_individual_id, condo.id]
-                    );
-                }
-                await pool.query('COMMIT');
-                return res.json({ status: 'success', message: 'Vinculación eliminada correctamente.' });
+            if (hasHistory) {
+                return res.status(409).json({
+                    status: 'error',
+                    message: 'No puedes eliminar este vínculo porque la junta ya fue incluida en al menos un aviso de cobro.',
+                });
             }
 
+            const beforeMember = {
+                id: member.id,
+                nombre_referencia: member.nombre_referencia,
+                rif: member.rif,
+                cuota_participacion: member.cuota_participacion,
+                zona_id: member.zona_id,
+                condominio_individual_id: member.condominio_individual_id,
+                activo: member.activo,
+                es_fantasma: member.es_fantasma,
+            };
+
             await pool.query(
-                `UPDATE junta_general_miembros
-                 SET activo = false, updated_at = now(), codigo_invitacion = NULL, codigo_expira_at = NULL
-                 WHERE id = $1 AND junta_general_id = $2`,
+                `DELETE FROM junta_general_miembros
+                 WHERE id = $1
+                   AND junta_general_id = $2`,
                 [id, condo.id]
             );
-            await pool.query('COMMIT');
+            if (member.condominio_individual_id) {
+                await pool.query(
+                    `UPDATE condominios
+                     SET junta_general_id = NULL
+                     WHERE id = $1
+                       AND junta_general_id = $2`,
+                    [member.condominio_individual_id, condo.id]
+                );
+            }
+            await logAuditoria({
+                juntaGeneralId: condo.id,
+                miembroId: id,
+                actorUserId: auth.id,
+                actorCondominioId: condo.id,
+                accion: 'MIEMBRO_ELIMINADO',
+                before: beforeMember,
+                after: null,
+            });
 
-            return res.json({ status: 'success', message: 'La junta se desactivó porque ya tiene historial de avisos.' });
+            await pushNotificacion(
+                condo.id,
+                'MIEMBRO_ELIMINADO',
+                'Vínculo eliminado',
+                `Se eliminó la vinculación de ${member.nombre_referencia} (${member.rif}).`,
+                { miembro_id: id, rif: member.rif }
+            );
+
+            if (member.condominio_individual_id) {
+                await pushNotificacion(
+                    member.condominio_individual_id,
+                    'VINCULACION_GENERAL',
+                    'Desvinculación de Junta General',
+                    'Tu junta fue desvinculada de la Junta General.',
+                    { junta_general_id: condo.id, miembro_id: id }
+                );
+            }
+            return res.json({ status: 'success', message: 'Vinculación eliminada correctamente.' });
         } catch (error) {
-            await pool.query('ROLLBACK');
-            const message = error instanceof Error ? error.message : 'Error al desactivar miembro.';
+            const message = error instanceof Error ? error.message : 'Error al eliminar miembro.';
             return res.status(500).json({ status: 'error', message });
         }
     });
@@ -506,6 +752,22 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const id = toPositiveInt(req.params?.id);
             if (!id) return res.status(400).json({ status: 'error', message: 'ID inválido.' });
 
+            const beforeInviteRes = await pool.query<{
+                id: number;
+                codigo_invitacion: string | null;
+                codigo_expira_at: string | Date | null;
+                activo: boolean;
+            }>(
+                `
+                SELECT id, codigo_invitacion, codigo_expira_at, activo
+                FROM junta_general_miembros
+                WHERE id = $1
+                  AND junta_general_id = $2
+                LIMIT 1
+                `,
+                [id, condo.id]
+            );
+            const beforeInvite = beforeInviteRes.rows[0] || null;
             const code = randomCode();
             const expira = new Date(Date.now() + (15 * 24 * 60 * 60 * 1000));
             const updated = await pool.query(
@@ -521,6 +783,26 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 [code, expira.toISOString(), id, condo.id]
             );
             if (!updated.rowCount) return res.status(404).json({ status: 'error', message: 'Miembro no encontrado o inactivo.' });
+            await logAuditoria({
+                juntaGeneralId: condo.id,
+                miembroId: id,
+                actorUserId: auth.id,
+                actorCondominioId: condo.id,
+                accion: 'INVITACION_GENERADA',
+                before: beforeInvite,
+                after: {
+                    id,
+                    codigo_invitacion: code,
+                    codigo_expira_at: expira.toISOString(),
+                },
+            });
+            await pushNotificacion(
+                condo.id,
+                'INVITACION_GENERADA',
+                'Código de vinculación generado',
+                `Se generó un nuevo código para ${beforeInvite ? 'la junta seleccionada' : 'el miembro'}.`,
+                { miembro_id: id, expira_at: expira.toISOString() }
+            );
 
             return res.json({
                 status: 'success',
@@ -627,6 +909,25 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 ]
             );
 
+            const afterInviteMemberRes = await pool.query<{
+                id: number;
+                condominio_individual_id: number | null;
+                es_fantasma: boolean;
+                vinculado_at: string | Date | null;
+                codigo_invitacion: string | null;
+                codigo_expira_at: string | Date | null;
+                nombre_referencia: string;
+                rif: string;
+            }>(
+                `
+                SELECT id, condominio_individual_id, es_fantasma, vinculado_at, codigo_invitacion, codigo_expira_at, nombre_referencia, rif
+                FROM junta_general_miembros
+                WHERE id = $1
+                LIMIT 1
+                `,
+                [invite.id]
+            );
+
             await pool.query(
                 `
                 UPDATE condominios
@@ -663,6 +964,33 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     JSON.stringify({ junta_general_id: invite.junta_general_id }),
                 ]
             );
+            await pushNotificacion(
+                invite.junta_general_id,
+                'VINCULACION_GENERAL',
+                'Junta individual vinculada',
+                `${String(condo.nombre_legal || condo.nombre || 'Junta Individual').trim()} aceptó la invitación de vinculación.`,
+                { miembro_id: invite.id, condominio_individual_id: condo.id }
+            );
+
+            await logAuditoria({
+                juntaGeneralId: invite.junta_general_id,
+                miembroId: invite.id,
+                actorUserId: auth.id,
+                actorCondominioId: condo.id,
+                accion: 'INVITACION_ACEPTADA',
+                detalle: {
+                    codigo_usado: code,
+                },
+                before: {
+                    id: invite.id,
+                    junta_general_id: invite.junta_general_id,
+                    cuota_participacion: invite.cuota_participacion,
+                    codigo_expira_at: invite.codigo_expira_at,
+                    nombre_referencia: invite.nombre_referencia,
+                    rif: invite.rif,
+                },
+                after: afterInviteMemberRes.rows[0] || null,
+            });
 
             await pool.query('COMMIT');
 
@@ -735,6 +1063,145 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             });
         } catch (error) {
             const message = error instanceof Error ? error.message : 'Error al cargar resumen.';
+            return res.status(500).json({ status: 'error', message });
+        }
+    });
+
+    app.get('/juntas-generales/avisos', verifyToken, async (req: Request, res: Response) => {
+        try {
+            const auth = asAuthUser(req.user);
+            await ensureJuntaGeneralSchema(pool);
+            const condo = await resolveCondominioSesion(auth);
+            if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            if (!isJuntaGeneralTipo(condo.tipo)) return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
+
+            const mes = String(req.query?.mes || '').trim();
+            const estado = String(req.query?.estado || '').trim().toUpperCase();
+
+            const avisosRes = await pool.query<{
+                aviso_id: number;
+                mes_origen: string;
+                metodo_division: string;
+                tasa_referencia: string | number;
+                total_usd: string | number;
+                total_bs: string | number;
+                created_at: string | Date;
+                juntas_total: string | number;
+                juntas_vinculadas: string | number;
+                pendientes_vinculacion: string | number;
+                pagado_usd: string | number;
+                pagado_bs: string | number;
+                pendiente_usd: string | number;
+                pendiente_bs: string | number;
+                estado_aviso: string;
+            }>(
+                `
+                SELECT
+                    a.id AS aviso_id,
+                    a.mes_origen,
+                    a.metodo_division,
+                    a.tasa_referencia,
+                    a.total_usd,
+                    a.total_bs,
+                    a.created_at,
+                    COUNT(d.id) AS juntas_total,
+                    COUNT(d.id) FILTER (WHERE d.condominio_individual_id IS NOT NULL) AS juntas_vinculadas,
+                    COUNT(d.id) FILTER (WHERE g.id IS NULL) AS pendientes_vinculacion,
+                    COALESCE(SUM(LEAST(COALESCE(g.monto_pagado_usd, 0), COALESCE(d.monto_usd, 0))), 0) AS pagado_usd,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN COALESCE(d.monto_usd, 0) > 0
+                                    THEN LEAST(COALESCE(g.monto_pagado_usd, 0), COALESCE(d.monto_usd, 0)) * (COALESCE(d.monto_bs, 0) / NULLIF(d.monto_usd, 0))
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS pagado_bs,
+                    GREATEST(
+                        COALESCE(a.total_usd, 0) - COALESCE(SUM(LEAST(COALESCE(g.monto_pagado_usd, 0), COALESCE(d.monto_usd, 0))), 0),
+                        0
+                    ) AS pendiente_usd,
+                    GREATEST(
+                        COALESCE(a.total_bs, 0) - COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN COALESCE(d.monto_usd, 0) > 0
+                                        THEN LEAST(COALESCE(g.monto_pagado_usd, 0), COALESCE(d.monto_usd, 0)) * (COALESCE(d.monto_bs, 0) / NULLIF(d.monto_usd, 0))
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        ),
+                        0
+                    ) AS pendiente_bs,
+                    CASE
+                        WHEN COUNT(d.id) FILTER (WHERE g.id IS NULL) > 0 THEN 'PENDIENTE_VINCULACION'
+                        WHEN GREATEST(
+                            COALESCE(a.total_usd, 0) - COALESCE(SUM(LEAST(COALESCE(g.monto_pagado_usd, 0), COALESCE(d.monto_usd, 0))), 0),
+                            0
+                        ) <= 0.005 THEN 'CONCILIADO'
+                        WHEN COALESCE(SUM(LEAST(COALESCE(g.monto_pagado_usd, 0), COALESCE(d.monto_usd, 0))), 0) > 0 THEN 'ABONADO'
+                        ELSE 'PENDIENTE'
+                    END AS estado_aviso
+                FROM junta_general_avisos a
+                LEFT JOIN junta_general_aviso_detalles d ON d.aviso_id = a.id
+                LEFT JOIN gastos g ON g.id = d.gasto_generado_id
+                WHERE a.junta_general_id = $1
+                  AND ($2::text = '' OR a.mes_origen = $2)
+                GROUP BY a.id, a.mes_origen, a.metodo_division, a.tasa_referencia, a.total_usd, a.total_bs, a.created_at
+                HAVING (
+                    $3::text = ''
+                    OR CASE
+                        WHEN COUNT(d.id) FILTER (WHERE g.id IS NULL) > 0 THEN 'PENDIENTE_VINCULACION'
+                        WHEN GREATEST(
+                            COALESCE(a.total_usd, 0) - COALESCE(SUM(LEAST(COALESCE(g.monto_pagado_usd, 0), COALESCE(d.monto_usd, 0))), 0),
+                            0
+                        ) <= 0.005 THEN 'CONCILIADO'
+                        WHEN COALESCE(SUM(LEAST(COALESCE(g.monto_pagado_usd, 0), COALESCE(d.monto_usd, 0))), 0) > 0 THEN 'ABONADO'
+                        ELSE 'PENDIENTE'
+                    END = $3
+                )
+                ORDER BY a.created_at DESC, a.id DESC
+                LIMIT 200
+                `,
+                [condo.id, mes, estado]
+            );
+
+            const avisos = avisosRes.rows.map((r) => ({
+                ...r,
+                tasa_referencia: Number(toNumber(r.tasa_referencia).toFixed(6)),
+                total_usd: Number(toNumber(r.total_usd).toFixed(2)),
+                total_bs: Number(toNumber(r.total_bs).toFixed(2)),
+                pagado_usd: Number(toNumber(r.pagado_usd).toFixed(2)),
+                pagado_bs: Number(toNumber(r.pagado_bs).toFixed(2)),
+                pendiente_usd: Number(toNumber(r.pendiente_usd).toFixed(2)),
+                pendiente_bs: Number(toNumber(r.pendiente_bs).toFixed(2)),
+                juntas_total: Number(toNumber(r.juntas_total)),
+                juntas_vinculadas: Number(toNumber(r.juntas_vinculadas)),
+                pendientes_vinculacion: Number(toNumber(r.pendientes_vinculacion)),
+            }));
+
+            const metricas = {
+                total_avisos: avisos.length,
+                total_usd: Number(avisos.reduce((acc, a) => acc + Number(a.total_usd || 0), 0).toFixed(2)),
+                total_bs: Number(avisos.reduce((acc, a) => acc + Number(a.total_bs || 0), 0).toFixed(2)),
+                pagado_usd: Number(avisos.reduce((acc, a) => acc + Number(a.pagado_usd || 0), 0).toFixed(2)),
+                pagado_bs: Number(avisos.reduce((acc, a) => acc + Number(a.pagado_bs || 0), 0).toFixed(2)),
+                pendiente_usd: Number(avisos.reduce((acc, a) => acc + Number(a.pendiente_usd || 0), 0).toFixed(2)),
+                pendiente_bs: Number(avisos.reduce((acc, a) => acc + Number(a.pendiente_bs || 0), 0).toFixed(2)),
+            };
+
+            return res.json({
+                status: 'success',
+                data: {
+                    filtros: { mes: mes || null, estado: estado || null },
+                    metricas,
+                    avisos,
+                },
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Error al cargar avisos de Junta General.';
             return res.status(500).json({ status: 'error', message });
         }
     });
@@ -861,6 +1328,49 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
         }
     });
 
+    app.get('/juntas-generales/auditoria', verifyToken, async (req: Request, res: Response) => {
+        try {
+            const auth = asAuthUser(req.user);
+            await ensureJuntaGeneralSchema(pool);
+            const condo = await resolveCondominioSesion(auth);
+            if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            if (!isJuntaGeneralTipo(condo.tipo)) {
+                return res.status(403).json({ status: 'error', message: 'Solo disponible para Junta General.' });
+            }
+
+            const limitRaw = parseInt(String(req.query?.limit || ''), 10);
+            const limit = Number.isFinite(limitRaw) ? Math.max(10, Math.min(limitRaw, 200)) : 50;
+
+            const logRes = await pool.query<AuditoriaEventoRow>(
+                `
+                SELECT
+                    a.id,
+                    a.accion,
+                    a.created_at,
+                    a.detalle_jsonb,
+                    a.before_jsonb,
+                    a.after_jsonb,
+                    a.actor_user_id,
+                    a.actor_condominio_id,
+                    COALESCE(NULLIF(BTRIM(u.nombre), ''), NULLIF(BTRIM(u.email), ''), NULLIF(BTRIM(u.cedula), '')) AS actor_nombre,
+                    COALESCE(NULLIF(BTRIM(c.nombre_legal), ''), NULLIF(BTRIM(c.nombre), ''), NULLIF(BTRIM(c.rif), '')) AS actor_condominio_nombre
+                FROM junta_general_auditoria_eventos a
+                LEFT JOIN users u ON u.id = a.actor_user_id
+                LEFT JOIN condominios c ON c.id = a.actor_condominio_id
+                WHERE a.junta_general_id = $1
+                ORDER BY a.created_at DESC, a.id DESC
+                LIMIT $2
+                `,
+                [condo.id, limit]
+            );
+
+            return res.json({ status: 'success', data: logRes.rows });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Error al cargar auditoría.';
+            return res.status(500).json({ status: 'error', message });
+        }
+    });
+
     app.get('/juntas-generales/notificaciones', verifyToken, async (req: Request, res: Response) => {
         try {
             const auth = asAuthUser(req.user);
@@ -906,6 +1416,28 @@ const registerJuntasRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             return res.json({ status: 'success' });
         } catch (error) {
             const message = error instanceof Error ? error.message : 'Error al actualizar notificación.';
+            return res.status(500).json({ status: 'error', message });
+        }
+    });
+
+    app.post('/juntas-generales/notificaciones/leidas/todas', verifyToken, async (req: Request, res: Response) => {
+        try {
+            const auth = asAuthUser(req.user);
+            await ensureJuntaGeneralSchema(pool);
+            const condo = await resolveCondominioSesion(auth);
+            if (!condo) return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+
+            await pool.query(
+                `UPDATE junta_general_notificaciones
+                 SET leida = true
+                 WHERE condominio_id = $1
+                   AND leida = false`,
+                [condo.id]
+            );
+
+            return res.json({ status: 'success' });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Error al actualizar notificaciones.';
             return res.status(500).json({ status: 'error', message });
         }
     });

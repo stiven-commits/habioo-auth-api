@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node -r ts-node/register tests/juntaGeneral.unit.test.js && node -r ts-node/register tests/api.integration.test.js && node -r ts-node/register tests/juntaGeneral.edge.integration.test.js",
+    "qa:junta-general": "node -r ts-node/register scripts/qa/junta-general-smoke.ts",
     "start": "node -r ts-node/register index.ts"
   },
   "keywords": [],

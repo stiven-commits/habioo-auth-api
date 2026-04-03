@@ -1,7 +1,7 @@
-import type { Application, NextFunction, Request, Response } from 'express';
+﻿import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 
-// ─── Interfaces de dependencias ───────────────────────────────────────────────
+// â”€â”€â”€ Interfaces de dependencias â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 interface AuthUser {
     id: number;
@@ -13,7 +13,7 @@ interface AuthDependencies {
     verifyToken: (req: Request, res: Response, next: NextFunction) => void | Promise<void>;
 }
 
-// ─── Interfaces de parámetros y body ──────────────────────────────────────────
+// â”€â”€â”€ Interfaces de parÃ¡metros y body â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 interface EncuestaParams {
     id?: string;
@@ -38,7 +38,7 @@ interface VotarBody {
     respuesta_texto?: string;
 }
 
-// ─── Interfaces de filas de DB ────────────────────────────────────────────────
+// â”€â”€â”€ Interfaces de filas de DB â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 interface EncuestaRow {
     id: number;
@@ -88,6 +88,7 @@ interface CountRow {
 
 interface IdRow {
     id: number;
+    tipo?: string | null;
 }
 
 interface EncuestaEstadoRow {
@@ -100,7 +101,12 @@ interface CondominioMetodoRow {
     metodo_division: string;
 }
 
-// ─── Helper de tipado seguro de req.user ──────────────────────────────────────
+interface CondominioMetaRow {
+    id: number;
+    tipo: string | null;
+}
+
+// â”€â”€â”€ Helper de tipado seguro de req.user â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const asAuthUser = (value: unknown): AuthUser => {
     if (
@@ -113,17 +119,56 @@ const asAuthUser = (value: unknown): AuthUser => {
     return value as AuthUser;
 };
 
-// ─── Registro de rutas ────────────────────────────────────────────────────────
+// â”€â”€â”€ Registro de rutas â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const registerEncuestasRoutes = (
     app: Application,
     { pool, verifyToken }: AuthDependencies,
 ): void => {
+    const getAdminCondominio = async (userId: number): Promise<CondominioMetaRow | null> => {
+        const r = await pool.query<CondominioMetaRow>(
+            'SELECT id, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+            [userId],
+        );
+        return r.rows[0] || null;
+    };
+
+    const getOwnerCondominioByPropiedad = async (userId: number, propiedadId: number): Promise<number | null> => {
+        const r = await pool.query<{ condominio_id: number }>(
+            `
+            SELECT p.condominio_id
+            FROM usuarios_propiedades up
+            INNER JOIN propiedades p ON p.id = up.propiedad_id
+            WHERE up.user_id = $1
+              AND up.propiedad_id = $2
+              AND COALESCE(up.acceso_portal, true) = true
+            LIMIT 1
+            `,
+            [userId, propiedadId],
+        );
+        return r.rows[0]?.condominio_id ?? null;
+    };
+
+    const ownerHasAnyPropiedadInCondominio = async (userId: number, condominioId: number): Promise<boolean> => {
+        const r = await pool.query<CountRow>(
+            `
+            SELECT COUNT(*)::text AS count
+            FROM usuarios_propiedades up
+            INNER JOIN propiedades p ON p.id = up.propiedad_id
+            WHERE up.user_id = $1
+              AND p.condominio_id = $2
+              AND COALESCE(up.acceso_portal, true) = true
+            `,
+            [userId, condominioId],
+        );
+        return parseInt(r.rows[0]?.count || '0', 10) > 0;
+    };
+
 
     /**
      * POST /encuestas
-     * Solo Admin. Crea una encuesta con sus opciones según el tipo:
-     * - SI_NO:    inserta automáticamente 'Sí' y 'No'.
+     * Solo Admin. Crea una encuesta con sus opciones segÃºn el tipo:
+     * - SI_NO:    inserta automÃ¡ticamente 'SÃ­' y 'No'.
      * - MULTIPLE: inserta las opciones recibidas en el body.
      * - ABIERTA:  no inserta opciones.
      */
@@ -141,7 +186,7 @@ const registerEncuestasRoutes = (
                 }
 
                 const cRes = await pool.query<IdRow>(
-                    'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                    'SELECT id, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1',
                     [authUser.id],
                 );
                 if (cRes.rows.length === 0) {
@@ -162,7 +207,7 @@ const registerEncuestasRoutes = (
                 if (tipo === 'SI_NO') {
                     await pool.query(
                         'INSERT INTO encuesta_opciones (encuesta_id, texto) VALUES ($1, $2)',
-                        [encuesta_id, 'Sí'],
+                        [encuesta_id, 'SÃ­'],
                     );
                     await pool.query(
                         'INSERT INTO encuesta_opciones (encuesta_id, texto) VALUES ($1, $2)',
@@ -191,7 +236,7 @@ const registerEncuestasRoutes = (
     /**
      * GET /encuestas/:condominio_id
      * Admin y Propietario. Devuelve todas las encuestas del condominio
-     * con sus opciones, total de votos y si la propiedad activa ya votó.
+     * con sus opciones, total de votos y si la propiedad activa ya votÃ³.
      * Query param: propiedad_id (opcional, requerido para calcular ya_voto).
      */
     app.get(
@@ -204,14 +249,42 @@ const registerEncuestasRoutes = (
             const { condominio_id } = req.params;
             const { propiedad_id } = req.query;
             try {
-                asAuthUser(req.user);
+                const authUser = asAuthUser(req.user);
+                const condominioIdNum = parseInt(String(condominio_id || ''), 10);
+                if (!Number.isFinite(condominioIdNum) || condominioIdNum <= 0) {
+                    res.status(400).json({ status: 'error', message: 'condominio_id invÃ¡lido.' });
+                    return;
+                }
+
+                if (authUser.is_admin) {
+                    const adminCondo = await getAdminCondominio(authUser.id);
+                    if (!adminCondo || adminCondo.id !== condominioIdNum) {
+                        res.status(403).json({ status: 'error', message: 'No autorizado para consultar encuestas de este condominio.' });
+                        return;
+                    }
+                } else {
+                    if (!propiedad_id) {
+                        res.status(400).json({ status: 'error', message: 'propiedad_id es requerido para propietarios.' });
+                        return;
+                    }
+                    const propiedadIdNum = parseInt(String(propiedad_id), 10);
+                    if (!Number.isFinite(propiedadIdNum) || propiedadIdNum <= 0) {
+                        res.status(400).json({ status: 'error', message: 'propiedad_id invÃ¡lido.' });
+                        return;
+                    }
+                    const ownerCondoId = await getOwnerCondominioByPropiedad(authUser.id, propiedadIdNum);
+                    if (!ownerCondoId || ownerCondoId !== condominioIdNum) {
+                        res.status(403).json({ status: 'error', message: 'No autorizado para consultar encuestas de este condominio.' });
+                        return;
+                    }
+                }
 
                 const eRes = await pool.query<EncuestaRow>(
                     `SELECT id, condominio_id, titulo, descripcion, tipo, fecha_fin, created_at
                      FROM encuestas
                      WHERE condominio_id = $1
                      ORDER BY created_at DESC`,
-                    [condominio_id],
+                    [condominioIdNum],
                 );
 
                 const encuestas: EncuestaConMeta[] = [];
@@ -285,9 +358,28 @@ const registerEncuestasRoutes = (
                     return;
                 }
                 const encuesta = eRes.rows[0];
+                const encuestaCondoRes = await pool.query<{ condominio_id: number }>(
+                    'SELECT condominio_id FROM encuestas WHERE id = $1 LIMIT 1',
+                    [id],
+                );
+                const encuestaCondoId = encuestaCondoRes.rows[0]?.condominio_id;
+                if (!encuestaCondoId) {
+                    res.status(404).json({ status: 'error', message: 'Encuesta no encontrada.' });
+                    return;
+                }
+                const propiedadIdNum = Number(propiedad_id);
+                if (!Number.isFinite(propiedadIdNum) || propiedadIdNum <= 0) {
+                    res.status(400).json({ status: 'error', message: 'propiedad_id invÃ¡lido.' });
+                    return;
+                }
+                const ownerCondoId = await getOwnerCondominioByPropiedad(authUser.id, propiedadIdNum);
+                if (!ownerCondoId || ownerCondoId !== encuestaCondoId) {
+                    res.status(403).json({ status: 'error', message: 'No autorizado para votar en esta encuesta.' });
+                    return;
+                }
 
                 if (new Date() > new Date(encuesta.fecha_fin)) {
-                    res.status(400).json({ status: 'error', message: 'La encuesta ya cerró y no acepta más votos.' });
+                    res.status(400).json({ status: 'error', message: 'La encuesta ya cerrÃ³ y no acepta mÃ¡s votos.' });
                     return;
                 }
 
@@ -295,17 +387,17 @@ const registerEncuestasRoutes = (
                     `SELECT COUNT(*) AS count
                      FROM encuesta_votos
                      WHERE encuesta_id = $1 AND propiedad_id = $2`,
-                    [id, propiedad_id],
+                    [id, propiedadIdNum],
                 );
                 if (parseInt(dupRes.rows[0].count, 10) > 0) {
-                    res.status(409).json({ status: 'error', message: 'Esta propiedad ya registró su voto en esta encuesta.' });
+                    res.status(409).json({ status: 'error', message: 'Esta propiedad ya registrÃ³ su voto en esta encuesta.' });
                     return;
                 }
 
                 await pool.query(
                     `INSERT INTO encuesta_votos (encuesta_id, propiedad_id, user_id, opcion_id, respuesta_texto)
                      VALUES ($1, $2, $3, $4, $5)`,
-                    [id, propiedad_id, authUser.id, opcion_id ?? null, respuesta_texto ?? null],
+                    [id, propiedadIdNum, authUser.id, opcion_id ?? null, respuesta_texto ?? null],
                 );
 
                 res.status(201).json({ status: 'success', message: 'Voto registrado exitosamente.' });
@@ -318,12 +410,12 @@ const registerEncuestasRoutes = (
 
     /**
      * GET /encuestas/:id/resultados
-     * Admin y Propietario con lógica diferenciada:
+     * Admin y Propietario con lÃ³gica diferenciada:
      *
-     * Admin → conteo por opción + detalle completo con:
+     * Admin â†’ conteo por opciÃ³n + detalle completo con:
      *   user_nombre, propiedad_identificador, respuesta_texto.
      *
-     * Propietario → solo conteo por opción (para barras de progreso) +
+     * Propietario â†’ solo conteo por opciÃ³n (para barras de progreso) +
      *   array plano de respuesta_texto para encuestas abiertas.
      *   Sin nombres ni identificadores (anonimato total).
      */
@@ -344,8 +436,30 @@ const registerEncuestasRoutes = (
                     return;
                 }
                 const encuesta = eRes.rows[0];
+                const encuestaCondoRes = await pool.query<{ condominio_id: number }>(
+                    'SELECT condominio_id FROM encuestas WHERE id = $1 LIMIT 1',
+                    [id],
+                );
+                const encuestaCondoId = encuestaCondoRes.rows[0]?.condominio_id;
+                if (!encuestaCondoId) {
+                    res.status(404).json({ status: 'error', message: 'Encuesta no encontrada.' });
+                    return;
+                }
+                if (authUser.is_admin) {
+                    const adminCondo = await getAdminCondominio(authUser.id);
+                    if (!adminCondo || adminCondo.id !== encuestaCondoId) {
+                        res.status(403).json({ status: 'error', message: 'No autorizado para ver resultados de esta encuesta.' });
+                        return;
+                    }
+                } else {
+                    const ownerHasAccess = await ownerHasAnyPropiedadInCondominio(authUser.id, encuestaCondoId);
+                    if (!ownerHasAccess) {
+                        res.status(403).json({ status: 'error', message: 'No autorizado para ver resultados de esta encuesta.' });
+                        return;
+                    }
+                }
 
-                // Obtener método de distribución del condominio
+                // Obtener mÃ©todo de distribuciÃ³n del condominio
                 const condoRes = await pool.query<CondominioMetodoRow>(
                     `SELECT metodo_division
                      FROM condominios
@@ -354,7 +468,7 @@ const registerEncuestasRoutes = (
                 );
                 const metodo_division = condoRes.rows[0]?.metodo_division ?? 'Partes Iguales';
 
-                // Conteo por opción: ponderado por alícuota o por unidad según método
+                // Conteo por opciÃ³n: ponderado por alÃ­cuota o por unidad segÃºn mÃ©todo
                 const conteoRes = await (metodo_division === 'Alicuota'
                     ? pool.query<ConteoPorOpcion>(
                         `SELECT ev.opcion_id,
@@ -405,7 +519,7 @@ const registerEncuestasRoutes = (
                         detalle:          detalleRes.rows,
                     });
                 } else {
-                    // Solo conteo + textos abiertos anónimos (sin nombres ni identificadores)
+                    // Solo conteo + textos abiertos anÃ³nimos (sin nombres ni identificadores)
                     const textosRes = await pool.query<{ respuesta_texto: string }>(
                         `SELECT respuesta_texto
                          FROM encuesta_votos
