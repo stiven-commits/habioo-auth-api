@@ -279,8 +279,26 @@ router.get('/mis-propiedades', verifyToken, async (req: Request, res: Response<A
                   WHERE h.propiedad_id = p.id
                     AND (
                       h.tipo IN ('CARGAR_DEUDA', 'DEUDA', 'AGREGAR_FAVOR', 'FAVOR')
-                      OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
-                      OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
+                      OR (
+                        h.tipo = 'SALDO_INICIAL'
+                        AND (
+                          COALESCE(h.nota, '') ILIKE '%(DEUDA)%'
+                          OR (
+                            COALESCE(h.nota, '') NOT ILIKE '%(FAVOR)%'
+                            AND COALESCE(h.monto, 0) >= 0
+                          )
+                        )
+                      )
+                      OR (
+                        h.tipo = 'SALDO_INICIAL'
+                        AND (
+                          COALESCE(h.nota, '') ILIKE '%(FAVOR)%'
+                          OR (
+                            COALESCE(h.nota, '') NOT ILIKE '%(DEUDA)%'
+                            AND COALESCE(h.monto, 0) < 0
+                          )
+                        )
+                      )
                     )
                 )
                 OR EXISTS (
@@ -299,10 +317,28 @@ router.get('/mis-propiedades', verifyToken, async (req: Request, res: Response<A
                 + COALESCE((
                   SELECT SUM(
                     CASE
-                      WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
-                        THEN COALESCE(h.monto, 0)
-                      WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
-                        THEN -COALESCE(h.monto, 0)
+                      WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA')
+                        THEN ABS(COALESCE(h.monto, 0))
+                      WHEN h.tipo = 'SALDO_INICIAL'
+                           AND (
+                             COALESCE(h.nota, '') ILIKE '%(DEUDA)%'
+                             OR (
+                               COALESCE(h.nota, '') NOT ILIKE '%(FAVOR)%'
+                               AND COALESCE(h.monto, 0) >= 0
+                             )
+                           )
+                        THEN ABS(COALESCE(h.monto, 0))
+                      WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR')
+                        THEN -ABS(COALESCE(h.monto, 0))
+                      WHEN h.tipo = 'SALDO_INICIAL'
+                           AND (
+                             COALESCE(h.nota, '') ILIKE '%(FAVOR)%'
+                             OR (
+                               COALESCE(h.nota, '') NOT ILIKE '%(DEUDA)%'
+                               AND COALESCE(h.monto, 0) < 0
+                             )
+                           )
+                        THEN -ABS(COALESCE(h.monto, 0))
                       ELSE 0
                     END
                   )
@@ -516,13 +552,31 @@ router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Req
             )
           ) AS concepto,
           CASE
-            WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(DEUDA)%')
-              THEN COALESCE(h.monto, 0)
+            WHEN h.tipo IN ('CARGAR_DEUDA', 'DEUDA')
+              THEN ABS(COALESCE(h.monto, 0))
+            WHEN h.tipo = 'SALDO_INICIAL'
+              AND (
+                COALESCE(h.nota, '') ILIKE '%(DEUDA)%'
+                OR (
+                  COALESCE(h.nota, '') NOT ILIKE '%(FAVOR)%'
+                  AND COALESCE(h.monto, 0) >= 0
+                )
+              )
+              THEN ABS(COALESCE(h.monto, 0))
             ELSE 0
           END AS cargo,
           CASE
-            WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR') OR (h.tipo = 'SALDO_INICIAL' AND COALESCE(h.nota, '') LIKE '%(FAVOR)%')
-              THEN COALESCE(h.monto, 0)
+            WHEN h.tipo IN ('AGREGAR_FAVOR', 'FAVOR')
+              THEN ABS(COALESCE(h.monto, 0))
+            WHEN h.tipo = 'SALDO_INICIAL'
+              AND (
+                COALESCE(h.nota, '') ILIKE '%(FAVOR)%'
+                OR (
+                  COALESCE(h.nota, '') NOT ILIKE '%(DEUDA)%'
+                  AND COALESCE(h.monto, 0) < 0
+                )
+              )
+              THEN ABS(COALESCE(h.monto, 0))
             ELSE 0
           END AS abono,
           COALESCE(
