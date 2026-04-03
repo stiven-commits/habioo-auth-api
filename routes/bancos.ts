@@ -698,6 +698,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 : "''";
             const pagoBancoDesdeNotaExpr = `NULLIF(BTRIM(COALESCE((regexp_match(${pagoNotaExpr}, '(?i)Banco origen:\\s*([^|]+)'))[1], '')), '')`;
             const pagoCedulaDesdeNotaExpr = `NULLIF(BTRIM(COALESCE((regexp_match(${pagoNotaExpr}, '(?i)Cedula origen:\\s*([^|]+)'))[1], '')), '')`;
+            const ajusteNotaExpr = "COALESCE(mf.nota, '')";
+            const ajusteBancoDesdeNotaExpr = `NULLIF(BTRIM(COALESCE((regexp_match(${ajusteNotaExpr}, '(?i)Banco origen:\\s*([^|\\[]+)'))[1], '')), '')`;
+            const ajusteReferenciaDesdeNotaExpr = `NULLIF(BTRIM(COALESCE((regexp_match(${ajusteNotaExpr}, '(?i)Ref(?:erencia)?(?:\\s+origen)?:\\s*([^|\\[]+)'))[1], '')), '')`;
             const pagoBancoOrigenExpr = hasCol('pagos', 'banco_origen')
                 ? `COALESCE(NULLIF(BTRIM(p.banco_origen), ''), ${pagoBancoDesdeNotaExpr})`
                 : pagoBancoDesdeNotaExpr;
@@ -736,11 +739,12 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                 THEN 'APERTURA'
                             WHEN mf.tipo = 'AJUSTE_INICIAL'
                                  AND (
-                                      COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
-                                      OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
-                                      OR hsi.id IS NOT NULL
-                                  )
+                                       COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                       OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                                       OR hsi.id IS NOT NULL
+                                   )
                                 THEN COALESCE(
+                                    ${ajusteReferenciaDesdeNotaExpr},
                                     CASE
                                         WHEN hsi.id IS NOT NULL THEN ('AJ-' || hsi.id::text)
                                         ELSE ('AJ-MF-' || mf.id::text)
@@ -810,7 +814,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                             ELSE NULL
                         END AS monto_usd,
                         p.monto_origen AS monto_origen_pago,
-                        ${pagoBancoOrigenExpr} AS banco_origen,
+                        COALESCE(${pagoBancoOrigenExpr}, ${ajusteBancoDesdeNotaExpr}) AS banco_origen,
                         ${pagoCedulaOrigenExpr} AS cedula_origen,
                         f.id::int AS fondo_id,
                         NULL::int AS fondo_origen_id,

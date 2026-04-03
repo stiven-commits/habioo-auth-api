@@ -175,6 +175,8 @@ interface AjustarSaldoBody {
     tipo_ajuste: string;
     nota?: string;
     fecha_operacion?: string;
+    referencia_origen?: string;
+    banco_origen?: string;
     monto_bs?: string | number;
     tasa_cambio?: string | number;
     cuenta_bancaria_id?: number | null;
@@ -1563,7 +1565,7 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
     // 7. AJUSTAR SALDO MANUALMENTE
     app.post('/propiedades-admin/:id/ajustar-saldo', verifyToken, async (req: Request<PropiedadEstadoCuentaParams, unknown, AjustarSaldoBody>, res: Response, _next: NextFunction) => {
         const propiedadId = asString(req.params.id);
-        const { monto, tipo_ajuste, nota, fecha_operacion, monto_bs, tasa_cambio, cuenta_bancaria_id, es_gasto_extra, gasto_extra_id, subtipo_favor } = req.body;
+        const { monto, tipo_ajuste, nota, fecha_operacion, referencia_origen, banco_origen, monto_bs, tasa_cambio, cuenta_bancaria_id, es_gasto_extra, gasto_extra_id, subtipo_favor } = req.body;
         const montoNum = parseFloat((monto || '0').toString().replace(',', '.')) || 0;
         if (montoNum <= 0) return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
 
@@ -1584,7 +1586,13 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
 
         try {
             await pool.query('BEGIN');
-            const notaBase = (nota || 'Ajuste manual del administrador').trim();
+            const notaBaseRaw = (nota || 'Ajuste manual del administrador').trim();
+            const referenciaOrigen = normalizeWhitespace(referencia_origen);
+            const bancoOrigen = normalizeWhitespace(banco_origen);
+            const notaExtras: string[] = [];
+            if (referenciaOrigen) notaExtras.push(`Ref origen: ${referenciaOrigen}`);
+            if (bancoOrigen) notaExtras.push(`Banco origen: ${bancoOrigen}`);
+            const notaBase = notaExtras.length > 0 ? `${notaBaseRaw} | ${notaExtras.join(' | ')}` : notaBaseRaw;
             const operador = esCargaDeuda ? '+' : '-';
             await pool.query(`UPDATE propiedades SET saldo_actual = saldo_actual ${operador} $1 WHERE id = $2`, [montoNum, propiedadId]);
 

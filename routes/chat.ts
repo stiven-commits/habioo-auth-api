@@ -1,6 +1,7 @@
 import type { Application, NextFunction, Request, Response } from 'express';
 import type { Pool } from 'pg';
 import type { AuthenticatedUser } from '../types/auth';
+const { createHmac }: { createHmac: typeof import('node:crypto').createHmac } = require('node:crypto');
 
 interface AuthDependencies {
     pool: Pool;
@@ -156,16 +157,38 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
             const abortController = new AbortController();
             const timeoutId = setTimeout(() => abortController.abort(), 25000);
 
+            const webhookToken = String(process.env.HABIOO_AI_WEBHOOK_TOKEN ?? '').trim();
+            if (!webhookToken) {
+                res.status(500).json({ status: 'error', message: 'HABIOO_AI_WEBHOOK_TOKEN no esta configurado.' });
+                return;
+            }
+
+            const webhookSecret = String(process.env.HABIOO_AI_WEBHOOK_SECRET ?? '').trim();
+            const webhookPayload = JSON.stringify({
+                mensaje,
+                userId: user.id,
+                rol: rolDetectado,
+                nombre: nombreObtenido,
+                condominio: nombreCondominio,
+            });
+            const webhookHeaders: Record<string, string> = {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${webhookToken}`,
+            };
+
+            if (webhookSecret) {
+                const timestamp = Date.now().toString();
+                const signature = createHmac('sha256', webhookSecret)
+                    .update(`${timestamp}.${webhookPayload}`)
+                    .digest('hex');
+                webhookHeaders['x-habioo-timestamp'] = timestamp;
+                webhookHeaders['x-habioo-signature'] = signature;
+            }
+
             const n8nRes = await fetch(webhookUrl, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    mensaje,
-                    userId: user.id,
-                    rol: rolDetectado,
-                    nombre: nombreObtenido,
-                    condominio: nombreCondominio,
-                }),
+                headers: webhookHeaders,
+                body: webhookPayload,
                 signal: abortController.signal,
             }).finally(() => {
                 clearTimeout(timeoutId);
