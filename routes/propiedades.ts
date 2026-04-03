@@ -174,6 +174,7 @@ interface AjustarSaldoBody {
     monto?: string | number;
     tipo_ajuste: string;
     nota?: string;
+    fecha_operacion?: string;
     monto_bs?: string | number;
     tasa_cambio?: string | number;
     cuenta_bancaria_id?: number | null;
@@ -1562,9 +1563,15 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
     // 7. AJUSTAR SALDO MANUALMENTE
     app.post('/propiedades-admin/:id/ajustar-saldo', verifyToken, async (req: Request<PropiedadEstadoCuentaParams, unknown, AjustarSaldoBody>, res: Response, _next: NextFunction) => {
         const propiedadId = asString(req.params.id);
-        const { monto, tipo_ajuste, nota, monto_bs, tasa_cambio, cuenta_bancaria_id, es_gasto_extra, gasto_extra_id, subtipo_favor } = req.body;
+        const { monto, tipo_ajuste, nota, fecha_operacion, monto_bs, tasa_cambio, cuenta_bancaria_id, es_gasto_extra, gasto_extra_id, subtipo_favor } = req.body;
         const montoNum = parseFloat((monto || '0').toString().replace(',', '.')) || 0;
         if (montoNum <= 0) return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
+
+        const fechaOperacionRaw = normalizeWhitespace(fecha_operacion);
+        if (fechaOperacionRaw && !/^\d{4}-\d{2}-\d{2}$/.test(fechaOperacionRaw)) {
+            return res.status(400).json({ error: 'fecha_operacion inválida. Use formato YYYY-MM-DD.' });
+        }
+        const fechaOperacionYmd = fechaOperacionRaw || null;
 
         const tipoAjusteRaw = String(tipo_ajuste || '').trim().toUpperCase();
         const esCargaDeuda = tipoAjusteRaw === 'CARGAR_DEUDA' || tipoAjusteRaw === 'DEUDA';
@@ -1591,14 +1598,17 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             for (const tipoHistorial of tiposCompatibles) {
                 try {
                     const historialRes = await pool.query<IHistorialSaldoIdRow>(
-                        'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, monto_bs, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+                        `INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, monto_bs, tasa_cambio, nota, fecha)
+                         VALUES ($1, $2, $3, $4, $5, $6, (COALESCE($7::date, CURRENT_DATE) + time '12:00:00'))
+                         RETURNING id`,
                         [
                             propiedadId,
                             tipoHistorial,
                             montoNum,
                             (typeof monto_bs === 'number' || typeof monto_bs === 'string') ? (parseFloat(String(monto_bs).replace(',', '.')) || null) : null,
                             (typeof tasa_cambio === 'number' || typeof tasa_cambio === 'string') ? (parseFloat(String(tasa_cambio).replace(',', '.')) || null) : null,
-                            notaBase
+                            notaBase,
+                            fechaOperacionYmd
                         ]
                     );
                     historialId = historialRes.rows?.[0]?.id || null;
@@ -1707,8 +1717,9 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                             }
                             await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, d.id]);
                             await pool.query(
-                                'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5)',
-                                [d.id, tipoMovimiento, montoFondo, tasaNum, notaMovimiento]
+                                `INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota, fecha)
+                                 VALUES ($1, $2, $3, $4, $5, (COALESCE($6::date, CURRENT_DATE) + time '12:00:00'))`,
+                                [d.id, tipoMovimiento, montoFondo, tasaNum, notaMovimiento, fechaOperacionYmd]
                             );
                         }
                     }
@@ -1726,8 +1737,9 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                         }
                         await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, f.id]);
                         await pool.query(
-                            'INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5)',
-                            [f.id, tipoMovimiento, montoFondo, tasaNum, notaMovimiento]
+                            `INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota, fecha)
+                             VALUES ($1, $2, $3, $4, $5, (COALESCE($6::date, CURRENT_DATE) + time '12:00:00'))`,
+                            [f.id, tipoMovimiento, montoFondo, tasaNum, notaMovimiento, fechaOperacionYmd]
                         );
                     }
                 }
