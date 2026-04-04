@@ -1574,6 +1574,14 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
             return res.status(400).json({ error: 'fecha_operacion inválida. Use formato YYYY-MM-DD.' });
         }
         const fechaOperacionYmd = fechaOperacionRaw || null;
+        const referenciaOrigen = normalizeWhitespace(referencia_origen);
+        const bancoOrigen = normalizeWhitespace(banco_origen);
+        if (!referenciaOrigen) {
+            return res.status(400).json({ error: 'referencia_origen es requerida.' });
+        }
+        if (!bancoOrigen) {
+            return res.status(400).json({ error: 'banco_origen es requerido.' });
+        }
 
         const tipoAjusteRaw = String(tipo_ajuste || '').trim().toUpperCase();
         const esCargaDeuda = tipoAjusteRaw === 'CARGAR_DEUDA' || tipoAjusteRaw === 'DEUDA';
@@ -1587,8 +1595,6 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
         try {
             await pool.query('BEGIN');
             const notaBaseRaw = (nota || 'Ajuste manual del administrador').trim();
-            const referenciaOrigen = normalizeWhitespace(referencia_origen);
-            const bancoOrigen = normalizeWhitespace(banco_origen);
             const notaExtras: string[] = [];
             if (referenciaOrigen) notaExtras.push(`Ref origen: ${referenciaOrigen}`);
             if (bancoOrigen) notaExtras.push(`Banco origen: ${bancoOrigen}`);
