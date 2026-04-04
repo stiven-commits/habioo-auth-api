@@ -1001,7 +1001,11 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     ORDER BY COALESCE(p.created_at, p.fecha_pago::timestamp) DESC, p.id DESC
                     LIMIT 1
                  ) p_ajuste ON TRUE
-                 WHERE h.propiedad_id = $1`,
+                 WHERE h.propiedad_id = $1
+                   AND NOT (
+                     h.tipo IN ('AGREGAR_FAVOR', 'FAVOR')
+                     AND COALESCE(h.nota, '') ILIKE 'Pago validado%'
+                   )`,
                 [propiedadId]
             );
 

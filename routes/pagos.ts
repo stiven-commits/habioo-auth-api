@@ -21,6 +21,7 @@ interface OptionalPagosColumns {
     cedula_origen?: boolean;
     banco_origen?: boolean;
     telefono_origen?: boolean;
+    metodo?: boolean;
     [key: string]: boolean | undefined;
 }
 
@@ -124,6 +125,10 @@ interface IPagoPendienteAdminRow {
     fecha_pago: string | Date | null;
     estado: string;
     nota: string | null;
+    metodo?: string | null;
+    banco_origen?: string | null;
+    cedula_origen?: string | null;
+    telefono_origen?: string | null;
     es_ajuste_historico?: boolean;
 }
 
@@ -371,16 +376,21 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 SELECT column_name
                 FROM information_schema.columns
                 WHERE table_name = 'pagos'
-                  AND column_name IN ('propiedad_id', 'es_ajuste_historico')
+                  AND column_name IN ('propiedad_id', 'es_ajuste_historico', 'metodo', 'nota', 'cedula_origen', 'banco_origen', 'telefono_origen')
             `);
             const cols = new Set(result.rows.map((r) => r.column_name));
             return {
                 ...optionalCols,
                 propiedad_id: cols.has('propiedad_id'),
                 es_ajuste_historico: cols.has('es_ajuste_historico'),
+                metodo: cols.has('metodo'),
+                nota: cols.has('nota'),
+                cedula_origen: cols.has('cedula_origen'),
+                banco_origen: cols.has('banco_origen'),
+                telefono_origen: cols.has('telefono_origen'),
             };
         } catch (_err) {
-            return { ...optionalCols, propiedad_id: false, es_ajuste_historico: false };
+            return { ...optionalCols, propiedad_id: false, es_ajuste_historico: false, metodo: false };
         }
     };
 
@@ -1117,6 +1127,11 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const ajusteHistoricoExpr = pagosCols.es_ajuste_historico
                 ? 'COALESCE(pa.es_ajuste_historico, false)'
                 : 'false';
+            const metodoExpr = pagosCols.metodo ? 'pa.metodo' : 'NULL::text';
+            const bancoOrigenExpr = pagosCols.banco_origen ? 'pa.banco_origen' : 'NULL::text';
+            const cedulaOrigenExpr = pagosCols.cedula_origen ? 'pa.cedula_origen' : 'NULL::text';
+            const telefonoOrigenExpr = pagosCols.telefono_origen ? 'pa.telefono_origen' : 'NULL::text';
+            const notaExpr = pagosCols.nota ? 'pa.nota' : 'NULL::text';
 
             const r = await pool.query<IPagoPendienteAdminRow>(
                 `
@@ -1132,7 +1147,11 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                     pa.referencia,
                     pa.fecha_pago,
                     pa.estado,
-                    pa.nota,
+                    ${notaExpr} AS nota,
+                    ${metodoExpr} AS metodo,
+                    ${bancoOrigenExpr} AS banco_origen,
+                    ${cedulaOrigenExpr} AS cedula_origen,
+                    ${telefonoOrigenExpr} AS telefono_origen,
                     ${ajusteHistoricoExpr} AS es_ajuste_historico
                   FROM pagos pa
                   INNER JOIN propiedades p ON p.id = pa.propiedad_id

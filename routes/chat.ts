@@ -45,6 +45,73 @@ interface CuentaBancariaRow {
     pago_movil_cedula_rif: string | null;
 }
 
+const CARACAS_TIME_ZONE = 'America/Caracas';
+const ISO_DATE_ONLY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+const toCaracasYmd = (date: Date = new Date()): string => {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: CARACAS_TIME_ZONE,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+    }).formatToParts(date);
+
+    const year = Number(parts.find(part => part.type === 'year')?.value ?? '');
+    const month = Number(parts.find(part => part.type === 'month')?.value ?? '');
+    const day = Number(parts.find(part => part.type === 'day')?.value ?? '');
+
+    if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+        return date.toISOString().slice(0, 10);
+    }
+
+    return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+};
+
+const parseIsoDateOnlyToUtc = (raw: string): Date | null => {
+    if (!ISO_DATE_ONLY_REGEX.test(raw)) return null;
+    const [yy, mm, dd] = raw.split('-');
+    const year = Number(yy);
+    const month = Number(mm);
+    const day = Number(dd);
+    if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+
+    const candidate = new Date(Date.UTC(year, month - 1, day));
+    if (
+        candidate.getUTCFullYear() !== year ||
+        candidate.getUTCMonth() + 1 !== month ||
+        candidate.getUTCDate() !== day
+    ) {
+        return null;
+    }
+
+    return candidate;
+};
+
+const validateFechaPagoWindow = (fechaIsoYmd: string): string | null => {
+    const pagoDateUtc = parseIsoDateOnlyToUtc(fechaIsoYmd);
+    if (!pagoDateUtc) {
+        return 'fecha_pago invalida. Debe estar en formato YYYY-MM-DD.';
+    }
+
+    const todayCaracasUtc = parseIsoDateOnlyToUtc(toCaracasYmd());
+    if (!todayCaracasUtc) {
+        return 'No fue posible validar la fecha de pago.';
+    }
+
+    const minAllowedUtc = new Date(todayCaracasUtc.getTime());
+    minAllowedUtc.setUTCMonth(minAllowedUtc.getUTCMonth() - 3);
+
+    if (pagoDateUtc.getTime() > todayCaracasUtc.getTime()) {
+        return 'fecha_pago invalida. No puede ser posterior a hoy (America/Caracas).';
+    }
+
+    if (pagoDateUtc.getTime() < minAllowedUtc.getTime()) {
+        return 'fecha_pago invalida. No puede ser mayor a 3 meses de antiguedad.';
+    }
+
+    return null;
+};
+
 const verifyChatServiceKey = (req: Request, res: Response): boolean => {
     const serviceKey = String(process.env.CHAT_SERVICE_KEY ?? '').trim();
     if (!serviceKey) {
@@ -318,7 +385,7 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
         const metodoFinal = String(metodo || 'Transferencia').trim() || 'Transferencia';
         const referenciaFinal = String(referencia ?? '').trim() || null;
         const notaFinal = String(nota ?? '').trim() || 'Registrado via chat';
-        const fechaFinal = String(fecha_pago ?? '').trim() || new Date().toISOString().split('T')[0];
+        const fechaFinal = String(fecha_pago ?? '').trim() || toCaracasYmd();
         const bancoOrigenFinal = String(banco_origen ?? '').trim() || null;
         const cedulaOrigenFinal = String(cedula_origen ?? '').trim() || null;
         const telefonoOrigenFinal = String(telefono_origen ?? '').trim() || null;
@@ -331,6 +398,12 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
             return void res.status(400).json({ status: 'error', message: 'cuenta_id invalido.' });
         if (!Number.isFinite(montoNum) || montoNum <= 0)
             return void res.status(400).json({ status: 'error', message: 'monto_origen invalido.' });
+        if (monedaFinal === 'BS' && (!Number.isFinite(tasaNum) || tasaNum <= 0))
+            return void res.status(400).json({ status: 'error', message: 'tasa_cambio invalida para pagos en Bs.' });
+        const fechaError = validateFechaPagoWindow(fechaFinal);
+        if (fechaError) {
+            return void res.status(400).json({ status: 'error', message: fechaError });
+        }
 
         try {
             // Verificar que el usuario tiene acceso a la propiedad
@@ -342,7 +415,7 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
                 return void res.status(403).json({ status: 'error', message: 'No autorizado para registrar pagos en este inmueble.' });
             }
 
-            const tasaFinal = monedaFinal === 'BS' ? (Number.isFinite(tasaNum) && tasaNum > 0 ? tasaNum : 1) : 1;
+            const tasaFinal = monedaFinal === 'BS' ? tasaNum : 1;
             const montoUsd = monedaFinal === 'BS' ? Math.round((montoNum / tasaFinal) * 100) / 100 : Math.round(montoNum * 100) / 100;
 
             await pool.query(

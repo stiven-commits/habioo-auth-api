@@ -131,6 +131,9 @@ interface NotificacionPagoRow {
   referencia: string | null;
   monto_origen: string | number | null;
   monto_usd: string | number | null;
+  tasa_cambio: string | number | null;
+  moneda: string | null;
+  metodo: string | null;
   estado: string;
   fecha_pago: string | Date | null;
   created_at: string | Date | null;
@@ -632,6 +635,10 @@ router.get('/estado-cuenta-inmueble/:propiedad_id', verifyToken, async (req: Req
           LIMIT 1
         ) p_ajuste ON TRUE
         WHERE h.propiedad_id = $1
+          AND NOT (
+            h.tipo IN ('AGREGAR_FAVOR', 'FAVOR')
+            AND COALESCE(h.nota, '') ILIKE 'Pago validado%'
+          )
       `,
       [propiedadId],
     );
@@ -1143,6 +1150,9 @@ router.get('/notificaciones', verifyToken, async (req: Request, res: Response<Ap
           pa.referencia,
           COALESCE(pa.monto_origen, 0) AS monto_origen,
           COALESCE(pa.monto_usd, 0) AS monto_usd,
+          pa.tasa_cambio,
+          pa.moneda,
+          pa.metodo,
           pa.estado,
           pa.fecha_pago,
           pa.created_at,
