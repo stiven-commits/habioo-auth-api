@@ -23,6 +23,9 @@ interface ChatRegistrarPagoBody {
     moneda?: unknown;
     metodo?: unknown;
     nota?: unknown;
+    banco_origen?: unknown;
+    cedula_origen?: unknown;
+    telefono_origen?: unknown;
 }
 
 interface PropiedadRow {
@@ -35,6 +38,11 @@ interface CuentaBancariaRow {
     id: number;
     banco: string | null;
     numero_cuenta: string | null;
+    tipo: string | null;
+    acepta_transferencia: boolean;
+    acepta_pago_movil: boolean;
+    pago_movil_telefono: string | null;
+    pago_movil_cedula_rif: string | null;
 }
 
 const verifyChatServiceKey = (req: Request, res: Response): boolean => {
@@ -245,13 +253,15 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
                     [userId],
                 ),
                 pool.query<CuentaBancariaRow>(
-                    `SELECT DISTINCT cb.id, cb.nombre_banco AS banco, cb.numero_cuenta
+                    `SELECT DISTINCT ON (cb.id) cb.id, cb.nombre_banco AS banco, cb.numero_cuenta,
+                            cb.tipo, cb.acepta_transferencia, cb.acepta_pago_movil,
+                            cb.pago_movil_telefono, cb.pago_movil_cedula_rif
                      FROM cuentas_bancarias cb
                      JOIN condominios c ON c.id = cb.condominio_id
                      JOIN propiedades p ON p.condominio_id = c.id
                      JOIN usuarios_propiedades up ON up.propiedad_id = p.id
-                     WHERE up.user_id = $1
-                     ORDER BY cb.nombre_banco ASC`,
+                     WHERE up.user_id = $1 AND cb.activo = true
+                     ORDER BY cb.id ASC, cb.es_predeterminada DESC NULLS LAST`,
                     [userId],
                 ),
             ]);
@@ -265,6 +275,12 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
                 cuentas: cuentasResult.rows.map(r => ({
                     id: r.id,
                     label: [r.banco, r.numero_cuenta].filter(Boolean).join(' - ') || `Cuenta #${r.id}`,
+                    tipo: r.tipo || null,
+                    moneda: ['Zelle', 'Efectivo USD'].includes(r.tipo || '') ? 'USD' : 'BS',
+                    acepta_transferencia: r.acepta_transferencia ?? false,
+                    acepta_pago_movil: r.acepta_pago_movil ?? false,
+                    pago_movil_telefono: r.pago_movil_telefono || null,
+                    pago_movil_cedula_rif: r.pago_movil_cedula_rif || null,
                 })),
             });
         } catch (error: unknown) {
@@ -288,6 +304,9 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
             moneda,
             metodo,
             nota,
+            banco_origen,
+            cedula_origen,
+            telefono_origen,
         } = req.body;
 
         const userIdNum = parseInt(String(userId ?? ''), 10);
@@ -300,6 +319,9 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
         const referenciaFinal = String(referencia ?? '').trim() || null;
         const notaFinal = String(nota ?? '').trim() || 'Registrado via chat';
         const fechaFinal = String(fecha_pago ?? '').trim() || new Date().toISOString().split('T')[0];
+        const bancoOrigenFinal = String(banco_origen ?? '').trim() || null;
+        const cedulaOrigenFinal = String(cedula_origen ?? '').trim() || null;
+        const telefonoOrigenFinal = String(telefono_origen ?? '').trim() || null;
 
         if (!Number.isFinite(userIdNum) || userIdNum <= 0)
             return void res.status(400).json({ status: 'error', message: 'userId invalido.' });
@@ -325,9 +347,9 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
 
             await pool.query(
                 `INSERT INTO pagos
-                 (propiedad_id, cuenta_bancaria_id, monto_origen, tasa_cambio, monto_usd, moneda, referencia, fecha_pago, metodo, nota, estado)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'PendienteAprobacion')`,
-                [propiedadIdNum, cuentaIdNum, montoNum, tasaFinal, montoUsd, monedaFinal, referenciaFinal, fechaFinal, metodoFinal, notaFinal],
+                 (propiedad_id, cuenta_bancaria_id, monto_origen, tasa_cambio, monto_usd, moneda, referencia, fecha_pago, metodo, nota, estado, banco_origen, cedula_origen, telefono_origen)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'PendienteAprobacion', $11, $12, $13)`,
+                [propiedadIdNum, cuentaIdNum, montoNum, tasaFinal, montoUsd, monedaFinal, referenciaFinal, fechaFinal, metodoFinal, notaFinal, bancoOrigenFinal, cedulaOrigenFinal, telefonoOrigenFinal],
             );
 
             res.json({

@@ -3,6 +3,9 @@ import type { Pool } from 'pg';
 
 interface AuthUser {
     id: number;
+    condominio_id?: number | string;
+    is_support_session?: boolean;
+    support_condominio_id?: number | string;
 }
 
 interface AuthDependencies {
@@ -15,6 +18,11 @@ interface ICondominioIdRow {
 }
 
 interface IProveedorExistRow {
+    id: number;
+    activo: boolean;
+}
+
+interface IProveedorIdActivoRow {
     id: number;
     activo: boolean;
 }
@@ -79,14 +87,18 @@ interface ProveedorParams {
 }
 
 const asAuthUser = (value: unknown): AuthUser => {
-    if (
-        typeof value !== 'object' ||
-        value === null ||
-        typeof (value as { id?: unknown }).id !== 'number'
-    ) {
+    if (typeof value !== 'object' || value === null) {
         throw new TypeError('Invalid authenticated user');
     }
-    return value as AuthUser;
+    const raw = value as AuthUser & { id?: unknown };
+    const parsedId = parseInt(String(raw.id ?? ''), 10);
+    if (!Number.isFinite(parsedId) || parsedId <= 0) {
+        throw new TypeError('Invalid authenticated user');
+    }
+    return {
+        ...raw,
+        id: parsedId,
+    };
 };
 
 const asString = (value: unknown): string => {
@@ -100,6 +112,12 @@ const asError = (value: unknown): Error => {
     return value instanceof Error ? value : new Error(String(value));
 };
 
+const toPositiveInt = (value: unknown): number | null => {
+    const n = parseInt(String(value ?? ''), 10);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n;
+};
+
 const asPgError = (value: unknown): PGError => {
     if (typeof value === 'object' && value !== null && typeof (value as { message?: unknown }).message === 'string') {
         return value as PGError;
@@ -109,6 +127,51 @@ const asPgError = (value: unknown): PGError => {
 
 const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: AuthDependencies): void => {
     const isValidEmail = (value: string): boolean => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+    const SERVICIOS_BASICOS_IDENTIFICADOR = 'SB0000000001';
+    const SERVICIOS_BASICOS_NOMBRE = 'Servicios Basicos (Agua, Electricidad y Gas)';
+
+    const resolveCondominioId = async (user: AuthUser): Promise<number | null> => {
+        const supportCondoId = user.is_support_session ? toPositiveInt(user.support_condominio_id) : null;
+        if (supportCondoId) return supportCondoId;
+
+        const tokenCondoId = toPositiveInt(user.condominio_id);
+        if (tokenCondoId) {
+            const byId = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE id = $1 LIMIT 1', [tokenCondoId]);
+            if (byId.rows[0]) return byId.rows[0].id;
+        }
+
+        const byAdmin = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
+        return byAdmin.rows[0]?.id ?? null;
+    };
+
+    const ensureServiciosBasicosProveedor = async (condoId: number): Promise<void> => {
+        const exist = await pool.query<IProveedorIdActivoRow>(
+            'SELECT id, activo FROM proveedores WHERE condominio_id = $1 AND identificador = $2 LIMIT 1',
+            [condoId, SERVICIOS_BASICOS_IDENTIFICADOR]
+        );
+
+        if (exist.rows.length === 0) {
+            await pool.query(
+                `INSERT INTO proveedores
+                 (condominio_id, identificador, nombre, email, telefono1, telefono2, direccion, estado_venezuela, rubro, activo)
+                 VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4, $5, true)`,
+                [condoId, SERVICIOS_BASICOS_IDENTIFICADOR, SERVICIOS_BASICOS_NOMBRE, 'N/A', 'Servicios Basicos']
+            );
+            return;
+        }
+
+        if (!exist.rows[0].activo) {
+            await pool.query(
+                `UPDATE proveedores
+                    SET activo = true,
+                        nombre = COALESCE(NULLIF(nombre, ''), $2),
+                        rubro = COALESCE(NULLIF(rubro, ''), $3),
+                        estado_venezuela = COALESCE(NULLIF(estado_venezuela, ''), $4)
+                  WHERE id = $1`,
+                [exist.rows[0].id, SERVICIOS_BASICOS_NOMBRE, 'Servicios Basicos', 'N/A']
+            );
+        }
+    };
 
     // 1. CREAR O REACTIVAR PROVEEDOR INDIVIDUAL
     app.post('/proveedores', verifyToken, async (req: Request<{}, unknown, ProveedorBaseBody>, res: Response, _next: NextFunction) => {
@@ -118,8 +181,8 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
         const emailDb = emailFmt || null;
         if (emailFmt && !isValidEmail(emailFmt)) return res.status(400).json({ error: 'Correo electrónico inválido.' });
         try {
-            const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            const condoId = c.rows[0].id;
+            const condoId = await resolveCondominioId(user);
+            if (!condoId) return res.status(403).json({ error: 'No se pudo determinar el condominio de la sesión.' });
 
             const exist = await pool.query<IProveedorExistRow>('SELECT id, activo FROM proveedores WHERE identificador = $1 AND condominio_id = $2', [identificador, condoId]);
 
@@ -156,8 +219,11 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
 
         try {
             await pool.query('BEGIN');
-            const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            const condoId = c.rows[0].id;
+            const condoId = await resolveCondominioId(user);
+            if (!condoId) {
+                await pool.query('ROLLBACK');
+                return res.status(403).json({ error: 'No se pudo determinar el condominio de la sesión.' });
+            }
 
             for (const item of proveedores) {
                 const rifFmt = (item.identificador || '').toUpperCase().replace(/[^VEJPG0-9]/g, '');
@@ -231,8 +297,10 @@ const registerProveedoresRoutes = (app: Application, { pool, verifyToken }: Auth
     app.get('/proveedores', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const c = await pool.query<ICondominioIdRow>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            const r = await pool.query<IProveedorRow>('SELECT * FROM proveedores WHERE condominio_id = $1 AND activo = true ORDER BY nombre ASC', [c.rows[0].id]);
+            const condoId = await resolveCondominioId(user);
+            if (!condoId) return res.status(403).json({ error: 'No se pudo determinar el condominio de la sesión.' });
+            await ensureServiciosBasicosProveedor(condoId);
+            const r = await pool.query<IProveedorRow>('SELECT * FROM proveedores WHERE condominio_id = $1 AND activo = true ORDER BY nombre ASC', [condoId]);
             res.json({ status: 'success', proveedores: r.rows });
         } catch (err: unknown) {
             const error = asError(err);

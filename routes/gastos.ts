@@ -8,8 +8,10 @@ const sharp: typeof import('sharp') = require('sharp');
 
 interface AuthUser {
     id: number;
-    cedula: string;
-    condominio_id?: number;
+    cedula?: string;
+    condominio_id?: number | string;
+    is_support_session?: boolean;
+    support_condominio_id?: number | string;
 }
 
 interface AuthDependencies {
@@ -213,21 +215,45 @@ interface UploadedFiles {
 }
 
 const asAuthUser = (value: unknown): AuthUser => {
-    if (
-        typeof value !== 'object' ||
-        value === null ||
-        typeof (value as { id?: unknown }).id !== 'number' ||
-        typeof (value as { cedula?: unknown }).cedula !== 'string'
-    ) {
+    if (typeof value !== 'object' || value === null) {
         throw new TypeError('Invalid authenticated user');
     }
-    return value as AuthUser;
+    const raw = value as AuthUser & { id?: unknown };
+    const parsedId = parseInt(String(raw.id ?? ''), 10);
+    if (!Number.isFinite(parsedId) || parsedId <= 0) {
+        throw new TypeError('Invalid authenticated user');
+    }
+    return {
+        ...raw,
+        id: parsedId,
+    };
 };
 
 const resolveCondominioBySession = async (pool: Pool, user: AuthUser): Promise<ICondominioConfigRow | null> => {
-    const tokenCondoId = typeof user.condominio_id === 'number' && Number.isFinite(user.condominio_id) && user.condominio_id > 0
-        ? user.condominio_id
+    const supportCondoId = user.is_support_session
+        ? (() => {
+            const n = parseInt(String(user.support_condominio_id ?? ''), 10);
+            return Number.isFinite(n) && n > 0 ? n : null;
+        })()
         : null;
+    if (supportCondoId) {
+        const bySupportId = await pool.query<ICondominioConfigRow>(
+            `SELECT id, mes_actual, metodo_division, metodo_division_manual, tipo,
+                    nombre, nombre_legal, rif, estado_venezuela,
+                    admin_nombre, admin_rif, admin_correo, logo_url,
+                    aviso_msg_1, aviso_msg_2, aviso_msg_3, aviso_msg_4
+             FROM condominios
+             WHERE id = $1
+             LIMIT 1`,
+            [supportCondoId]
+        );
+        if (bySupportId.rows[0]) return bySupportId.rows[0];
+    }
+
+    const tokenCondoId = (() => {
+        const n = parseInt(String(user.condominio_id ?? ''), 10);
+        return Number.isFinite(n) && n > 0 ? n : null;
+    })();
 
     if (tokenCondoId) {
         const byId = await pool.query<ICondominioConfigRow>(
@@ -482,13 +508,13 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const t_c = parseLocaleNumber(tasa_cambio);
             const fechaGastoSafe = toIsoDateOrNull(fecha_gasto);
 
-            const condoRes = await pool.query<ICondominioMesRow>('SELECT id, mes_actual, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            if (condoRes.rows.length === 0) {
-                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para el administrador.' });
+            const condo = await resolveCondominioBySession(pool, user);
+            if (!condo) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para la sesión activa.' });
             }
-            const condominio_id = condoRes.rows[0].id;
-            const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0].mes_actual);
-            const esJuntaGeneral = isJuntaGeneralTipo(condoRes.rows[0].tipo);
+            const condominio_id = condo.id;
+            const mes_actual = asYyyyMmOrPrevious(condo.mes_actual);
+            const esJuntaGeneral = isJuntaGeneralTipo(condo.tipo);
 
             const monto_usd = (m_bs / t_c).toFixed(2);
             const monto_cuota_usd = (parseFloat(monto_usd) / parseInt(String(total_cuotas), 10)).toFixed(2);
@@ -546,13 +572,13 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
         let inTransaction = false;
         try {
-            const condoRes = await pool.query<ICondominioMesRow>('SELECT id, mes_actual, tipo FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            if (condoRes.rows.length === 0) {
-                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para el administrador.' });
+            const condo = await resolveCondominioBySession(pool, user);
+            if (!condo) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para la sesión activa.' });
             }
-            const condominio_id = condoRes.rows[0].id;
-            const mes_actual = asYyyyMmOrPrevious(condoRes.rows[0].mes_actual);
-            const esJuntaGeneral = isJuntaGeneralTipo(condoRes.rows[0].tipo);
+            const condominio_id = condo.id;
+            const mes_actual = asYyyyMmOrPrevious(condo.mes_actual);
+            const esJuntaGeneral = isJuntaGeneralTipo(condo.tipo);
 
             const ownGastoRes = await pool.query<IGastoImagenesRow>(
                 'SELECT id, condominio_id, factura_img, imagenes FROM gastos WHERE id = $1 LIMIT 1',
@@ -709,6 +735,10 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
     app.get('/gastos', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
         try {
+            const condo = await resolveCondominioBySession(pool, user);
+            if (!condo) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para la sesión activa.' });
+            }
             const result = await pool.query<IGastoListRow>(
                 `
             SELECT g.id as gasto_id, gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio,
@@ -726,9 +756,9 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             JOIN condominios c ON g.condominio_id = c.id
             LEFT JOIN zonas z ON g.zona_id = z.id
             LEFT JOIN propiedades prop ON g.propiedad_id = prop.id
-            WHERE c.admin_user_id = $1 ORDER BY g.id DESC, gc.numero_cuota ASC
+            WHERE g.condominio_id = $1 ORDER BY g.id DESC, gc.numero_cuota ASC
         `,
-                [user.id]
+                [condo.id]
             );
             res.json({ status: 'success', gastos: result.rows });
         } catch (err: unknown) {
@@ -1644,10 +1674,9 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
     app.get('/gastos-extras-procesados', verifyToken, async (req: Request, res: Response, _next: NextFunction) => {
         try {
             const user = asAuthUser(req.user);
-            const condoRes = await pool.query<{id: number}>('SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1', [user.id]);
-            if (condoRes.rows.length === 0) return res.status(404).json({status:'error'});
-            
-            const condoId = condoRes.rows[0].id;
+            const condo = await resolveCondominioBySession(pool, user);
+            if (!condo) return res.status(404).json({ status: 'error' });
+            const condoId = condo.id;
 
             const result = await pool.query(
                 `
