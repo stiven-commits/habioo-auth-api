@@ -2404,7 +2404,10 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                         throw new Error(`Fondo ${origen.fondoId} no encontrado.`);
                     }
 
-                    const tipoMovimientoEgreso = await resolveMovimientoFondoTipo(['EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO'], 'EGRESO');
+                    const tipoMovimientoEgreso = await resolveMovimientoFondoTipo(
+                        ['EGRESO_GASTO', 'EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO'],
+                        'EGRESO_GASTO',
+                    );
 
                     await pool.query(
                         `
