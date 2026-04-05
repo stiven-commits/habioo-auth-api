@@ -47,6 +47,7 @@ interface CuentaBancariaRow {
 
 const CARACAS_TIME_ZONE = 'America/Caracas';
 const ISO_DATE_ONLY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const USD_ACCOUNT_TYPES = new Set(['Zelle', 'Efectivo USD']);
 
 const toCaracasYmd = (date: Date = new Date()): string => {
     const parts = new Intl.DateTimeFormat('en-CA', {
@@ -85,6 +86,37 @@ const parseIsoDateOnlyToUtc = (raw: string): Date | null => {
     }
 
     return candidate;
+};
+
+const parseLocaleDecimal = (value: unknown): number => {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : Number.NaN;
+
+    const raw = String(value ?? '').trim();
+    if (!raw) return Number.NaN;
+
+    const cleaned = raw.replace(/\s+/g, '').replace(/[^\d,.-]/g, '');
+    const lastComma = cleaned.lastIndexOf(',');
+    const lastDot = cleaned.lastIndexOf('.');
+    const decimalIndex = Math.max(lastComma, lastDot);
+
+    if (decimalIndex >= 0) {
+        const intPart = cleaned.slice(0, decimalIndex).replace(/[.,]/g, '');
+        const decimalPart = cleaned.slice(decimalIndex + 1).replace(/[.,]/g, '');
+        const sign = cleaned.startsWith('-') ? '-' : '';
+        const merged = `${sign}${intPart || '0'}${decimalPart ? `.${decimalPart}` : ''}`;
+        const parsed = Number.parseFloat(merged);
+        return Number.isFinite(parsed) ? parsed : Number.NaN;
+    }
+
+    const parsed = Number.parseFloat(cleaned.replace(/[.,]/g, ''));
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+};
+
+const normalizeCurrency = (value: unknown): 'USD' | 'BS' => {
+    const raw = String(value ?? '').trim().toUpperCase();
+    if (!raw) return 'BS';
+    if (raw === 'USD' || raw === '$' || raw === 'DOLAR' || raw === 'DOLARES') return 'USD';
+    return 'BS';
 };
 
 const validateFechaPagoWindow = (fechaIsoYmd: string): string | null => {
@@ -379,9 +411,9 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
         const userIdNum = parseInt(String(userId ?? ''), 10);
         const propiedadIdNum = parseInt(String(propiedad_id ?? ''), 10);
         const cuentaIdNum = parseInt(String(cuenta_id ?? ''), 10);
-        const montoNum = parseFloat(String(monto_origen ?? '').replace(',', '.'));
-        const tasaNum = parseFloat(String(tasa_cambio ?? '1').replace(',', '.'));
-        const monedaFinal = String(moneda || 'BS').toUpperCase() === 'USD' ? 'USD' : 'BS';
+        const montoNum = parseLocaleDecimal(monto_origen);
+        const tasaNum = parseLocaleDecimal(tasa_cambio);
+        const monedaSolicitada = normalizeCurrency(moneda);
         const metodoFinal = String(metodo || 'Transferencia').trim() || 'Transferencia';
         const referenciaFinal = String(referencia ?? '').trim() || null;
         const notaFinal = String(nota ?? '').trim() || 'Registrado via chat';
@@ -398,8 +430,6 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
             return void res.status(400).json({ status: 'error', message: 'cuenta_id invalido.' });
         if (!Number.isFinite(montoNum) || montoNum <= 0)
             return void res.status(400).json({ status: 'error', message: 'monto_origen invalido.' });
-        if (monedaFinal === 'BS' && (!Number.isFinite(tasaNum) || tasaNum <= 0))
-            return void res.status(400).json({ status: 'error', message: 'tasa_cambio invalida para pagos en Bs.' });
         const fechaError = validateFechaPagoWindow(fechaFinal);
         if (fechaError) {
             return void res.status(400).json({ status: 'error', message: fechaError });
@@ -415,6 +445,42 @@ const registerChatRoutes = (app: Application, { pool, verifyToken }: AuthDepende
                 return void res.status(403).json({ status: 'error', message: 'No autorizado para registrar pagos en este inmueble.' });
             }
 
+            const cuentaResult = await pool.query<{ id: number; tipo: string | null }>(
+                `
+                SELECT cb.id, cb.tipo
+                FROM cuentas_bancarias cb
+                JOIN propiedades p ON p.condominio_id = cb.condominio_id
+                WHERE cb.id = $1
+                  AND p.id = $2
+                  AND COALESCE(cb.activo, true) = true
+                LIMIT 1
+                `,
+                [cuentaIdNum, propiedadIdNum],
+            );
+
+            if ((cuentaResult.rowCount ?? 0) === 0) {
+                return void res.status(400).json({
+                    status: 'error',
+                    message: 'La cuenta bancaria seleccionada no pertenece al condominio del inmueble.',
+                });
+            }
+
+            const tipoCuenta = String(cuentaResult.rows[0]?.tipo || '').trim();
+            const monedaCuenta: 'USD' | 'BS' = USD_ACCOUNT_TYPES.has(tipoCuenta) ? 'USD' : 'BS';
+            if (monedaSolicitada !== monedaCuenta) {
+                return void res.status(400).json({
+                    status: 'error',
+                    message: `Moneda invalida para la cuenta seleccionada. La cuenta trabaja en ${monedaCuenta}.`,
+                });
+            }
+            if (monedaCuenta === 'BS' && (!Number.isFinite(tasaNum) || tasaNum <= 0)) {
+                return void res.status(400).json({
+                    status: 'error',
+                    message: 'tasa_cambio invalida para pagos en Bs. Debe enviarse la tasa BCV vigente.',
+                });
+            }
+
+            const monedaFinal: 'USD' | 'BS' = monedaCuenta;
             const tasaFinal = monedaFinal === 'BS' ? tasaNum : 1;
             const montoUsd = monedaFinal === 'BS' ? Math.round((montoNum / tasaFinal) * 100) / 100 : Math.round(montoNum * 100) / 100;
 

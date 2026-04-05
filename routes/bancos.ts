@@ -1654,83 +1654,46 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             if (saldoOrigen < montoOrigenSafe) {
                 throw new Error('El fondo de origen no tiene saldo suficiente.');
             }
-            if (!hasCuentaDestino && !hasFondoDestino) {
-                throw new Error('Debe seleccionar un fondo destino o una cuenta destino.');
-            }
-            if (hasCuentaDestino && hasFondoDestino) {
-                throw new Error('Seleccione solo un tipo de destino: fondo o cuenta.');
+            if (!hasFondoDestino) {
+                throw new Error('Debe seleccionar un fondo destino.');
             }
 
             await client.query('UPDATE fondos SET saldo_actual = saldo_actual - $1 WHERE id = $2', [montoOrigenSafe, fondoOrigenIdSafe]);
 
+            const fondoDestinoIdSafe = asPositiveInt(fondo_destino_id, 'fondo_destino_id');
+            const destinoRes = await client.query<IFondoTransferRow>(
+                `SELECT id, cuenta_bancaria_id, condominio_id, moneda, porcentaje_asignacion, es_operativo
+                 FROM fondos
+                 WHERE id = $1
+                   AND condominio_id = $2
+                   AND activo = true
+                 LIMIT 1`,
+                [fondoDestinoIdSafe, condoId]
+            );
+            if (destinoRes.rows.length === 0) {
+                throw new Error('Fondo destino no encontrado o no pertenece al condominio.');
+            }
+            const fondoDestino = destinoRes.rows[0];
+            if (fondoDestino.id === fondoOrigenIdSafe) {
+                throw new Error('El fondo destino debe ser distinto al fondo de origen.');
+            }
+            if (String(fondoDestino.moneda || '').toUpperCase() !== String(fondoOrigen.moneda || '').toUpperCase()) {
+                throw new Error('El fondo destino debe tener la misma moneda que el fondo de origen.');
+            }
             if (hasCuentaDestino) {
                 const cuentaDestinoIdSafe = asPositiveInt(cuenta_destino_id, 'cuenta_destino_id');
-                const destinoFundsRes = await client.query<IFondoTransferRow>(
-                    `SELECT id, cuenta_bancaria_id, condominio_id, moneda, porcentaje_asignacion, es_operativo
-                     FROM fondos
-                     WHERE cuenta_bancaria_id = $1
-                       AND condominio_id = $2
-                       AND activo = true
-                       AND moneda = $3
-                     ORDER BY es_operativo DESC, id ASC`,
-                    [cuentaDestinoIdSafe, condoId, fondoOrigen.moneda]
-                );
-                const destinoFunds = destinoFundsRes.rows.filter((f) => f.id !== fondoOrigenIdSafe);
-                if (destinoFunds.length === 0) {
-                    throw new Error(`La cuenta destino no tiene fondos activos en moneda ${fondoOrigen.moneda}.`);
+                if (fondoDestino.cuenta_bancaria_id !== cuentaDestinoIdSafe) {
+                    throw new Error('El fondo destino no pertenece a la cuenta destino seleccionada.');
                 }
-                for (const f of destinoFunds) {
-                    await validarFechaVsAperturaFondo(f.id, fechaSafe);
-                }
-
-                const noOperativos = destinoFunds.filter((f) => !f.es_operativo);
-                const fondoPrincipal = destinoFunds.find((f) => !!f.es_operativo) || destinoFunds[0];
-
-                const distribuciones = noOperativos.map((f) => {
-                    const pct = parseFloat(String(f.porcentaje_asignacion || 0)) || 0;
-                    const amount = parseFloat(((montoDestinoSafe * pct) / 100).toFixed(2));
-                    return { fondoId: f.id, monto: amount };
-                });
-                const usado = parseFloat(distribuciones.reduce((a, d) => a + d.monto, 0).toFixed(2));
-                const resto = parseFloat((montoDestinoSafe - usado).toFixed(2));
-                if (resto !== 0) {
-                    const idx = distribuciones.findIndex((d) => d.fondoId === fondoPrincipal.id);
-                    if (idx >= 0) {
-                        distribuciones[idx].monto = parseFloat((distribuciones[idx].monto + resto).toFixed(2));
-                    } else {
-                        distribuciones.push({ fondoId: fondoPrincipal.id, monto: resto });
-                    }
-                }
-
-                for (const dist of distribuciones) {
-                    if (dist.monto <= 0) continue;
-                    await client.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [dist.monto, dist.fondoId]);
-                    await client.query(
-                        `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-                        [
-                            condoId,
-                            fondoOrigenIdSafe,
-                            dist.fondoId,
-                            montoOrigenSafe,
-                            tasaCambioSafe,
-                            dist.monto,
-                            referenciaSafe,
-                            fechaSafe,
-                            `${notaSafe || ''}${notaSafe ? ' | ' : ''}Distribución automática por cuenta destino`,
-                        ]
-                    );
-                }
-            } else {
-                const fondoDestinoIdSafe = asPositiveInt(fondo_destino_id, 'fondo_destino_id');
-                await validarFechaVsAperturaFondo(fondoDestinoIdSafe, fechaSafe);
-                await client.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [montoDestinoSafe, fondoDestinoIdSafe]);
-                await client.query(
-                    `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-                    [condoId, fondoOrigenIdSafe, fondoDestinoIdSafe, montoOrigenSafe, tasaCambioSafe, montoDestinoSafe, referenciaSafe, fechaSafe, notaSafe]
-                );
             }
+
+            await validarFechaVsAperturaFondo(fondoDestinoIdSafe, fechaSafe);
+            await client.query('UPDATE fondos SET saldo_actual = saldo_actual + $1 WHERE id = $2', [montoDestinoSafe, fondoDestinoIdSafe]);
+            await client.query(
+                `INSERT INTO transferencias (condominio_id, fondo_origen_id, fondo_destino_id, monto_origen, tasa_cambio, monto_destino, referencia, fecha, nota)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                [condoId, fondoOrigenIdSafe, fondoDestinoIdSafe, montoOrigenSafe, tasaCambioSafe, montoDestinoSafe, referenciaSafe, fechaSafe, notaSafe]
+            );
 
             await client.query('COMMIT');
             res.json({ status: 'success', message: 'Transferencia procesada exitosamente.' });

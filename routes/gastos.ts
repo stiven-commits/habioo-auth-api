@@ -1488,22 +1488,28 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
                 for (const c of cuotasRes.rows) {
                     let cuotaPropiedadUsd = 0;
+                    const tipoCuota = String(c.tipo || '').trim().toLowerCase();
+                    const cuotaMontoUsd = parseFloat(String(c.monto_cuota_usd || 0));
+                    const cuotaPropiedadId = parseInt(String(c.propiedad_id || ''), 10);
 
-                    if (c.tipo === 'Comun' || c.tipo === 'Extra') {
-                        if (metodo_division === 'Partes Iguales') cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd)) / propRes.rows.length;
-                        else cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd)) * (parseFloat(String(p.alicuota)) / 100);
-                    } else if ((c.tipo === 'No Comun' || c.tipo === 'Zona') && c.zona_id !== null && zonaIds.includes(c.zona_id)) {
+                    // Regla clave: gastos Individuales se cargan al 100% al inmueble objetivo.
+                    if (tipoCuota === 'individual') {
+                        if (Number.isFinite(cuotaPropiedadId) && cuotaPropiedadId === p.id) {
+                            cuotaPropiedadUsd = cuotaMontoUsd;
+                        }
+                    } else if (tipoCuota === 'comun' || tipoCuota === 'extra') {
+                        if (metodo_division === 'Partes Iguales') cuotaPropiedadUsd = cuotaMontoUsd / propRes.rows.length;
+                        else cuotaPropiedadUsd = cuotaMontoUsd * (parseFloat(String(p.alicuota)) / 100);
+                    } else if ((tipoCuota === 'no comun' || tipoCuota === 'zona') && c.zona_id !== null && zonaIds.includes(c.zona_id)) {
                         const propsZona = await pool.query<ICountRow>('SELECT COUNT(*) FROM propiedades_zonas WHERE zona_id = $1', [c.zona_id]);
-                        if (metodo_division === 'Partes Iguales') cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd)) / parseInt(propsZona.rows[0].count, 10);
+                        if (metodo_division === 'Partes Iguales') cuotaPropiedadUsd = cuotaMontoUsd / parseInt(propsZona.rows[0].count, 10);
                         else {
                             const sumAl = await pool.query<ISumTotalRow>(
                                 'SELECT SUM(p.alicuota) as total FROM propiedades p JOIN propiedades_zonas pz ON p.id = pz.propiedad_id WHERE pz.zona_id = $1',
                                 [c.zona_id]
                             );
-                            cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd)) * (parseFloat(String(p.alicuota)) / parseFloat(String(sumAl.rows[0].total)));
+                            cuotaPropiedadUsd = cuotaMontoUsd * (parseFloat(String(p.alicuota)) / parseFloat(String(sumAl.rows[0].total)));
                         }
-                    } else if (c.tipo === 'Individual' && c.propiedad_id === p.id) {
-                        cuotaPropiedadUsd = parseFloat(String(c.monto_cuota_usd));
                     }
 
                     if (cuotaPropiedadUsd > 0) {
