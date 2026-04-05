@@ -247,6 +247,8 @@ interface GastoMontoRow {
 interface IPagoProveedorRollbackRow {
     id: number;
     gasto_id: number;
+    fondo_id: number | null;
+    fondo_moneda: string | null;
     monto_bs: number | string | null;
     tasa_cambio: number | string | null;
     monto_usd: number | string;
@@ -1671,6 +1673,13 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 SELECT
                     pp.id,
                     pp.gasto_id,
+                    pp.fondo_id,
+                    (
+                        SELECT f.moneda
+                        FROM fondos f
+                        WHERE f.id = pp.fondo_id
+                        LIMIT 1
+                    ) AS fondo_moneda,
                     pp.monto_bs,
                     pp.tasa_cambio,
                     pp.monto_usd,
@@ -1744,7 +1753,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 LEFT JOIN fondos f ON f.id = gpf.fondo_id
                 WHERE gpf.pago_proveedor_id = $1
                 ORDER BY gpf.id ASC
-                FOR UPDATE
+                FOR UPDATE OF gpf
                 `
                 : `
                 SELECT
@@ -1761,17 +1770,10 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                   AND gpf.fecha_pago::date = pp.fecha_pago::date
                   ${refFilter}
                 ORDER BY gpf.id ASC
-                FOR UPDATE
+                FOR UPDATE OF gpf
                 `;
 
             const gpfRes = await pool.query<IGastoPagoFondoRollbackRow>(gpfQuery, [pagoProveedorId]);
-            if (gpfRes.rows.length === 0) {
-                await pool.query('ROLLBACK');
-                return res.status(400).json({
-                    status: 'error',
-                    message: 'No se encontraron detalles del pago en gastos_pagos_fondos para revertirlo con seguridad.',
-                });
-            }
 
             const movimientosRes = await pool.query<IMovimientoFondoPagoRow>(
                 `
@@ -1817,6 +1819,37 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             }
             for (const [fondoId, monto] of restoreByMovimiento.entries()) {
                 finalRestoreByFondo.set(fondoId, monto);
+            }
+
+            // Fallback legacy: pagos_proveedores sin gastos_pagos_fondos ni movimientos_fondos.
+            // En ese caso intentamos restaurar el fondo directo del pago si tiene trazabilidad mínima.
+            if (finalRestoreByFondo.size === 0 && gpfRes.rows.length === 0) {
+                const fondoIdLegacy = Number.parseInt(String(pago.fondo_id ?? ''), 10);
+                const montoUsdLegacy = round2(parseLocaleNumber(pago.monto_usd || 0));
+                const montoBsLegacy = round2(parseLocaleNumber(pago.monto_bs || 0));
+                const fondoMonedaLegacy = String(pago.fondo_moneda || '').toUpperCase();
+
+                if (Number.isFinite(fondoIdLegacy) && fondoIdLegacy > 0) {
+                    let restoreLegacy = 0;
+                    if (fondoMonedaLegacy === 'USD') {
+                        restoreLegacy = montoUsdLegacy;
+                    } else {
+                        restoreLegacy = montoBsLegacy > 0
+                            ? montoBsLegacy
+                            : (montoUsdLegacy > 0 && tasaFallback > 0 ? round2(montoUsdLegacy * tasaFallback) : 0);
+                    }
+                    if (restoreLegacy > 0) {
+                        finalRestoreByFondo.set(fondoIdLegacy, restoreLegacy);
+                    }
+                }
+            }
+
+            if (finalRestoreByFondo.size === 0) {
+                await pool.query('ROLLBACK');
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'No se encontraron trazas suficientes para revertir este pago a proveedor con seguridad.',
+                });
             }
 
             for (const [fondoId, monto] of finalRestoreByFondo.entries()) {
