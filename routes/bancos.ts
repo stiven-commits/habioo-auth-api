@@ -246,6 +246,13 @@ const asError = (value: unknown): Error => {
     return value instanceof Error ? value : new Error(String(value));
 };
 
+const inferAccountCurrency = (tipo: unknown): 'USD' | 'BS' => {
+    const raw = String(tipo || '').trim().toUpperCase();
+    if (!raw) return 'BS';
+    if (raw.includes('ZELLE') || raw.includes('USD')) return 'USD';
+    return 'BS';
+};
+
 const toIsoDate = (value: unknown, fieldName: string): string => {
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
         return value.toISOString().slice(0, 10);
@@ -560,12 +567,35 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 });
             }
 
+            const cuentaRes = await pool.query<{ id: number; tipo: string | null }>(
+                `SELECT id, tipo
+                 FROM cuentas_bancarias
+                 WHERE id = $1 AND condominio_id = $2
+                 LIMIT 1`,
+                [cuentaId, condoId]
+            );
+            if (!cuentaRes.rows.length) {
+                return res.status(404).json({ status: 'error', message: 'Cuenta bancaria no encontrada.' });
+            }
+            const cuentaMoneda = inferAccountCurrency(cuentaRes.rows[0].tipo);
+
             await pool.query('BEGIN');
-            await pool.query('UPDATE cuentas_bancarias SET es_predeterminada = false WHERE condominio_id = $1', [condoId]);
+            await pool.query(
+                `UPDATE cuentas_bancarias
+                 SET es_predeterminada = false
+                 WHERE condominio_id = $1
+                   AND (
+                     CASE
+                       WHEN UPPER(COALESCE(tipo, '')) LIKE '%USD%' OR UPPER(COALESCE(tipo, '')) LIKE '%ZELLE%' THEN 'USD'
+                       ELSE 'BS'
+                     END
+                   ) = $2`,
+                [condoId, cuentaMoneda]
+            );
             await pool.query('UPDATE cuentas_bancarias SET es_predeterminada = true WHERE id = $1 AND condominio_id = $2', [cuentaId, condoId]);
             await pool.query('COMMIT');
 
-            res.json({ status: 'success', message: 'Cuenta principal actualizada con Ã©xito.' });
+            res.json({ status: 'success', message: `Cuenta principal ${cuentaMoneda} actualizada con exito.` });
         } catch (err: unknown) {
             const error = asError(err);
             await pool.query('ROLLBACK');
