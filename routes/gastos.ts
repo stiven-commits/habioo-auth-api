@@ -75,6 +75,11 @@ interface IGastoListRow extends Record<string, unknown> {
     tasa_cambio: string | number;
     monto_total_usd: string | number;
     monto_pagado_usd: string | number | null;
+    monto_pagado_proveedor_usd?: string | number | null;
+    monto_recaudado_usd?: string | number | null;
+    has_real_pago_proveedor?: boolean;
+    cuotas_historicas?: number | string | null;
+    monto_historico_proveedor_usd?: number | string | null;
     nota: string | null;
     clasificacion: string | null;
     proveedor: string;
@@ -171,6 +176,10 @@ interface ISumTotalRow {
     total: string | null;
 }
 
+interface IColumnNameRow {
+    column_name: string;
+}
+
 interface IPeriodRow {
     anio: number;
     mes: number;
@@ -193,6 +202,8 @@ interface CreateGastoBody {
     zona_id?: string | number | null;
     propiedad_id?: string | number | null;
     fecha_gasto?: string | null;
+    cuotas_historicas?: string | number | null;
+    monto_historico_proveedor_usd?: string | number | null;
     remove_factura_img?: string | boolean | null;
     keep_imagenes?: string | string[] | null;
 }
@@ -459,7 +470,23 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
     app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount: 1 }, { name: 'soportes', maxCount: 4 }]), async (req: Request<{}, unknown, CreateGastoBody>, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
 
-        const { proveedor_id, concepto, numero_documento, monto_bs, tasa_cambio, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, remove_factura_img } = req.body;
+        const {
+            proveedor_id,
+            concepto,
+            numero_documento,
+            monto_bs,
+            tasa_cambio,
+            total_cuotas,
+            nota,
+            clasificacion,
+            tipo,
+            zona_id,
+            propiedad_id,
+            fecha_gasto,
+            cuotas_historicas,
+            monto_historico_proveedor_usd,
+            remove_factura_img,
+        } = req.body;
 
         let inTransaction = false;
         try {
@@ -516,11 +543,32 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const mes_actual = asYyyyMmOrPrevious(condo.mes_actual);
             const esJuntaGeneral = isJuntaGeneralTipo(condo.tipo);
 
+            const totalCuotasSafe = Math.max(1, parseInt(String(total_cuotas), 10) || 1);
+            const cuotasHistoricasSafe = Math.max(0, Math.trunc(parseLocaleNumber(cuotas_historicas || 0)));
+            if (cuotasHistoricasSafe >= totalCuotasSafe) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Las cuotas históricas deben ser menores al total de cuotas.',
+                });
+            }
+
             const monto_usd = (m_bs / t_c).toFixed(2);
-            const monto_cuota_usd = (parseFloat(monto_usd) / parseInt(String(total_cuotas), 10)).toFixed(2);
+            const montoUsdNum = parseFloat(monto_usd);
+            const montoCuotaUsdNum = Number((montoUsdNum / totalCuotasSafe).toFixed(2));
+            const monto_cuota_usd = montoCuotaUsdNum.toFixed(2);
+            const montoHistoricoProveedorUsdSafe = Number(parseLocaleNumber(monto_historico_proveedor_usd || 0).toFixed(2));
+            if (montoHistoricoProveedorUsdSafe < 0 || montoHistoricoProveedorUsdSafe > Number(montoUsdNum.toFixed(2))) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'El pago histórico del proveedor debe estar entre 0 y el monto total del gasto.',
+                });
+            }
 
             const mes_factura = fechaGastoSafe ? fechaGastoSafe.substring(0, 7) : mes_actual;
-            const mes_inicio_cobro = mes_factura > mes_actual ? mes_factura : mes_actual;
+            const mes_inicio_base = mes_factura > mes_actual ? mes_factura : mes_actual;
+            const mes_inicio_cobro = cuotasHistoricasSafe > 0
+                ? addMonths(mes_actual, -cuotasHistoricasSafe)
+                : mes_inicio_base;
 
             const dbTipo = tipo || 'Comun';
             const dbClasificacion = String(clasificacion || '').trim().toLowerCase() === 'fijo' ? 'Fijo' : 'Variable';
@@ -537,19 +585,23 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const pId = dbTipo === 'Individual' ? (propiedad_id || null) : null;
             const numeroDocSafe = String(numero_documento || '').trim();
             const notaSafe = String(nota || '').trim();
-            const notaFinal = numeroDocSafe
+            const notaBase = numeroDocSafe
                 ? (notaSafe ? `Nro. recibo/factura: ${numeroDocSafe} | ${notaSafe}` : `Nro. recibo/factura: ${numeroDocSafe}`)
                 : (notaSafe || null);
+            const metaHistorico: string[] = [];
+            if (cuotasHistoricasSafe > 0) metaHistorico.push(`[hist.cuotas:${cuotasHistoricasSafe}]`);
+            if (montoHistoricoProveedorUsdSafe > 0) metaHistorico.push(`[hist.proveedor_usd:${montoHistoricoProveedorUsdSafe.toFixed(2)}]`);
+            const notaFinal = [notaBase, ...metaHistorico].filter(Boolean).join(' | ') || null;
 
             const result = await pool.query<IInsertedIdRow>(
                 `
-            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, factura_img, imagenes)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id
+            INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, monto_pagado_usd, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, factura_img, imagenes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id
         `,
-                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, total_cuotas, notaFinal, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados]
+                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, montoHistoricoProveedorUsdSafe, totalCuotasSafe, notaFinal, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados]
             );
 
-            for (let i = 1; i <= Number(total_cuotas); i += 1) {
+            for (let i = 1; i <= totalCuotasSafe; i += 1) {
                 const mes_cuota = addMonths(mes_inicio_cobro, i - 1);
                 await pool.query('INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado) VALUES ($1, $2, $3, $4)', [result.rows[0].id, i, monto_cuota_usd, mes_cuota]);
             }
@@ -568,7 +620,23 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             return res.status(400).json({ status: 'error', message: 'ID de gasto invalido.' });
         }
 
-        const { proveedor_id, concepto, numero_documento, monto_bs, tasa_cambio, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, remove_factura_img } = req.body;
+        const {
+            proveedor_id,
+            concepto,
+            numero_documento,
+            monto_bs,
+            tasa_cambio,
+            total_cuotas,
+            nota,
+            clasificacion,
+            tipo,
+            zona_id,
+            propiedad_id,
+            fecha_gasto,
+            cuotas_historicas,
+            monto_historico_proveedor_usd,
+            remove_factura_img,
+        } = req.body;
 
         let inTransaction = false;
         try {
@@ -653,11 +721,29 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const t_c = parseLocaleNumber(tasa_cambio);
             const fechaGastoSafe = toIsoDateOrNull(fecha_gasto);
             const monto_usd = (m_bs / t_c).toFixed(2);
+            const montoUsdNum = parseFloat(monto_usd);
             const totalCuotasSafe = Math.max(1, parseInt(String(total_cuotas), 10) || 1);
+            const cuotasHistoricasSafe = Math.max(0, Math.trunc(parseLocaleNumber(cuotas_historicas || 0)));
+            if (cuotasHistoricasSafe >= totalCuotasSafe) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Las cuotas históricas deben ser menores al total de cuotas.',
+                });
+            }
+            const montoHistoricoProveedorUsdSafe = Number(parseLocaleNumber(monto_historico_proveedor_usd || 0).toFixed(2));
+            if (montoHistoricoProveedorUsdSafe < 0 || montoHistoricoProveedorUsdSafe > Number(montoUsdNum.toFixed(2))) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'El pago histórico del proveedor debe estar entre 0 y el monto total del gasto.',
+                });
+            }
             const monto_cuota_usd = (parseFloat(monto_usd) / totalCuotasSafe).toFixed(2);
 
             const mes_factura = fechaGastoSafe ? fechaGastoSafe.substring(0, 7) : mes_actual;
-            const mes_inicio_cobro = mes_factura > mes_actual ? mes_factura : mes_actual;
+            const mes_inicio_base = mes_factura > mes_actual ? mes_factura : mes_actual;
+            const mes_inicio_cobro = cuotasHistoricasSafe > 0
+                ? addMonths(mes_actual, -cuotasHistoricasSafe)
+                : mes_inicio_base;
 
             const dbTipo = tipo || 'Comun';
             const dbClasificacion = String(clasificacion || '').trim().toLowerCase() === 'fijo' ? 'Fijo' : 'Variable';
@@ -674,9 +760,13 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const pId = dbTipo === 'Individual' ? (propiedad_id || null) : null;
             const numeroDocSafe = String(numero_documento || '').trim();
             const notaSafe = String(nota || '').trim();
-            const notaFinal = numeroDocSafe
+            const notaBase = numeroDocSafe
                 ? (notaSafe ? `Nro. recibo/factura: ${numeroDocSafe} | ${notaSafe}` : `Nro. recibo/factura: ${numeroDocSafe}`)
                 : (notaSafe || null);
+            const metaHistorico: string[] = [];
+            if (cuotasHistoricasSafe > 0) metaHistorico.push(`[hist.cuotas:${cuotasHistoricasSafe}]`);
+            if (montoHistoricoProveedorUsdSafe > 0) metaHistorico.push(`[hist.proveedor_usd:${montoHistoricoProveedorUsdSafe.toFixed(2)}]`);
+            const notaFinal = [notaBase, ...metaHistorico].filter(Boolean).join(' | ') || null;
 
             await pool.query('BEGIN');
             inTransaction = true;
@@ -698,7 +788,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     fecha_gasto = $12,
                     factura_img = $13,
                     imagenes = $14
-                WHERE id = $15
+                    WHERE id = $15
                 `,
                 [proveedor_id, concepto, m_bs, t_c, monto_usd, totalCuotasSafe, notaFinal, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados, gastoId]
             );
@@ -739,10 +829,31 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             if (!condo) {
                 return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para la sesión activa.' });
             }
+            const ppColsRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'pagos_proveedores'
+                  AND column_name IN ('es_ajuste_historico')
+                `
+            );
+            const hasPpHistoricoCol = ppColsRes.rows.some((r) => r.column_name === 'es_ajuste_historico');
+            const realPagoProveedorExpr = hasPpHistoricoCol
+                ? "EXISTS (SELECT 1 FROM pagos_proveedores pp WHERE pp.gasto_id = g.id AND COALESCE(pp.es_ajuste_historico, false) = false)"
+                : "EXISTS (SELECT 1 FROM pagos_proveedores pp WHERE pp.gasto_id = g.id)";
             const result = await pool.query<IGastoListRow>(
                 `
             SELECT g.id as gasto_id, gc.id as cuota_id, g.concepto, g.monto_bs, g.tasa_cambio,
-                   g.monto_usd as monto_total_usd, g.monto_pagado_usd, g.nota, g.clasificacion, p.nombre as proveedor,
+                   g.monto_usd as monto_total_usd, g.monto_pagado_usd,
+                   (
+                     COALESCE((SELECT SUM(pp.monto_usd) FROM pagos_proveedores pp WHERE pp.gasto_id = g.id), 0)
+                     + COALESCE(((regexp_match(COALESCE(g.nota, ''), '\\[hist\\.proveedor_usd:([0-9]+(?:\\.[0-9]+)?)\\]'))[1])::numeric, 0)
+                   ) AS monto_pagado_proveedor_usd,
+                   LEAST(COALESCE(g.monto_usd, 0), COALESCE(g.monto_pagado_usd, 0)) AS monto_recaudado_usd,
+                   ${realPagoProveedorExpr} AS has_real_pago_proveedor,
+                   COALESCE(((regexp_match(COALESCE(g.nota, ''), '\\[hist\\.cuotas:(\\d+)\\]'))[1])::int, 0) AS cuotas_historicas,
+                   COALESCE(((regexp_match(COALESCE(g.nota, ''), '\\[hist\\.proveedor_usd:([0-9]+(?:\\.[0-9]+)?)\\]'))[1])::numeric, 0) AS monto_historico_proveedor_usd,
+                   g.nota, g.clasificacion, p.nombre as proveedor,
                    gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.mes_asignado, gc.estado,
                    TO_CHAR(g.created_at, 'DD/MM/YYYY') as fecha_registro,
                    TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha_factura,
@@ -772,6 +883,23 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const gastoId = asString(req.params.id);
             const cuotasCheck = await pool.query<IGastoCuotaCheckRow>("SELECT id FROM gastos_cuotas WHERE gasto_id = $1 AND estado != 'Pendiente'", [gastoId]);
             if (cuotasCheck.rows.length > 0) return res.status(400).json({ status: 'error', message: 'No puedes eliminar un gasto con cuotas procesadas.' });
+
+            const ppColsRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'pagos_proveedores'
+                  AND column_name IN ('es_ajuste_historico')
+                `
+            );
+            const hasPpHistoricoCol = ppColsRes.rows.some((r) => r.column_name === 'es_ajuste_historico');
+            const pagosRealesQuery = hasPpHistoricoCol
+                ? 'SELECT id FROM pagos_proveedores WHERE gasto_id = $1 AND COALESCE(es_ajuste_historico, false) = false LIMIT 1'
+                : 'SELECT id FROM pagos_proveedores WHERE gasto_id = $1 LIMIT 1';
+            const pagosRealesCheck = await pool.query<IGastoCuotaCheckRow>(pagosRealesQuery, [gastoId]);
+            if (pagosRealesCheck.rows.length > 0) {
+                return res.status(400).json({ status: 'error', message: 'No puedes eliminar un gasto con pagos reales al proveedor.' });
+            }
 
             const imgRes = await pool.query<IGastoImagenesRow>('SELECT factura_img, imagenes FROM gastos WHERE id = $1', [gastoId]);
             const { factura_img, imagenes } = imgRes.rows[0] || {};

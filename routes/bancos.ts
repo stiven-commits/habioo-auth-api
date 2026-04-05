@@ -964,6 +964,45 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                           END
                       ) > 0
                 ),
+                ingresos_extra_detalle AS (
+                    SELECT
+                        ('ING-EXTRA-' || p.id::text) AS id,
+                        p.fecha_pago::date AS fecha,
+                        p.referencia,
+                        ('Ingreso por gastos Extra - Inmueble: ' || COALESCE(pr.identificador, 'N/A')) AS concepto,
+                        'INGRESO'::text AS tipo,
+                        CASE
+                            WHEN p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0 THEN (extra_meta.extra_usd * p.tasa_cambio)
+                            ELSE NULL
+                        END AS monto_bs,
+                        p.tasa_cambio,
+                        extra_meta.extra_usd AS monto_usd,
+                        p.monto_origen AS monto_origen_pago,
+                        ${pagoBancoOrigenExpr} AS banco_origen,
+                        ${pagoCedulaOrigenExpr} AS cedula_origen,
+                        NULL::int AS fondo_id,
+                        NULL::int AS fondo_origen_id,
+                        NULL::int AS fondo_destino_id,
+                        NULL::text AS fondo_nombre,
+                        p.id::int AS pago_id,
+                        pr.identificador::text AS inmueble,
+                        p.created_at AS created_at
+                    FROM pagos p
+                    LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
+                    CROSS JOIN LATERAL (
+                        SELECT COALESCE(
+                            NULLIF(
+                                (regexp_match(COALESCE(${pagoNotaExpr}, ''), '(?i)\\[extra_usd:([0-9]+(?:\\.[0-9]+)?)\\]'))[1],
+                                ''
+                            )::numeric,
+                            0
+                        ) AS extra_usd
+                    ) extra_meta
+                    WHERE p.cuenta_bancaria_id = $1
+                      AND p.estado = 'Validado'
+                      AND COALESCE(p.es_ajuste_historico, false) = false
+                      AND extra_meta.extra_usd > 0
+                ),
                 egresos_gpf AS (
                     SELECT
                         ('EGR-' || ${gpfIdExpr}) AS id,
@@ -1152,6 +1191,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 UNION ALL
                 SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble, created_at
                 FROM ingresos_transito
+                UNION ALL
+                SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble, created_at
+                FROM ingresos_extra_detalle
                 UNION ALL
                 SELECT id, fecha, referencia, concepto, tipo, monto_bs, tasa_cambio, monto_usd, monto_origen_pago, banco_origen, cedula_origen, fondo_id, fondo_origen_id, fondo_destino_id, fondo_nombre, pago_id, inmueble, created_at
                 FROM egresos_gpf

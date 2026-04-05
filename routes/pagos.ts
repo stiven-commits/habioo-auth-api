@@ -77,6 +77,7 @@ interface IReciboRow {
     monto_pagado_usd: string | number | null;
     estado: string;
     fecha_emision: string | Date;
+    snapshot_jsonb?: unknown;
 }
 
 interface IFondoActivoRow {
@@ -150,6 +151,7 @@ interface AbonoFondosInput {
     cuentaId: string | number;
     montoDistribuibleUsd: number;
     montoDistribuibleOrigen: number;
+    montoExtraUsd?: number;
     monedaPago: string;
     tasaNum: number;
     pagoId: number | null;
@@ -203,6 +205,14 @@ interface PagoProveedorBody {
     origenes: PagoProveedorOrigenBody[];
 }
 
+interface PagoProveedorHistoricoBody {
+    gasto_id: number | string;
+    fecha: string;
+    monto_usd: number | string;
+    referencia?: string | null;
+    nota?: string | null;
+}
+
 interface PagoProveedorDetalleParams {
     gasto_id?: string;
 }
@@ -219,6 +229,7 @@ interface PagoProveedorDetalleRow {
     fecha_pago: string | Date | null;
     fecha_registro: string | Date | null;
     nota: string | null;
+    es_ajuste_historico?: boolean | null;
 }
 
 interface GastoMontoRow {
@@ -368,6 +379,35 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
     };
 
     const round2 = (n: unknown): number => parseFloat((parseFloat(String(n || 0))).toFixed(2));
+    const normalizeReciboEstado = (pagado: number, monto: number): 'Pendiente' | 'Abonado' | 'Pagado' => {
+        if (pagado >= monto - 0.005) return 'Pagado';
+        if (pagado > 0) return 'Abonado';
+        return 'Pendiente';
+    };
+    const getCreditoPrevioDesdeSnapshot = (recibo: IReciboRow): number => {
+        try {
+            const snapshot = (recibo.snapshot_jsonb && typeof recibo.snapshot_jsonb === 'object')
+                ? (recibo.snapshot_jsonb as { saldo_cuenta?: { antes_aviso_usd?: number | string } })
+                : null;
+            const antesAvisoUsd = round2(parseLocaleNumber(snapshot?.saldo_cuenta?.antes_aviso_usd || 0));
+            return antesAvisoUsd < 0 ? round2(Math.abs(antesAvisoUsd)) : 0;
+        } catch (_err) {
+            return 0;
+        }
+    };
+    const updateReciboPagoEstado = async (
+        client: QueryClient,
+        reciboId: number,
+        montoPagadoUsd: number,
+        estado: 'Pendiente' | 'Abonado' | 'Pagado',
+    ): Promise<void> => {
+        // Mantener este update libre de operaciones JSON para evitar abortar la
+        // transacción de aprobación por snapshots históricos inconsistentes.
+        await client.query(
+            'UPDATE recibos SET monto_pagado_usd = $1, estado = $2 WHERE id = $3',
+            [montoPagadoUsd, estado, reciboId]
+        );
+    };
 
     const getPagosColumns = async (): Promise<OptionalPagosColumns & { propiedad_id: boolean; es_ajuste_historico: boolean }> => {
         const optionalCols = await getPagosOptionalColumns();
@@ -392,6 +432,30 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         } catch (_err) {
             return { ...optionalCols, propiedad_id: false, es_ajuste_historico: false, metodo: false };
         }
+    };
+
+    const appendPagoExtraMeta = async (
+        client: QueryClient,
+        pagoId: number | null | undefined,
+        extraUsd: number,
+        notaDisponible: boolean,
+    ): Promise<void> => {
+        if (!notaDisponible || !pagoId) return;
+        const extraSafe = round2(extraUsd);
+        if (extraSafe <= 0) return;
+        const marker = `[extra_usd:${extraSafe.toFixed(2)}]`;
+        await client.query(
+            `
+            UPDATE pagos
+            SET nota = CASE
+                WHEN COALESCE(NULLIF(BTRIM(nota), ''), '') = '' THEN $2
+                WHEN COALESCE(nota, '') LIKE '%' || $2 || '%' THEN nota
+                ELSE CONCAT(nota, ' | ', $2)
+            END
+            WHERE id = $1
+            `,
+            [pagoId, marker]
+        );
     };
 
     const getCuentaFechaLimiteSaldo = async (cuentaId: number): Promise<string | null> => {
@@ -657,12 +721,15 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
     };
 
     // Distribuye SOLO el monto no-Extra en fondos + movimientos_fondos.
-    const distribuirAbonoEnFondos = async (client: QueryClient, { cuentaId, montoDistribuibleUsd, montoDistribuibleOrigen, monedaPago, tasaNum, pagoId, referencia }: AbonoFondosInput): Promise<void> => {
+    const distribuirAbonoEnFondos = async (client: QueryClient, { cuentaId, montoDistribuibleUsd, montoDistribuibleOrigen, montoExtraUsd = 0, monedaPago, tasaNum, pagoId, referencia }: AbonoFondosInput): Promise<void> => {
         const monedaBase = String(monedaPago || '').toUpperCase() === 'USD' ? 'USD' : 'BS';
         const montoBase = monedaBase === 'BS'
             ? round2(montoDistribuibleOrigen)
             : round2(montoDistribuibleUsd);
-        if (montoBase <= 0) return;
+        const montoExtraBase = monedaBase === 'BS'
+            ? round2((round2(montoExtraUsd) * (tasaNum || 0)))
+            : round2(montoExtraUsd);
+        if (montoBase <= 0 && montoExtraBase <= 0) return;
 
         const fondosRes = await client.query<IFondoActivoRow>(
             `
@@ -703,6 +770,23 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             distBase.push({ ...fondosActivos[0], montoBaseParte: montoBase });
         }
 
+        // Regla Extra: el componente Extra se abona 100% al fondo principal (operativo).
+        // Si no existe uno marcado, se acumula en el primer fondo de la cuenta.
+        if (montoExtraBase > 0) {
+            if (fondoPrincipal) {
+                const idxPrincipal = distBase.findIndex((d) => d.id === fondoPrincipal.id);
+                if (idxPrincipal >= 0) {
+                    distBase[idxPrincipal].montoBaseParte = round2(distBase[idxPrincipal].montoBaseParte + montoExtraBase);
+                } else {
+                    distBase.push({ ...fondoPrincipal, montoBaseParte: montoExtraBase });
+                }
+            } else if (distBase.length > 0) {
+                distBase[0].montoBaseParte = round2(distBase[0].montoBaseParte + montoExtraBase);
+            } else {
+                distBase.push({ ...fondosActivos[0], montoBaseParte: montoExtraBase });
+            }
+        }
+
         const tipoMovimiento = await resolveMovimientoFondoTipo(['ABONO', 'ENTRADA', 'INGRESO', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
         for (const d of distBase) {
             const parteBase = round2(d.montoBaseParte || 0);
@@ -729,11 +813,20 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         }
     };
 
-    const aplicarPagoEnCascada = async (client: QueryClient, pago: IPagoFullRow): Promise<void> => {
+    const aplicarPagoEnCascada = async (
+        client: QueryClient,
+        pago: IPagoFullRow,
+        notaDisponible: boolean = false,
+    ): Promise<void> => {
         const montoUsd = round2(parseFloat(String(pago.monto_usd || 0)));
         if (montoUsd <= 0) return;
 
         const propiedadId = pago.propiedad_id;
+        const propSaldoRes = await client.query<{ saldo_actual: string | number }>(
+            'SELECT COALESCE(saldo_actual, 0) AS saldo_actual FROM propiedades WHERE id = $1 FOR UPDATE',
+            [propiedadId]
+        );
+        const saldoAntesPago = round2(parseFloat(String(propSaldoRes.rows?.[0]?.saldo_actual || 0)));
         await client.query('UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2', [montoUsd, propiedadId]);
         await client.query(
             'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, nota) VALUES ($1, $2, $3, $4)',
@@ -741,6 +834,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
         );
 
         let dineroRestante = montoUsd;
+        let dineroDisponibleParaRecibos = montoUsd;
         let montoDistribuibleFondos = 0;
         let montoExtraTotalUsd = 0;
 
@@ -749,27 +843,45 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             [propiedadId]
         );
 
-        for (const rec of recibosPendientes.rows) {
-            if (dineroRestante <= 0) break;
+        const deudaTotalRecibos = round2(recibosPendientes.rows.reduce((acc, rec) => {
+            const montoRecibo = round2(parseFloat(String(rec.monto_usd || 0)));
+            const pagadoActual = round2(parseFloat(String(rec.monto_pagado_usd || 0)));
+            const creditoPrevio = getCreditoPrevioDesdeSnapshot(rec);
+            const pagadoBase = round2(Math.min(montoRecibo, Math.max(pagadoActual, creditoPrevio)));
+            return acc + round2(Math.max(0, montoRecibo - pagadoBase));
+        }, 0));
+        const deudaNoReciboPrevia = round2(Math.max(0, saldoAntesPago - deudaTotalRecibos));
+        dineroDisponibleParaRecibos = round2(Math.max(0, montoUsd - deudaNoReciboPrevia));
 
-            const deudaRecibo = round2(parseFloat(String(rec.monto_usd || 0)) - parseFloat(String(rec.monto_pagado_usd || 0)));
+        for (const rec of recibosPendientes.rows) {
+            if (dineroDisponibleParaRecibos <= 0) break;
+
+            const montoRecibo = round2(parseFloat(String(rec.monto_usd || 0)));
+            const pagadoActual = round2(parseFloat(String(rec.monto_pagado_usd || 0)));
+            const creditoPrevio = getCreditoPrevioDesdeSnapshot(rec);
+            const pagadoBase = round2(Math.min(montoRecibo, Math.max(pagadoActual, creditoPrevio)));
+
+            if (Math.abs(pagadoBase - pagadoActual) > 0.009) {
+                await updateReciboPagoEstado(
+                    client,
+                    rec.id,
+                    pagadoBase,
+                    normalizeReciboEstado(pagadoBase, montoRecibo)
+                );
+            }
+
+            const deudaRecibo = round2(montoRecibo - pagadoBase);
             if (deudaRecibo <= 0) {
-                await client.query("UPDATE recibos SET estado = 'Pagado' WHERE id = $1", [rec.id]);
+                await updateReciboPagoEstado(client, rec.id, montoRecibo, 'Pagado');
                 continue;
             }
 
-            const montoAplicadoRecibo = Math.min(dineroRestante, deudaRecibo);
-
-            if (dineroRestante >= deudaRecibo) {
-                await client.query("UPDATE recibos SET monto_pagado_usd = monto_usd, estado = 'Pagado' WHERE id = $1", [rec.id]);
-                dineroRestante = round2(dineroRestante - deudaRecibo);
-            } else {
-                await client.query(
-                    "UPDATE recibos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1, estado = 'Abonado' WHERE id = $2",
-                    [dineroRestante, rec.id]
-                );
-                dineroRestante = 0;
-            }
+            const montoAplicadoRecibo = Math.min(dineroDisponibleParaRecibos, deudaRecibo);
+            const nuevoPagado = round2(Math.min(montoRecibo, pagadoBase + montoAplicadoRecibo));
+            const nuevoEstado = normalizeReciboEstado(nuevoPagado, montoRecibo);
+            await updateReciboPagoEstado(client, rec.id, nuevoPagado, nuevoEstado);
+            dineroDisponibleParaRecibos = round2(Math.max(0, dineroDisponibleParaRecibos - montoAplicadoRecibo));
+            dineroRestante = round2(Math.max(0, dineroRestante - montoAplicadoRecibo));
 
             const { montoDistribuibleUsd, montoExtraUsd } = await imputarReciboEnGastos(client, rec, montoAplicadoRecibo);
             montoDistribuibleFondos = round2(montoDistribuibleFondos + montoDistribuibleUsd);
@@ -787,17 +899,19 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             ? round2(Math.max(0, montoOrigenNum - round2(montoExtraTotalUsd * tasaNum)))
             : montoDistribuibleFondos;
 
-        if (pago.cuenta_bancaria_id && montoDistribuibleFondos > 0) {
+        if (pago.cuenta_bancaria_id && (montoDistribuibleFondos > 0 || montoExtraTotalUsd > 0)) {
             await distribuirAbonoEnFondos(client, {
                 cuentaId: pago.cuenta_bancaria_id,
                 montoDistribuibleUsd: montoDistribuibleFondos,
                 montoDistribuibleOrigen,
+                montoExtraUsd: montoExtraTotalUsd,
                 monedaPago,
                 tasaNum,
                 pagoId: pago.id,
                 referencia: pago.referencia || null,
             });
         }
+        await appendPagoExtraMeta(client, pago.id, montoExtraTotalUsd, notaDisponible);
     };
 
     const ensureInmueblePagosAccess = async (adminUserId: number, res: Response): Promise<boolean> => {
@@ -922,11 +1036,18 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             );
             const pagoId = pagoInsertRes.rows?.[0]?.id || null;
 
-            // 3. Restamos el pago al saldo consolidado de la propiedad.
+            // 3. Cascada FIFO por recibos + imputacion por tipo de gasto.
+            // Se bloquea y lee saldo previo para reservar deuda antigua (no asociada a recibos)
+            // antes de aplicar sobre recibos pendientes.
+            const propSaldoRes = await pool.query<{ saldo_actual: string | number }>(
+                'SELECT COALESCE(saldo_actual, 0) AS saldo_actual FROM propiedades WHERE id = $1 FOR UPDATE',
+                [propiedad_id]
+            );
+            const saldoAntesPago = round2(parseFloat(String(propSaldoRes.rows?.[0]?.saldo_actual || 0)));
             await pool.query('UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2', [montoUsd, propiedad_id]);
 
-            // 4. Cascada FIFO por recibos + imputacion por tipo de gasto.
             let dineroRestante = montoUsd;
+            let dineroDisponibleParaRecibos = montoUsd;
             let montoDistribuibleFondos = 0;
             let montoExtraTotalUsd = 0;
 
@@ -935,27 +1056,45 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 [propiedad_id]
             );
 
-            for (const rec of recibosPendientes.rows) {
-                if (dineroRestante <= 0) break;
+            const deudaTotalRecibos = round2(recibosPendientes.rows.reduce((acc, rec) => {
+                const montoRecibo = round2(parseFloat(String(rec.monto_usd || 0)));
+                const pagadoActual = round2(parseFloat(String(rec.monto_pagado_usd || 0)));
+                const creditoPrevio = getCreditoPrevioDesdeSnapshot(rec);
+                const pagadoBase = round2(Math.min(montoRecibo, Math.max(pagadoActual, creditoPrevio)));
+                return acc + round2(Math.max(0, montoRecibo - pagadoBase));
+            }, 0));
+            const deudaNoReciboPrevia = round2(Math.max(0, saldoAntesPago - deudaTotalRecibos));
+            dineroDisponibleParaRecibos = round2(Math.max(0, montoUsd - deudaNoReciboPrevia));
 
-                const deudaRecibo = round2(parseFloat(String(rec.monto_usd || 0)) - parseFloat(String(rec.monto_pagado_usd || 0)));
+            for (const rec of recibosPendientes.rows) {
+                if (dineroDisponibleParaRecibos <= 0) break;
+
+                const montoRecibo = round2(parseFloat(String(rec.monto_usd || 0)));
+                const pagadoActual = round2(parseFloat(String(rec.monto_pagado_usd || 0)));
+                const creditoPrevio = getCreditoPrevioDesdeSnapshot(rec);
+                const pagadoBase = round2(Math.min(montoRecibo, Math.max(pagadoActual, creditoPrevio)));
+
+                if (Math.abs(pagadoBase - pagadoActual) > 0.009) {
+                    await updateReciboPagoEstado(
+                        pool,
+                        rec.id,
+                        pagadoBase,
+                        normalizeReciboEstado(pagadoBase, montoRecibo)
+                    );
+                }
+
+                const deudaRecibo = round2(montoRecibo - pagadoBase);
                 if (deudaRecibo <= 0) {
-                    await pool.query("UPDATE recibos SET estado = 'Pagado' WHERE id = $1", [rec.id]);
+                    await updateReciboPagoEstado(pool, rec.id, montoRecibo, 'Pagado');
                     continue;
                 }
 
-                const montoAplicadoRecibo = Math.min(dineroRestante, deudaRecibo);
-
-                if (dineroRestante >= deudaRecibo) {
-                    await pool.query("UPDATE recibos SET monto_pagado_usd = monto_usd, estado = 'Pagado' WHERE id = $1", [rec.id]);
-                    dineroRestante = round2(dineroRestante - deudaRecibo);
-                } else {
-                    await pool.query(
-                        "UPDATE recibos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1, estado = 'Abonado' WHERE id = $2",
-                        [dineroRestante, rec.id]
-                    );
-                    dineroRestante = 0;
-                }
+                const montoAplicadoRecibo = Math.min(dineroDisponibleParaRecibos, deudaRecibo);
+                const nuevoPagado = round2(Math.min(montoRecibo, pagadoBase + montoAplicadoRecibo));
+                const nuevoEstado = normalizeReciboEstado(nuevoPagado, montoRecibo);
+                await updateReciboPagoEstado(pool, rec.id, nuevoPagado, nuevoEstado);
+                dineroDisponibleParaRecibos = round2(Math.max(0, dineroDisponibleParaRecibos - montoAplicadoRecibo));
+                dineroRestante = round2(Math.max(0, dineroRestante - montoAplicadoRecibo));
 
                 // SQL + JS: separar porcion Extra y actualizar monto_pagado_usd en gastos.
                 const { montoDistribuibleUsd, montoExtraUsd } = await imputarReciboEnGastos(pool, rec, montoAplicadoRecibo);
@@ -978,11 +1117,13 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 cuentaId: cuenta_id,
                 montoDistribuibleUsd: montoDistribuibleFondos,
                 montoDistribuibleOrigen,
+                montoExtraUsd: montoExtraTotalUsd,
                 monedaPago: monedaFinal,
                 tasaNum,
                 pagoId,
                 referencia: referencia || null,
             });
+            await appendPagoExtraMeta(pool, pagoId, montoExtraTotalUsd, Boolean(optionalCols.nota));
 
             await pool.query('COMMIT');
             res.json({ status: 'success', message: 'Pago registrado y saldos distribuidos exitosamente en la propiedad.' });
@@ -1186,30 +1327,70 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
     // Validacion manual de pagos pendientes (FIFO por recibos de la propiedad).
     app.post('/pagos/:id/validar', verifyToken, async (req: Request<PagoValidarParams>, res: Response, _next: NextFunction) => {
         const pagoId = asString(req.params.id);
+        const client = await pool.connect();
+        let txStarted = false;
 
         try {
             const user = asAuthUser(req.user);
             if (!(await ensureInmueblePagosAccess(user.id, res))) return;
 
-            await pool.query('BEGIN');
+            await client.query('BEGIN');
+            txStarted = true;
             const pagosCols = await getPagosColumns();
             const ajusteHistoricoExpr = pagosCols.es_ajuste_historico
                 ? 'COALESCE(es_ajuste_historico, false)'
                 : 'false';
 
-            const pagoRes = await pool.query<IPagoFullRow>(
-                `SELECT id, monto_usd, monto_origen, tasa_cambio, propiedad_id, estado, cuenta_bancaria_id, moneda, referencia, ${ajusteHistoricoExpr} AS es_ajuste_historico FROM pagos WHERE id = $1 AND estado IN ('Pendiente', 'PendienteAprobacion')`,
+            const pagoRes = await client.query<IPagoFullRow>(
+                `SELECT id, monto_usd, monto_origen, tasa_cambio, propiedad_id, estado, cuenta_bancaria_id, moneda, referencia, ${ajusteHistoricoExpr} AS es_ajuste_historico
+                 FROM pagos
+                 WHERE id = $1
+                 FOR UPDATE`,
                 [pagoId]
             );
             if (pagoRes.rows.length === 0) throw new Error('Pago no encontrado o ya fue procesado.');
 
             const pago = pagoRes.rows[0];
+            if (!['Pendiente', 'PendienteAprobacion'].includes(String(pago.estado || ''))) {
+                throw new Error('Pago no encontrado o ya fue procesado.');
+            }
             const hasAccess = await adminHasPropiedadAccess(user.id, pago.propiedad_id);
             if (!hasAccess) {
                 throw new Error('No autorizado para aprobar pagos de otro condominio.');
             }
 
-            await pool.query("UPDATE pagos SET estado = 'Validado' WHERE id = $1", [pagoId]);
+            // Si por un fallo previo quedaron efectos contables aplicados con estado pendiente,
+            // cerramos el pago sin reaplicar para evitar duplicados.
+            const yaAplicadoRes = await client.query<{ ok: number }>(
+                `
+                SELECT 1 AS ok
+                FROM historial_saldos_inmuebles
+                WHERE propiedad_id = $1
+                  AND nota LIKE $2
+                LIMIT 1
+                `,
+                [pago.propiedad_id, `%#${pago.id}%`]
+            );
+            const yaAplicadoMovRes = await client.query<{ ok: number }>(
+                `
+                SELECT 1 AS ok
+                FROM movimientos_fondos
+                WHERE referencia_id = $1
+                LIMIT 1
+                `,
+                [pago.id]
+            );
+            if (yaAplicadoRes.rows.length > 0 || yaAplicadoMovRes.rows.length > 0) {
+                await client.query("UPDATE pagos SET estado = 'Validado' WHERE id = $1", [pagoId]);
+                await client.query('COMMIT');
+                txStarted = false;
+                return res.json({
+                    status: 'success',
+                    message: 'Pago aprobado. Se detectaron efectos contables previos y se evitó reprocesar para no duplicar movimientos.',
+                });
+            }
+
+            await client.query("UPDATE pagos SET estado = 'Validado' WHERE id = $1", [pagoId]);
             if (pago.es_ajuste_historico) {
                 const montoUsd = round2(parseFloat(String(pago.monto_usd || 0)));
                 const montoBsRaw = parseFloat(String(pago.monto_origen ?? 0));
@@ -1217,11 +1398,11 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 const montoBs = Number.isFinite(montoBsRaw) && montoBsRaw > 0 ? round2(montoBsRaw) : null;
                 const tasaCambio = Number.isFinite(tasaRaw) && tasaRaw > 0 ? tasaRaw : null;
                 if (montoUsd > 0) {
-                    await pool.query(
+                    await client.query(
                         'UPDATE propiedades SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2',
                         [montoUsd, pago.propiedad_id]
                     );
-                    await pool.query(
+                    await client.query(
                         'INSERT INTO historial_saldos_inmuebles (propiedad_id, tipo, monto, monto_bs, tasa_cambio, nota) VALUES ($1, $2, $3, $4, $5, $6)',
                         [
                             pago.propiedad_id,
@@ -1234,15 +1415,25 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                     );
                 }
             } else {
-                await aplicarPagoEnCascada(pool, pago);
+                await aplicarPagoEnCascada(client, pago, Boolean(pagosCols.nota));
             }
 
-            await pool.query('COMMIT');
+            await client.query('COMMIT');
+            txStarted = false;
             res.json({ status: 'success', message: 'Pago aprobado y saldos distribuidos en cascada correctamente.' });
         } catch (err: unknown) {
             const error = asError(err);
-            await pool.query('ROLLBACK');
-            res.status(500).json({ error: error.message });
+            if (txStarted) await client.query('ROLLBACK');
+            const msg = String(error.message || '');
+            const isBusinessError =
+                msg.includes('Pago no encontrado') ||
+                msg.includes('No autorizado') ||
+                msg.includes('fondos activos') ||
+                msg.includes('porcentajes de fondos') ||
+                msg.includes('tasa de cambio');
+            res.status(isBusinessError ? 400 : 500).json({ error: error.message });
+        } finally {
+            client.release();
         }
     });
 
@@ -1426,7 +1617,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 SELECT id, fondo_id, monto
                 FROM movimientos_fondos
                 WHERE referencia_id = $1
-                  AND UPPER(COALESCE(tipo, '')) IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
+                  AND UPPER(COALESCE(tipo, '')) IN ('INGRESO', 'INGRESO_PAGO', 'ABONO', 'ENTRADA', 'AJUSTE_INICIAL')
                 ORDER BY id ASC
                 `,
                 [pago.id]
@@ -1447,7 +1638,7 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 `
                 DELETE FROM movimientos_fondos
                 WHERE referencia_id = $1
-                  AND UPPER(COALESCE(tipo, '')) IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
+                  AND UPPER(COALESCE(tipo, '')) IN ('INGRESO', 'INGRESO_PAGO', 'ABONO', 'ENTRADA', 'AJUSTE_INICIAL')
                 `,
                 [pago.id]
             );
@@ -1876,6 +2067,17 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
             const gpfFechaRegistroExpr = cols.has('created_at') ? 'gpf.created_at' : 'pp.created_at';
             const gpfNotaExpr = cols.has('nota') ? 'COALESCE(NULLIF(TRIM(gpf.nota), \'\'), pp.nota)' : 'pp.nota';
             const gpfJoinPagoIdExpr = cols.has('pago_proveedor_id') ? 'gpf.pago_proveedor_id' : 'NULL';
+            const ppColsRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'pagos_proveedores'
+                  AND column_name IN ('es_ajuste_historico')
+                `
+            );
+            const ppCols = new Set(ppColsRes.rows.map((r) => r.column_name));
+            const ppHistoricoExpr = ppCols.has('es_ajuste_historico') ? 'COALESCE(pp.es_ajuste_historico, false)' : 'false';
             const bancoColsRes = await pool.query<IColumnNameRow>(
                 `
                 SELECT column_name
@@ -1938,7 +2140,8 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                         ${gpfRefExpr} AS referencia,
                         gpf.fecha_pago AS fecha_pago,
                         ${gpfFechaRegistroExpr} AS fecha_registro,
-                        ${gpfNotaExpr} AS nota
+                        ${gpfNotaExpr} AS nota,
+                        ${ppHistoricoExpr} AS es_ajuste_historico
                     FROM gpf_rank gpf
                     LEFT JOIN fondos f ON f.id = gpf.fondo_id
                     LEFT JOIN cuentas_bancarias cb ON cb.id = ${gpfCuentaExpr}
@@ -1962,7 +2165,8 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                         pp.referencia,
                         pp.fecha_pago,
                         pp.created_at AS fecha_registro,
-                        pp.nota
+                        pp.nota,
+                        ${ppHistoricoExpr} AS es_ajuste_historico
                     FROM pagos_proveedores pp
                     LEFT JOIN fondos f ON f.id = pp.fondo_id
                     LEFT JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
@@ -1985,12 +2189,13 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                     u.referencia,
                     u.fecha_pago,
                     u.fecha_registro,
-                    u.nota
+                    u.nota,
+                    u.es_ajuste_historico
                 FROM (
-                    SELECT id, fondo_id, fondo_nombre, banco_nombre, monto_bs, tasa_cambio, monto_usd, referencia, fecha_pago, fecha_registro, nota
+                    SELECT id, fondo_id, fondo_nombre, banco_nombre, monto_bs, tasa_cambio, monto_usd, referencia, fecha_pago, fecha_registro, nota, es_ajuste_historico
                     FROM detalles_gpf
                     UNION ALL
-                    SELECT id, fondo_id, fondo_nombre, banco_nombre, monto_bs, tasa_cambio, monto_usd, referencia, fecha_pago, fecha_registro, nota
+                    SELECT id, fondo_id, fondo_nombre, banco_nombre, monto_bs, tasa_cambio, monto_usd, referencia, fecha_pago, fecha_registro, nota, es_ajuste_historico
                     FROM detalles_pp_fallback
                 ) u
                 ORDER BY COALESCE(u.fecha_registro, u.fecha_pago) DESC, u.id DESC
@@ -2382,6 +2587,136 @@ const registerPagosRoutes = (app: Application, { pool, verifyToken, parseLocaleN
                 error.message.includes('Saldo insuficiente') ||
                 error.message.includes('Fondo') ||
                 error.message.includes('moneda válida');
+            return res.status(isBusinessError ? 400 : 500).json({ status: 'error', message: error.message });
+        }
+    });
+
+    app.post('/pagos-proveedores/historico', verifyToken, async (req: Request<{}, unknown, PagoProveedorHistoricoBody>, res: Response) => {
+        const { gasto_id, fecha, monto_usd, referencia, nota } = req.body;
+        let txStarted = false;
+
+        try {
+            const user = asAuthUser(req.user);
+            const gastoId = parseInt(String(gasto_id), 10);
+            if (!Number.isFinite(gastoId) || gastoId <= 0) {
+                return res.status(400).json({ status: 'error', message: 'gasto_id es requerido y debe ser válido.' });
+            }
+            if (!fecha) {
+                return res.status(400).json({ status: 'error', message: 'fecha es requerida.' });
+            }
+            const fechaPagoSafe = toIsoDate(fecha, 'fecha');
+
+            const montoUsd = round2(parseLocaleNumber(monto_usd));
+            if (!Number.isFinite(montoUsd) || montoUsd <= 0) {
+                return res.status(400).json({ status: 'error', message: 'monto_usd debe ser mayor a 0.' });
+            }
+
+            const condoRes = await pool.query<{ id: number }>(
+                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                [user.id]
+            );
+            const condoId = condoRes.rows[0]?.id;
+            if (!condoId) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado.' });
+            }
+
+            await pool.query('BEGIN');
+            txStarted = true;
+
+            const gastoUpdate = await pool.query<GastoMontoRow>(
+                `
+                UPDATE gastos
+                SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1
+                WHERE id = $2
+                  AND condominio_id = $3
+                RETURNING id, monto_usd, monto_pagado_usd
+                `,
+                [montoUsd, gastoId, condoId]
+            );
+
+            if (gastoUpdate.rows.length === 0) {
+                throw new Error('Gasto no encontrado.');
+            }
+
+            const gastoActualizado = gastoUpdate.rows[0];
+            const montoTotalGastoUsd = round2(parseLocaleNumber(gastoActualizado.monto_usd));
+            const montoPagadoGastoUsd = round2(parseLocaleNumber(gastoActualizado.monto_pagado_usd));
+            if (montoPagadoGastoUsd - montoTotalGastoUsd > 0.009) {
+                throw new Error('El pago histórico excede el monto total del gasto.');
+            }
+
+            const ppColsRes = await pool.query<IColumnNameRow>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'pagos_proveedores'
+                  AND column_name IN ('es_ajuste_historico')
+                `
+            );
+            const ppCols = new Set(ppColsRes.rows.map((r) => r.column_name));
+
+            const notaFinal = (nota || '').trim() || 'Regularización histórica de pago a proveedor';
+            const referenciaFinal = (referencia || '').trim() || 'HISTORICO';
+
+            const insertCols: string[] = [
+                'gasto_id',
+                'fondo_id',
+                'monto_bs',
+                'tasa_cambio',
+                'monto_usd',
+                'referencia',
+                'fecha_pago',
+                'nota',
+            ];
+            const insertVals: Array<number | string | null | boolean> = [
+                gastoId,
+                null,
+                null,
+                null,
+                montoUsd,
+                referenciaFinal,
+                fechaPagoSafe,
+                notaFinal,
+            ];
+
+            if (ppCols.has('es_ajuste_historico')) {
+                insertCols.push('es_ajuste_historico');
+                insertVals.push(true);
+            }
+
+            const placeholders = insertVals.map((_, idx) => `$${idx + 1}`).join(', ');
+            const pagoProveedorRes = await pool.query<IPagoInsertRow>(
+                `INSERT INTO pagos_proveedores (${insertCols.join(', ')}) VALUES (${placeholders}) RETURNING id`,
+                insertVals
+            );
+
+            const pagoProveedorId = pagoProveedorRes.rows[0]?.id;
+            if (!pagoProveedorId) {
+                throw new Error('No se pudo crear el pago proveedor histórico.');
+            }
+
+            await pool.query('COMMIT');
+            return res.status(200).json({
+                status: 'success',
+                pago_proveedor_id: pagoProveedorId,
+                gasto: {
+                    id: gastoId,
+                    monto_usd: montoTotalGastoUsd,
+                    monto_pagado_usd: montoPagadoGastoUsd,
+                    saldo_pendiente_usd: round2(Math.max(0, montoTotalGastoUsd - montoPagadoGastoUsd)),
+                },
+            });
+        } catch (err: unknown) {
+            const error = asError(err);
+            if (txStarted) await pool.query('ROLLBACK');
+            const isBusinessError =
+                error.message.includes('gasto_id') ||
+                error.message.includes('fecha') ||
+                error.message.includes('monto_usd') ||
+                error.message.includes('Condominio no encontrado') ||
+                error.message.includes('Gasto no encontrado') ||
+                error.message.includes('excede el monto total');
             return res.status(isBusinessError ? 400 : 500).json({ status: 'error', message: error.message });
         }
     });

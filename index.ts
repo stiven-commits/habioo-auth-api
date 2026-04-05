@@ -134,7 +134,9 @@ const propietarioRoutes: import('express').Router = require('./routes/propietari
 const app: Application = express();
 const PORT: number = Number(process.env.PORT || 3000);
 
-app.use(cors());
+app.use(cors({
+    exposedHeaders: ['x-habioo-refreshed-token', 'x-habioo-session-expires-at'],
+}));
 app.use(express.json());
 
 const uploadsDir: string = path.join(__dirname, 'uploads', 'gastos');

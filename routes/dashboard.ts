@@ -64,6 +64,7 @@ interface IPropConfig {
     iden: string;
     zona: number;
     saldo: number;
+    alicuota: number;
 }
 
 interface IGastoConfig {
@@ -695,6 +696,7 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
             const zonas = [zA.rows[0].id, zB.rows[0].id, zC.rows[0].id, zD.rows[0].id];
 
             const props: number[] = [];
+            const alicuotasSeed = [4.0, 5.0, 6.0];
             const propConfigs: IPropConfig[] = Array.from({ length: 20 }, (_, idx) => {
                 const i = idx + 1;
                 let saldo = 0;
@@ -705,15 +707,16 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                     iden: `TEST-${String(i).padStart(2, '0')}`,
                     zona: zonas[idx % zonas.length],
                     saldo,
+                    alicuota: alicuotasSeed[idx % alicuotasSeed.length],
                 };
             });
 
             for (const pc of propConfigs) {
                 const p = await pool.query<IIdRow>(
                     `INSERT INTO propiedades (condominio_id, identificador, alicuota, zona_id, saldo_actual)
-                     VALUES ($1, $2, 5.00, $3, $4)
+                     VALUES ($1, $2, $3, $4, $5)
                      RETURNING id`,
-                    [condoId, pc.iden, pc.zona, pc.saldo],
+                    [condoId, pc.iden, pc.alicuota, pc.zona, pc.saldo],
                 );
                 props.push(p.rows[0].id);
                 await pool.query('INSERT INTO propiedades_zonas (propiedad_id, zona_id) VALUES ($1, $2)', [p.rows[0].id, pc.zona]);
