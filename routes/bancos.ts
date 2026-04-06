@@ -28,6 +28,9 @@ interface ICuentaBancariaRow {
     nombre_banco: string | null;
     apodo: string | null;
     tipo: string | null;
+    moneda?: string | null;
+    swift?: string | null;
+    aba?: string | null;
     nombre_titular: string | null;
     cedula_rif: string | null;
     telefono: string | null;
@@ -92,6 +95,9 @@ interface CreateBancoBody {
     nombre_banco?: string | null;
     apodo?: string | null;
     tipo?: string | null;
+    moneda?: string | null;
+    swift?: string | null;
+    aba?: string | null;
     nombre_titular?: string | null;
     cedula_rif?: string | null;
     telefono?: string | null;
@@ -371,6 +377,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             nombre_banco,
             apodo,
             tipo,
+            moneda,
             nombre_titular,
             cedula_rif,
             telefono,
@@ -385,6 +392,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const nombreBancoSafe = asOptionalStringOrNull(nombre_banco);
             const apodoSafe = asOptionalStringOrNull(apodo);
             const tipoSafe = asOptionalStringOrNull(tipo);
+            const monedaSafe = String(moneda || '').trim().toUpperCase() === 'USD' ? 'USD' : 'BS';
+            const swiftSafe = String(req.body.swift || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 11) || null;
+            const abaSafe = String(req.body.aba || '').replace(/\D/g, '').slice(0, 9) || null;
             const nombreTitularSafe = asOptionalStringOrNull(nombre_titular);
             const cedulaRifSafe = asOptionalStringOrNull(cedula_rif);
             const telefonoSafe = asOptionalStringOrNull(telefono);
@@ -416,6 +426,18 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const insertCols: string[] = ['condominio_id', 'numero_cuenta', 'nombre_banco', 'apodo', 'tipo', 'nombre_titular', 'cedula_rif', 'telefono'];
             const insertVals: unknown[] = [condoId, numeroCuentaSafe || '', nombreBancoSafe || '', apodoSafe, tipoSafe, nombreTitularSafe || '', cedulaRifSafe || '', telefonoSafe || ''];
 
+            if (hasCuentaCol('moneda')) {
+                insertCols.push('moneda');
+                insertVals.push(monedaSafe);
+            }
+            if (hasCuentaCol('swift')) {
+                insertCols.push('swift');
+                insertVals.push(swiftSafe);
+            }
+            if (hasCuentaCol('aba')) {
+                insertCols.push('aba');
+                insertVals.push(abaSafe);
+            }
             if (hasCuentaCol('acepta_transferencia')) {
                 insertCols.push('acepta_transferencia');
                 insertVals.push(canales.aceptaTransferencia);
@@ -451,6 +473,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             nombre_banco,
             apodo,
             tipo,
+            moneda,
             nombre_titular,
             cedula_rif,
             telefono,
@@ -472,6 +495,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const nombreBancoSafe = asOptionalStringOrNull(nombre_banco);
             const apodoSafe = asOptionalStringOrNull(apodo);
             const tipoSafe = asOptionalStringOrNull(tipo);
+            const monedaSafe = String(moneda || '').trim().toUpperCase() === 'USD' ? 'USD' : 'BS';
+            const swiftSafe = String(req.body.swift || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 11) || null;
+            const abaSafe = String(req.body.aba || '').replace(/\D/g, '').slice(0, 9) || null;
             const nombreTitularSafe = asOptionalStringOrNull(nombre_titular);
             const cedulaRifSafe = asOptionalStringOrNull(cedula_rif);
             const telefonoSafe = asOptionalStringOrNull(telefono);
@@ -516,6 +542,18 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 telefonoSafe || '',
             ];
 
+            if (hasCuentaCol('moneda')) {
+                updateSets.push(`moneda = $${updateVals.length + 1}`);
+                updateVals.push(monedaSafe);
+            }
+            if (hasCuentaCol('swift')) {
+                updateSets.push(`swift = $${updateVals.length + 1}`);
+                updateVals.push(swiftSafe);
+            }
+            if (hasCuentaCol('aba')) {
+                updateSets.push(`aba = $${updateVals.length + 1}`);
+                updateVals.push(abaSafe);
+            }
             if (hasCuentaCol('acepta_transferencia')) {
                 updateSets.push(`acepta_transferencia = $${updateVals.length + 1}`);
                 updateVals.push(canales.aceptaTransferencia);

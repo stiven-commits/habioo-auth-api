@@ -1767,6 +1767,51 @@ const registerPropiedadesRoutes = (app: Application, { pool, verifyToken }: Auth
                     'UPDATE gastos SET monto_pagado_usd = COALESCE(monto_pagado_usd, 0) + $1 WHERE id = $2',
                     [montoNum, gasto_extra_id]
                 );
+                // Registrar en la cuenta bancaria principal (100% al fondo operativo de esa cuenta)
+                if (cuenta_bancaria_id) {
+                    const r2ge = (n: number) => Math.round(n * 100) / 100;
+                    const tasaNumGe = parseFloat(String(tasa_cambio || '1')) || 1;
+                    const notaMovimiento = historialId
+                        ? `${notaBase} | ajuste_historial_id:${historialId}`
+                        : notaBase;
+                    const fondoRes = await pool.query<{ id: number; moneda: string }>(
+                        'SELECT id, moneda FROM fondos WHERE cuenta_bancaria_id = $1 AND activo = true ORDER BY es_operativo DESC, id ASC LIMIT 1',
+                        [cuenta_bancaria_id]
+                    );
+                    if (fondoRes.rows.length > 0) {
+                        const f = fondoRes.rows[0];
+                        const monedaFondo = String(f.moneda || '').toUpperCase();
+                        let montoFondo = montoNum;
+                        if (monedaFondo === 'BS' || monedaFondo === 'BS.') {
+                            montoFondo = parseFloat(String(monto_bs || '0')) > 0
+                                ? r2ge(parseFloat(String(monto_bs)))
+                                : r2ge(montoNum * tasaNumGe);
+                        }
+                        // Reutilizar resolveMovimientoFondoTipo inline
+                        let tipoMovimiento = 'AJUSTE_INICIAL';
+                        try {
+                            const rConstraint = await pool.query<{ def: string }>(`
+                                SELECT pg_get_constraintdef(oid) AS def
+                                FROM pg_constraint
+                                WHERE conname = 'movimientos_fondos_tipo_check'
+                                LIMIT 1
+                            `);
+                            const def = rConstraint.rows?.[0]?.def || '';
+                            const matches = [...def.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+                            const allowed = new Set(matches);
+                            const preferred = ['AJUSTE_INICIAL', 'INGRESO', 'ABONO', 'ENTRADA'];
+                            const selected = preferred.find((t) => allowed.has(t));
+                            if (selected) tipoMovimiento = selected;
+                            else if (matches.length > 0) tipoMovimiento = matches[0];
+                        } catch (_) { /* usa fallback */ }
+                        await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [montoFondo, f.id]);
+                        await pool.query(
+                            `INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota, fecha)
+                             VALUES ($1, $2, $3, $4, $5, (COALESCE($6::date, CURRENT_DATE) + time '12:00:00'))`,
+                            [f.id, tipoMovimiento, montoFondo, tasaNumGe, notaMovimiento, fechaOperacionYmd]
+                        );
+                    }
+                }
             }
             
             await pool.query('COMMIT');
