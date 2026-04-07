@@ -12,22 +12,24 @@ const parseLocaleNumber = (value: unknown, fallback = 0): number => {
     let normalized = raw;
 
     // Caso: solo punto (sin coma)
-    // Ej: "471.700" -> ¿es 471,70 (punto decimal) o 471700 (punto de miles)?
-    // Heurística: si la parte entera (antes del punto) tiene <= 3 dígitos,
-    // y la parte decimal tiene 1-3 dígitos, asumir punto decimal.
+    // Ej: "471.700" -> ¿es 471.70 (punto decimal) o 471700 (punto de miles)?
+    // Heurística: los grupos de miles siempre tienen exactamente 3 dígitos.
+    // Si la parte decimal tiene 1 o 2 dígitos, SIEMPRE es separador decimal (ej: 66488.80).
+    // Si la parte decimal tiene 3 dígitos y la entera > 3 dígitos, asumir punto de miles.
     if (hasDot && !hasComma) {
         const parts = raw.split('.');
         if (parts.length === 2) {
             const integerPart = parts[0].replace(/^-/, ''); // remover signo negativo si existe
             const decimalPart = parts[1];
-            
-            // Si la parte entera tiene 3 o menos dígitos y la decimal tiene 1-3 dígitos,
-            // es probable que sea formato decimal (ej: 471.700 = 471,700)
-            if (integerPart.length <= 3 && decimalPart.length >= 1 && decimalPart.length <= 3) {
+
+            // 1 o 2 dígitos decimales → siempre separador decimal (miles nunca tienen < 3 dígitos)
+            // 3 dígitos decimales con parte entera <= 3 → asumir decimal (ej: 1.234)
+            // 3 dígitos decimales con parte entera > 3 → asumir miles (ej: 66.488 → 66488)
+            if (decimalPart.length <= 2 || integerPart.length <= 3) {
                 // Mantener el punto como separador decimal
                 normalized = raw;
             } else {
-                // Asumir punto de miles (ej: 1.234.567)
+                // Asumir punto de miles
                 normalized = raw.replace(/\./g, '');
             }
         } else {
