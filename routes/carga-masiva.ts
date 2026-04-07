@@ -476,6 +476,15 @@ const registerCargaMasivaRoutes = (
     app.post(
         '/chat/preview-carga-pagos',
         verifyToken,
+        (req: Request, res: Response, next: NextFunction) => {
+            upload.single('archivo')(req, res, (err: unknown) => {
+                if (err) {
+                    const msg = err instanceof Error ? err.message : 'Tipo de archivo no permitido.';
+                    return res.status(400).json({ error: msg, mensaje_usuario: msg });
+                }
+                next();
+            });
+        },
         async (req: Request, res: Response) => {
             try {
                 const user = asAuthUser(req.user);
