@@ -48,6 +48,7 @@ interface IFondoRow {
     es_operativo: boolean;
     saldo_actual: string | number;
     activo: boolean;
+    cuenta_bancaria_id: number;
 }
 
 interface ICuentaBancariaRow {
@@ -204,7 +205,7 @@ const registerCargaMasivaRoutes = (
 
             const [fondosRes, cuentasRes, bancosRes] = await Promise.all([
                 pool.query<IFondoRow>(
-                    `SELECT f.id, f.nombre, f.moneda, f.porcentaje_asignacion, f.es_operativo, f.saldo_actual, f.activo
+                    `SELECT f.id, f.nombre, f.moneda, f.porcentaje_asignacion, f.es_operativo, f.saldo_actual, f.activo, f.cuenta_bancaria_id
                      FROM fondos f
                      JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
                      WHERE cb.condominio_id = $1 AND f.activo = true
@@ -234,6 +235,7 @@ const registerCargaMasivaRoutes = (
                 porcentaje: parseFloat(String(f.porcentaje_asignacion || 0)),
                 es_operativo: f.es_operativo,
                 moneda: f.moneda,
+                cuenta_bancaria_id: f.cuenta_bancaria_id,
             }));
 
             // Las columnas requeridas y validaciones se leen desde esta misma fuente de verdad.
@@ -468,6 +470,199 @@ const registerCargaMasivaRoutes = (
     });
 
     // ══════════════════════════════════════════════════════════════════════════
+    // POST /chat/preview-carga-pagos
+    // Valida el Excel y devuelve la preview directamente (sin pasar por n8n)
+    // ══════════════════════════════════════════════════════════════════════════
+    app.post(
+        '/chat/preview-carga-pagos',
+        verifyToken,
+        async (req: Request, res: Response) => {
+            try {
+                const user = asAuthUser(req.user);
+                const condo = await getCondominioByAdminUserId(pool, user.id);
+                if (!condo) return res.status(404).json({ error: 'Condominio no encontrado.' });
+                if (isJuntaGeneralTipo(condo.tipo)) {
+                    return res.status(403).json({ error: 'La Junta General no puede cargar pagos.' });
+                }
+
+                const archivo = (req as unknown as { file?: Express.Multer.File }).file;
+                if (!archivo) return res.status(400).json({ error: 'No se adjuntó ningún archivo.' });
+
+                // Parsear Excel
+                const workbook = XLSX.read(archivo.buffer, { type: 'buffer', cellDates: true });
+                const sheetName = workbook.SheetNames[0];
+                if (!sheetName) return res.status(400).json({ error: 'El archivo Excel está vacío.' });
+
+                const sheet = workbook.Sheets[sheetName];
+                const filasRaw = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+
+                if (!filasRaw.length) {
+                    return res.status(400).json({ error: 'La hoja Excel no contiene datos.' });
+                }
+
+                // Obtener fondos del condominio
+                const fondosRes = await pool.query<{ id: number; nombre: string; moneda: string }>(
+                    `SELECT f.id, f.nombre, f.moneda FROM fondos f
+                     JOIN cuentas_bancarias cb ON cb.id = f.cuenta_bancaria_id
+                     WHERE cb.condominio_id = $1 AND f.activo = true
+                     ORDER BY f.es_operativo DESC, f.nombre ASC`,
+                    [condo.id]
+                );
+                const fondos = fondosRes.rows.map(f => ({
+                    id: f.id,
+                    nombre: f.nombre,
+                    moneda: f.moneda
+                }));
+
+                // Validar filas
+                const pagosValidos: Array<{
+                    fila: number;
+                    fecha_pago: string;
+                    referencia: string;
+                    inmueble: string;
+                    banco_origen: string;
+                    monto_bs: number;
+                    tasa_cambio: number;
+                    monto_usd: number;
+                    fondo_id: number | null;
+                    modo: string;
+                }> = [];
+                const errores: Array<{
+                    fila: number;
+                    referencia: string;
+                    inmueble: string;
+                    errores: string[];
+                    valid_funds: string[];
+                }> = [];
+
+                const norm = (s: string) => s.trim().toLowerCase()
+                    .replace(/[áàä]/g, 'a').replace(/[éèë]/g, 'e')
+                    .replace(/[íìï]/g, 'i').replace(/[óòö]/g, 'o')
+                    .replace(/[úùü]/g, 'u').replace(/ñ/g, 'n');
+
+                const findVal = (obj: Record<string, unknown>, names: string[]): unknown => {
+                    const keys = Object.keys(obj);
+                    for (const n of names) {
+                        const nk = norm(n);
+                        const k = keys.find(kk => norm(kk) === nk);
+                        if (k !== undefined && obj[k] !== undefined && obj[k] !== '') return obj[k];
+                    }
+                    return undefined;
+                };
+
+                const parseDate = (val: unknown): string | null => {
+                    if (val === null || val === undefined) return null;
+                    if (val instanceof Date) {
+                        const y = val.getFullYear();
+                        const m = String(val.getMonth() + 1).padStart(2, '0');
+                        const d = String(val.getDate()).padStart(2, '0');
+                        return `${y}-${m}-${d}`;
+                    }
+                    const s = String(val).trim();
+                    const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+                    if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+                    if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+                    return null;
+                };
+
+                for (let i = 0; i < filasRaw.length; i++) {
+                    const f = filasRaw[i];
+                    const filaErrores: string[] = [];
+                    const filaNum = i + 1;
+
+                    const fechaRaw = findVal(f, ['Fecha operacion', 'Fecha operación', 'Fecha']);
+                    const referencia = String(findVal(f, ['Referencia', 'Ref']) ?? '').trim();
+                    const inmueble = String(findVal(f, ['Inmueble', 'Unidad']) ?? '').trim();
+                    const bancoOrigen = String(findVal(f, ['Banco origen', 'Banco Origen', 'Banco']) ?? '').trim();
+                    const montoRaw = findVal(f, ['Pago', 'Monto', 'Monto Bs', 'Monto BS']);
+                    const tasaRaw = findVal(f, ['Tasa', 'Tasa BCV', 'Tasa Cambio']);
+                    const fondoNombre = String(findVal(f, ['Fondo']) ?? '').trim();
+
+                    const fecha_pago = parseDate(fechaRaw);
+                    if (!fecha_pago) filaErrores.push('Fecha inválida o vacía');
+
+                    if (!referencia) filaErrores.push('Referencia vacía');
+                    if (!inmueble) filaErrores.push('Inmueble vacío');
+                    if (!bancoOrigen) filaErrores.push('Banco origen vacío');
+
+                    const montoStr = String(montoRaw ?? '').replace(/\./g, '').replace(',', '.');
+                    const monto = parseFloat(montoStr);
+                    if (isNaN(monto) || monto <= 0) filaErrores.push('Monto inválido o debe ser > 0');
+
+                    const tasaStr = String(tasaRaw ?? '').replace(/\./g, '').replace(',', '.');
+                    const tasa = parseFloat(tasaStr);
+                    if (isNaN(tasa) || tasa < 1) filaErrores.push('Tasa inválida (debe ser >= 1)');
+
+                    let modo = 'distribuido';
+                    let fondoId: number | null = null;
+                    const validFunds: string[] = [];
+
+                    if (fondoNombre && fondos.length > 0) {
+                        const fEnc = fondos.find(fd => norm(fd.nombre) === norm(fondoNombre));
+                        if (!fEnc) {
+                            validFunds.push(...fondos.map(fd => fd.nombre));
+                            filaErrores.push(`Fondo "${fondoNombre}" no existe. Válidos: ${fondos.map(fd => fd.nombre).join(', ')}`);
+                        } else {
+                            modo = 'fondo_unico';
+                            fondoId = fEnc.id;
+                        }
+                    }
+
+                    if (filaErrores.length > 0) {
+                        errores.push({
+                            fila: filaNum,
+                            referencia,
+                            inmueble,
+                            errores: filaErrores,
+                            valid_funds: validFunds
+                        });
+                    } else if (fecha_pago) {
+                        const montoUsd = tasa > 0 ? Math.round((monto / tasa) * 100) / 100 : 0;
+                        pagosValidos.push({
+                            fila: filaNum,
+                            fecha_pago,
+                            referencia,
+                            inmueble,
+                            banco_origen: bancoOrigen,
+                            monto_bs: monto,
+                            tasa_cambio: tasa,
+                            monto_usd: montoUsd,
+                            fondo_id: fondoId,
+                            modo
+                        });
+                    }
+                }
+
+                let msg = '';
+                if (pagosValidos.length > 0 && errores.length === 0) {
+                    msg = `✅ ${pagosValidos.length} pago(s) válido(s) encontrado(s). Revisa los datos y confirma la carga.`;
+                } else if (pagosValidos.length > 0) {
+                    msg = `⚠️ ${pagosValidos.length} pago(s) válido(s), ${errores.length} con error(es). Revisa los datos y confirma.`;
+                } else {
+                    msg = `❌ No se encontraron pagos válidos (${errores.length} errores).`;
+                }
+
+                res.json({
+                    tipo: 'preview',
+                    mensaje: msg,
+                    preview: {
+                        pagos: pagosValidos,
+                        errores,
+                        totalFilas: filasRaw.length
+                    },
+                    exitosos: pagosValidos.length,
+                    fallidos: errores.length,
+                    total: filasRaw.length,
+                    errores
+                });
+            } catch (err) {
+                console.error('[POST /chat/preview-carga-pagos]', err);
+                res.status(500).json({ error: 'Error interno al procesar el archivo.' });
+            }
+        },
+    );
+
+    // ══════════════════════════════════════════════════════════════════════════
     // POST /chat/subir-excel-pagos
     // Recibe el Excel del usuario autenticado desde el chat widget,
     // lo convierte a JSON y lo envía al webhook de n8n para validación y carga.
@@ -572,6 +767,78 @@ const registerCargaMasivaRoutes = (
             } catch (err) {
                 console.error('[POST /chat/subir-excel-pagos]', err);
                 res.status(500).json({ error: 'Error interno al procesar el archivo.' });
+            }
+        },
+    );
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // POST /chat/confirmar-carga-pagos
+    // Recibe los pagos validados desde el frontend (después de la vista previa)
+    // y los guarda en la base de datos.
+    // ══════════════════════════════════════════════════════════════════════════
+    app.post(
+        '/chat/confirmar-carga-pagos',
+        verifyToken,
+        async (req: Request<{}, unknown, { pagos: Array<{ fecha_pago: string; referencia: string; inmueble: string; banco_origen: string; monto_bs: number; tasa_cambio: number; modo?: string; fondo_id?: number }> }>, res: Response) => {
+            try {
+                const user = asAuthUser(req.user);
+                const condo = await getCondominioByAdminUserId(pool, user.id);
+                if (!condo) return res.status(404).json({ error: 'Condominio no encontrado.' });
+                if (isJuntaGeneralTipo(condo.tipo)) {
+                    return res.status(403).json({ error: 'La Junta General no puede cargar pagos.' });
+                }
+
+                const pagos = req.body?.pagos;
+                if (!Array.isArray(pagos) || pagos.length === 0) {
+                    return res.status(400).json({ error: 'No hay pagos para registrar.' });
+                }
+
+                // Obtener cuentas bancarias del condominio para asignar la cuenta
+                const cuentasRes = await pool.query<{ id: number }>(
+                    'SELECT id FROM cuentas_bancarias WHERE condominio_id = $1 AND activo = true ORDER BY apodo LIMIT 1',
+                    [condo.id]
+                );
+                if (!cuentasRes.rows.length) {
+                    return res.status(400).json({ error: 'No hay cuentas bancarias configuradas para este condominio.' });
+                }
+                const cuentaBancariaId = cuentasRes.rows[0].id;
+
+                // Usar el mismo endpoint de carga masiva que usa n8n
+                const cargaMasivaUrl = String(process.env.BACKEND_URL ?? 'http://localhost:3000').trim() + '/pagos/carga-masiva';
+                const serviceKey = String(process.env.CHAT_SERVICE_KEY ?? '').trim();
+
+                const payload = JSON.stringify({
+                    pagos: pagos.map(p => ({
+                        fecha_pago: p.fecha_pago,
+                        referencia: p.referencia,
+                        inmueble: p.inmueble,
+                        banco_origen: p.banco_origen,
+                        monto_bs: p.monto_bs,
+                        tasa_cambio: p.tasa_cambio,
+                        modo: p.modo || 'distribuido',
+                        fondo_id: p.fondo_id || undefined,
+                    })),
+                    condominio_id: condo.id,
+                    cuenta_bancaria_id: cuentaBancariaId,
+                });
+
+                const cargaResp = await fetchJson(cargaMasivaUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-chat-service-key': serviceKey,
+                    },
+                    body: payload,
+                });
+
+                if (cargaResp.status >= 400) {
+                    return res.status(502).json({ error: 'Error al registrar los pagos.', detalle: cargaResp.body });
+                }
+
+                res.json(cargaResp.body);
+            } catch (err) {
+                console.error('[POST /chat/confirmar-carga-pagos]', err);
+                res.status(500).json({ error: 'Error interno al registrar los pagos.' });
             }
         },
     );
