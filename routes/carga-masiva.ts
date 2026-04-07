@@ -549,6 +549,98 @@ const registerCargaMasivaRoutes = (
                     .replace(/[íìï]/g, 'i').replace(/[óòö]/g, 'o')
                     .replace(/[úùü]/g, 'u').replace(/ñ/g, 'n');
 
+                // Lista de bancos venezolanos conocidos para normalización
+                const KNOWN_BANKS = [
+                    'Banesco', 'BBVA Provincial', 'Provincial', 'Mercantil', 'Mercantil Panamá',
+                    'Bancamiga', 'Banco del Tesoro', 'Banco de Venezuela', 'BDV',
+                    'Banco Nacional de Crédito', 'BNC', '100% Banco', 'Banco Exterior',
+                    'Banco Plaza', 'Banco Caroní', 'Banco Bicentenario', 'Banco del Caribe',
+                    'Banco Fondo Común', 'BFC', 'Banco Sofitasa', 'Mi Banco', 'Banco Activo',
+                    'Banco Venezolano de Crédito', 'BVC', 'Banco Occidental de Descuento', 'BOD',
+                    'Banco Bicentenario del Pueblo', 'Banplus', 'Banco de la Gente Emprendedora',
+                    'Bancrecer', 'Banco Internacional de Desarrollo', 'BID',
+                ];
+
+                const normalizeBankName = (rawName: string): string => {
+                    if (!rawName) return '';
+                    const raw = rawName.trim();
+                    const rawNorm = norm(raw);
+
+                    // Exact match
+                    const exact = KNOWN_BANKS.find(b => norm(b) === rawNorm);
+                    if (exact) return exact;
+
+                    // Partial match - check if any known bank contains or is contained in the input
+                    for (const bank of KNOWN_BANKS) {
+                        const bankNorm = norm(bank);
+                        if (bankNorm.includes(rawNorm) || rawNorm.includes(bankNorm)) {
+                            return bank;
+                        }
+                    }
+
+                    // Check abbreviations
+                    const abbrevMap: Record<string, string> = {
+                        'bdv': 'Banco de Venezuela',
+                        'bnc': 'Banco Nacional de Crédito',
+                        'bfc': 'Banco Fondo Común',
+                        'bod': 'Banco Occidental de Descuento',
+                        'bid': 'Banco Internacional de Desarrollo',
+                        'bvc': 'Banco Venezolano de Crédito',
+                    };
+                    if (abbrevMap[rawNorm]) return abbrevMap[rawNorm];
+
+                    return raw;
+                };
+
+                // Parse number - handles both Venezuelan and English formats
+                // Venezuelan: "1.500,00" → 1500.00 (dot=thousands, comma=decimal)
+                // English: "1,500.00" → 1500.00 (comma=thousands, dot=decimal)
+                // Also handles: "443.259" → 443.259 (dot as decimal for rates)
+                const parseNumber = (val: unknown): number => {
+                    if (val === null || val === undefined || val === '') return NaN;
+                    if (typeof val === 'number') return val;
+
+                    let raw = String(val).trim();
+                    if (!raw) return NaN;
+
+                    const hasComma = raw.includes(',');
+                    const hasDot = raw.includes('.');
+
+                    if (hasComma && hasDot) {
+                        // Both present: determine format by position of last separator
+                        const lastComma = raw.lastIndexOf(',');
+                        const lastDot = raw.lastIndexOf('.');
+                        if (lastComma > lastDot) {
+                            // Venezuelan: "1.234,56" → remove dots, comma→dot
+                            return parseFloat(raw.replace(/\./g, '').replace(',', '.'));
+                        } else {
+                            // English: "1,234.56" → remove commas
+                            return parseFloat(raw.replace(/,/g, ''));
+                        }
+                    } else if (hasComma) {
+                        // Only comma: treat as decimal separator
+                        return parseFloat(raw.replace(',', '.'));
+                    } else if (hasDot) {
+                        // Only dot: could be decimal ("443.259") or thousands ("1.234")
+                        // Heuristic: if removing dots gives a number > 10,000 (unlikely for rates/prices),
+                        // treat dot as decimal instead
+                        const asThousands = parseFloat(raw.replace(/\./g, ''));
+                        const asDecimal = parseFloat(raw);
+
+                        // If "thousands" interpretation gives unreasonable value (> 100k), use decimal
+                        if (asThousands > 100000 && Number.isFinite(asDecimal)) {
+                            return asDecimal;
+                        }
+                        // If "thousands" gives reasonable value, use it
+                        if (Number.isFinite(asThousands)) {
+                            return asThousands;
+                        }
+                        return asDecimal;
+                    }
+
+                    return parseFloat(raw);
+                };
+
                 const findVal = (obj: Record<string, unknown>, names: string[]): unknown => {
                     const keys = Object.keys(obj);
                     for (const n of names) {
@@ -582,7 +674,7 @@ const registerCargaMasivaRoutes = (
                     const fechaRaw = findVal(f, ['Fecha operacion', 'Fecha operación', 'Fecha']);
                     const referencia = String(findVal(f, ['Referencia', 'Ref']) ?? '').trim();
                     const inmueble = String(findVal(f, ['Inmueble', 'Unidad']) ?? '').trim();
-                    const bancoOrigen = String(findVal(f, ['Banco origen', 'Banco Origen', 'Banco']) ?? '').trim();
+                    const bancoOrigenRaw = String(findVal(f, ['Banco origen', 'Banco Origen', 'Banco']) ?? '').trim();
                     const montoRaw = findVal(f, ['Pago', 'Monto', 'Monto Bs', 'Monto BS']);
                     const tasaRaw = findVal(f, ['Tasa', 'Tasa BCV', 'Tasa Cambio']);
                     const fondoNombre = String(findVal(f, ['Fondo']) ?? '').trim();
@@ -592,14 +684,16 @@ const registerCargaMasivaRoutes = (
 
                     if (!referencia) filaErrores.push('Referencia vacía');
                     if (!inmueble) filaErrores.push('Inmueble vacío');
+
+                    // Normalizar nombre del banco
+                    const bancoOrigen = normalizeBankName(bancoOrigenRaw);
                     if (!bancoOrigen) filaErrores.push('Banco origen vacío');
 
-                    const montoStr = String(montoRaw ?? '').replace(/\./g, '').replace(',', '.');
-                    const monto = parseFloat(montoStr);
+                    // Parsear monto y tasa con la nueva función inteligente
+                    const monto = parseNumber(montoRaw);
                     if (isNaN(monto) || monto <= 0) filaErrores.push('Monto inválido o debe ser > 0');
 
-                    const tasaStr = String(tasaRaw ?? '').replace(/\./g, '').replace(',', '.');
-                    const tasa = parseFloat(tasaStr);
+                    const tasa = parseNumber(tasaRaw);
                     if (isNaN(tasa) || tasa < 1) filaErrores.push('Tasa inválida (debe ser >= 1)');
 
                     let modo = 'distribuido';
