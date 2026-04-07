@@ -106,6 +106,22 @@ interface JuntasRoutesRegistrar {
     (app: Application, deps: { pool: Pool; verifyToken: VerifyTokenMiddleware }): void;
 }
 
+interface CargaMasivaRoutesRegistrar {
+    (
+        app: Application,
+        deps: {
+            pool: Pool;
+            verifyToken: VerifyTokenMiddleware;
+            parseLocaleNumber: ParseLocaleNumber;
+            getPagosOptionalColumns: GetPagosOptionalColumns;
+        },
+    ): void;
+}
+
+interface N8NRoutesRegistrar {
+    (app: Application, deps: { verifyToken: VerifyTokenMiddleware }): void;
+}
+
 const { pool }: { pool: Pool } = require('./config/db');
 const { verifyToken }: { verifyToken: VerifyTokenMiddleware } = require('./middleware/verifyToken');
 const { parseLocaleNumber }: { parseLocaleNumber: ParseLocaleNumber } = require('./utils/number');
@@ -128,6 +144,8 @@ const { registerChatRoutes }: { registerChatRoutes: ChatRoutesRegistrar } = requ
 const { registerAlquileresRoutes }: { registerAlquileresRoutes: AlquileresRoutesRegistrar } = require('./routes/alquileres');
 const { registerSupportRoutes }: { registerSupportRoutes: SupportRoutesRegistrar } = require('./routes/support');
 const { registerJuntasRoutes }: { registerJuntasRoutes: JuntasRoutesRegistrar } = require('./routes/juntas');
+const { registerCargaMasivaRoutes }: { registerCargaMasivaRoutes: CargaMasivaRoutesRegistrar } = require('./routes/carga-masiva');
+const { registerN8NRoutes }: { registerN8NRoutes: N8NRoutesRegistrar } = require('./routes/n8n');
 const perfilRoutes: import('express').Router = require('./routes/perfil');
 const propietarioRoutes: import('express').Router = require('./routes/propietario');
 
@@ -189,6 +207,8 @@ registerChatRoutes(app, { pool, verifyToken });
 registerAlquileresRoutes(app, { pool, verifyToken });
 registerSupportRoutes(app, { pool, verifyToken });
 registerJuntasRoutes(app, { pool, verifyToken });
+registerCargaMasivaRoutes(app, { pool, verifyToken, parseLocaleNumber, getPagosOptionalColumns });
+registerN8NRoutes(app, { verifyToken });
 app.use('/api/perfil', perfilRoutes);
 app.use('/api/propietario', propietarioRoutes);
 
