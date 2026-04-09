@@ -77,7 +77,7 @@ interface PagoFilaInput {
     banco_origen: string;
     monto_bs: number;
     tasa_cambio: number;
-    modo: 'distribuido' | 'fondo_unico';
+    modo: 'distribuido' | 'fondo_unico' | 'extra';
     fondo_id?: number;            // solo si modo === 'fondo_unico'
     nota?: string;
 }
@@ -385,7 +385,11 @@ const registerCargaMasivaRoutes = (
                 );
 
                 // -- Distribuir a fondos --
-                if (fila.modo === 'fondo_unico' && fila.fondo_id) {
+                if (fila.modo === 'extra') {
+                    // Modo extra: no se distribuye en fondos, ingresa directo a la cuenta bancaria
+                    // El pago queda registrado sin fondo, visible en el libro mayor como "Tránsito / Extra"
+                    // No se inserta en movimientos_fondos
+                } else if (fila.modo === 'fondo_unico' && fila.fondo_id) {
                     // 100% al fondo indicado
                     await client.query(
                         'UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2',
@@ -534,6 +538,7 @@ const registerCargaMasivaRoutes = (
                     tasa_cambio: number;
                     monto_usd: number;
                     fondo_id: number | null;
+                    fondo: string | null;
                     modo: string;
                 }> = [];
                 const errores: Array<{
@@ -549,16 +554,15 @@ const registerCargaMasivaRoutes = (
                     .replace(/[íìï]/g, 'i').replace(/[óòö]/g, 'o')
                     .replace(/[úùü]/g, 'u').replace(/ñ/g, 'n');
 
-                // Lista de bancos venezolanos conocidos para normalización
+                // Lista de bancos venezolanos conocida (sincronizada con frontend ModalRegistrarPago.tsx)
                 const KNOWN_BANKS = [
-                    'Banesco', 'BBVA Provincial', 'Provincial', 'Mercantil', 'Mercantil Panamá',
-                    'Bancamiga', 'Banco del Tesoro', 'Banco de Venezuela', 'BDV',
-                    'Banco Nacional de Crédito', 'BNC', '100% Banco', 'Banco Exterior',
-                    'Banco Plaza', 'Banco Caroní', 'Banco Bicentenario', 'Banco del Caribe',
-                    'Banco Fondo Común', 'BFC', 'Banco Sofitasa', 'Mi Banco', 'Banco Activo',
-                    'Banco Venezolano de Crédito', 'BVC', 'Banco Occidental de Descuento', 'BOD',
-                    'Banco Bicentenario del Pueblo', 'Banplus', 'Banco de la Gente Emprendedora',
-                    'Bancrecer', 'Banco Internacional de Desarrollo', 'BID',
+                    'Banco de Venezuela (BDV)', 'Banesco Banco Universal', 'Banco Mercantil', 'BBVA Provincial',
+                    'Banco Nacional de Crédito (BNC)', 'Bancamiga Banco Universal', 'Banplus Banco Universal',
+                    'Banco del Tesoro', 'Banco del Caribe (Bancaribe)', 'Banco Fondo Común (BFC)', 'Banco Caroní',
+                    'Banco Activo', 'Banco Venezolano de Crédito (BVC)', 'Banco Sofitasa', '100% Banco',
+                    'Delsur Banco Universal', 'Banco Agrícola de Venezuela', 'Banco Bicentenario', 'Banco Plaza',
+                    'Banco Exterior', 'Banco de la Fuerza Armada Nacional Bolivariana (Banfanb)',
+                    'Banco Digital de los Trabajadores (BDT)', 'N58 Banco Digital', 'Bancrecer', 'Bangente', 'R4 Banco Microfinanciero',
                 ];
 
                 const normalizeBankName = (rawName: string): string => {
@@ -590,6 +594,27 @@ const registerCargaMasivaRoutes = (
                     if (abbrevMap[rawNorm]) return abbrevMap[rawNorm];
 
                     return raw;
+                };
+
+                // Obtener encabezados y sus índices para lectura directa de celdas
+                const headersRaw = XLSX.utils.sheet_to_json(sheet, { header: 1, range: 0 });
+                const headerRow = Array.isArray(headersRaw) && headersRaw.length > 0
+                    ? (headersRaw[0] as unknown[])
+                    : [];
+
+                // Encontrar índice de la columna "Pago" para lectura del valor formateado
+                const pagoColIndex = headerRow.findIndex((h: unknown) => {
+                    const hk = norm(String(h ?? ''));
+                    return ['pago', 'monto', 'monto bs', 'monto bs'].includes(hk);
+                });
+
+                // Función para obtener el valor formateado (w) de una celda específica
+                const getFormattedCellValue = (rowIndex: number, colIndex: number): string | null => {
+                    const cellRef = XLSX.utils.encode_cell({ r: rowIndex + 1, c: colIndex }); // +1 because row 0 is header
+                    const cell = sheet[cellRef];
+                    if (!cell) return null;
+                    // Usar 'w' (formatted text) si existe, sino 'v' (raw value)
+                    return cell.w != null ? String(cell.w) : (cell.v != null ? String(cell.v) : null);
                 };
 
                 // Parse number - handles both Venezuelan and English formats
@@ -689,19 +714,64 @@ const registerCargaMasivaRoutes = (
                     const bancoOrigen = normalizeBankName(bancoOrigenRaw);
                     if (!bancoOrigen) filaErrores.push('Banco origen vacío');
 
-                    // Parsear monto y tasa con la nueva función inteligente
-                    const monto = parseNumber(montoRaw);
-                    if (isNaN(monto) || monto <= 0) filaErrores.push('Monto inválido o debe ser > 0');
+                    // Parsear monto con validación estricta: decimales SOLO con coma
+                    // Usar el valor FORMATEADO de la celda para validar el formato decimal
+                    let monto: number;
+                    const montoFormatted = pagoColIndex >= 0
+                        ? getFormattedCellValue(i, pagoColIndex)
+                        : String(montoRaw ?? '');
 
-                    const tasa = parseNumber(tasaRaw);
+                    // Si el valor formateado tiene punto y no coma, rechazar (debe usar coma para decimales)
+                    if (montoFormatted && montoFormatted.includes('.') && !montoFormatted.includes(',')) {
+                        // Generar valor corregido reemplazando punto por coma
+                        const montoCorregido = montoFormatted.replace('.', ',');
+                        filaErrores.push(`El monto "${montoFormatted}" usa punto decimal. Debe escribirse con coma, por ejemplo: ${montoCorregido}`);
+                        monto = NaN;
+                    } else {
+                        monto = parseNumber(montoRaw);
+                    }
+                    if (isNaN(monto) || monto <= 0) {
+                        if (filaErrores.length === 0 || !filaErrores[filaErrores.length - 1].includes('punto decimal')) {
+                            filaErrores.push('Monto inválido o debe ser > 0');
+                        }
+                    }
+
+                    // Para Tasa SÍ se permite punto decimal (valores como 443.259 son correctos)
+                    let tasa = parseNumber(tasaRaw);
+                    // Sanity check for BCV rate: if it's suspiciously high (> 10,000),
+                    // the dot was likely treated as thousands separator incorrectly.
+                    // Venezuelan BCV rates are typically 30-600, so divide by 1000.
+                    if (tasa > 10000 && tasa < 100000000) {
+                        tasa = tasa / 1000;
+                    }
                     if (isNaN(tasa) || tasa < 1) filaErrores.push('Tasa inválida (debe ser >= 1)');
 
-                    let modo = 'distribuido';
+                    let modo: 'distribuido' | 'fondo_unico' | 'extra' = 'distribuido';
                     let fondoId: number | null = null;
                     const validFunds: string[] = [];
 
-                    if (fondoNombre && fondos.length > 0) {
-                        const fEnc = fondos.find(fd => norm(fd.nombre) === norm(fondoNombre));
+                    // Detectar modo EXTRA por columna Fondo
+                    const fondoNorm = fondoNombre ? norm(fondoNombre) : '';
+                    const isExtraMode = /^(extra|gasto\s*extra|gastos?\s*extra|ingreso\s*extra|transito|tránsito)$/i.test(fondoNorm);
+
+                    if (isExtraMode) {
+                        // Modo extra: no se distribuye en fondos, ingresa directo a la cuenta bancaria
+                        modo = 'extra';
+                    } else if (fondoNombre && fondos.length > 0) {
+                        const fondoNormCheck = fondoNorm;
+                        // First try exact match
+                        let fEnc = fondos.find(fd => norm(fd.nombre) === fondoNormCheck);
+
+                        // If no exact match, try partial match (any fund name containing the input)
+                        if (!fEnc) {
+                            fEnc = fondos.find(fd => norm(fd.nombre).includes(fondoNormCheck));
+                        }
+
+                        // Also try reverse: input contains fund name
+                        if (!fEnc) {
+                            fEnc = fondos.find(fd => fondoNormCheck.includes(norm(fd.nombre)));
+                        }
+
                         if (!fEnc) {
                             validFunds.push(...fondos.map(fd => fd.nombre));
                             filaErrores.push(`Fondo "${fondoNombre}" no existe. Válidos: ${fondos.map(fd => fd.nombre).join(', ')}`);
@@ -721,6 +791,10 @@ const registerCargaMasivaRoutes = (
                         });
                     } else if (fecha_pago) {
                         const montoUsd = tasa > 0 ? Math.round((monto / tasa) * 100) / 100 : 0;
+                        // Get fund name for display
+                        const fondoNombreDisplay = fondoId 
+                            ? (fondos.find(fd => fd.id === fondoId)?.nombre || null)
+                            : null;
                         pagosValidos.push({
                             fila: filaNum,
                             fecha_pago,
@@ -731,6 +805,7 @@ const registerCargaMasivaRoutes = (
                             tasa_cambio: tasa,
                             monto_usd: montoUsd,
                             fondo_id: fondoId,
+                            fondo: fondoNombreDisplay,
                             modo
                         });
                     }
@@ -918,7 +993,7 @@ const registerCargaMasivaRoutes = (
                         banco_origen: p.banco_origen,
                         monto_bs: p.monto_bs,
                         tasa_cambio: p.tasa_cambio,
-                        modo: p.modo || 'distribuido',
+                        modo: (p.modo === 'fondo_unico' || p.modo === 'extra') ? p.modo : 'distribuido',
                         fondo_id: p.fondo_id || undefined,
                     })),
                     condominio_id: condo.id,

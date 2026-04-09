@@ -126,6 +126,15 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
         const m = String(d.getUTCMonth() + 1).padStart(2, '0');
         return `${y}-${m}`;
     };
+    const mesCobroFromYyyyMm = (yyyyMm: string): string => {
+        const monthNames = [
+            'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+            'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre',
+        ];
+        const [year, month] = String(yyyyMm).split('-').map(Number);
+        const mes = monthNames[(month || 1) - 1] || 'enero';
+        return `${mes} ${year}`;
+    };
 
     const resolveCondoIdForInmuebles = async (adminUserId: number, res: Response): Promise<number | null> => {
         const condoRes = await pool.query<ICondominioAdminRow>(
@@ -503,6 +512,8 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
             const now = new Date();
             const mesAnteriorDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
             const mesActual = `${mesAnteriorDate.getUTCFullYear()}-${String(mesAnteriorDate.getUTCMonth() + 1).padStart(2, '0')}`;
+            const fechaSaldoFondosSeed = '2024-01-01';
+            const tasaCambioSeed = 40;
             await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [mesActual, condoId]);
 
             // Asegura compatibilidad del tipo "Extra" en entornos donde el CHECK aun no fue migrado.
@@ -676,16 +687,17 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                 `INSERT INTO fondos
                     (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, fecha_saldo)
                  VALUES
-                    ($1, $2, '[TEST] Fondo Operativo Principal Bs', 'BS', 0, 8000, true, '2026-03-22'),
-                    ($1, $3, '[TEST] Fondo Caja Chica Bs', 'BS', 0, 2500, false, '2026-03-22'),
-                    ($1, $4, '[TEST] Fondo Reserva General Bs', 'BS', 0, 3200, false, '2026-03-22'),
-                    ($1, $5, '[TEST] Fondo USD', 'USD', 0, 1500, false, '2026-03-22')`,
+                    ($1, $2, '[TEST] Fondo Operativo Principal Bs', 'BS', 0, 8000, true, $6::date),
+                    ($1, $3, '[TEST] Fondo Caja Chica Bs', 'BS', 0, 2500, false, $6::date),
+                    ($1, $4, '[TEST] Fondo Reserva General Bs', 'BS', 0, 3200, false, $6::date),
+                    ($1, $5, '[TEST] Fondo USD', 'USD', 0, 1500, false, $6::date)`,
                 [
                     condoId,
                     cuentaPrincipalBs.rows[0].id,
                     cuentaPagoMovilBs.rows[0].id,
                     cuentaSecundariaBs.rows[0].id,
                     cuentaUsd.rows[0].id,
+                    fechaSaldoFondosSeed,
                 ],
             );
 
@@ -696,6 +708,7 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
             const zonas = [zA.rows[0].id, zB.rows[0].id, zC.rows[0].id, zD.rows[0].id];
 
             const props: number[] = [];
+            let apto101Id: number | null = null;
             const alicuotasSeed = [4.0, 5.0, 6.0];
             const propConfigs: IPropConfig[] = Array.from({ length: 20 }, (_, idx) => {
                 const i = idx + 1;
@@ -710,6 +723,9 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                     alicuota: alicuotasSeed[idx % alicuotasSeed.length],
                 };
             });
+            if (propConfigs.length > 0) {
+                propConfigs[0].iden = 'Apto 101';
+            }
 
             for (const pc of propConfigs) {
                 const p = await pool.query<IIdRow>(
@@ -719,6 +735,9 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                     [condoId, pc.iden, pc.alicuota, pc.zona, pc.saldo],
                 );
                 props.push(p.rows[0].id);
+                if (pc.iden === 'Apto 101') {
+                    apto101Id = p.rows[0].id;
+                }
                 await pool.query('INSERT INTO propiedades_zonas (propiedad_id, zona_id) VALUES ($1, $2)', [p.rows[0].id, pc.zona]);
 
                 if (pc.saldo !== 0) {
@@ -821,10 +840,150 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                 }
             }
 
+            if (!apto101Id) {
+                throw new Error('No se pudo determinar la propiedad Apto 101 para escenarios de prueba.');
+            }
+            const apto101PropId = apto101Id;
+
+            const recibosColsRes = await pool.query<{ column_name: string }>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'recibos'
+                  AND column_name IN ('fecha_emision')
+                `
+            );
+            const recibosCols = new Set(recibosColsRes.rows.map((r) => r.column_name));
+
+            const pagosColsRes = await pool.query<{ column_name: string }>(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'pagos'
+                  AND column_name IN ('nota', 'es_ajuste_historico', 'metodo')
+                `
+            );
+            const pagosCols = new Set(pagosColsRes.rows.map((r) => r.column_name));
+
+            // -----------------------------------------------------------
+            // ESCENARIO FIFO BASE: 4 recibos pendientes consecutivos para Apto 101
+            // -----------------------------------------------------------
+            const recibosSeedConfig = [
+                { offsetMes: 0, montoUsd: 120.00, fecha: `${mesActual}-01` },
+                { offsetMes: 1, montoUsd: 95.00, fecha: `${addMonthsSeed(mesActual, 1)}-01` },
+                { offsetMes: 2, montoUsd: 105.00, fecha: `${addMonthsSeed(mesActual, 2)}-01` },
+                { offsetMes: 3, montoUsd: 130.00, fecha: `${addMonthsSeed(mesActual, 3)}-01` },
+            ];
+
+            const recibosApto101: Array<{ id: number; montoUsd: number; mesCobro: string }> = [];
+            for (const rc of recibosSeedConfig) {
+                const mesRecibo = addMonthsSeed(mesActual, rc.offsetMes);
+                const mesCobro = mesCobroFromYyyyMm(mesRecibo);
+                const insertCols = ['propiedad_id', 'mes_cobro', 'monto_usd', 'monto_pagado_usd', 'estado'];
+                const insertVals: Array<number | string> = [apto101PropId, mesCobro, rc.montoUsd, 0, 'Pendiente'];
+                if (recibosCols.has('fecha_emision')) {
+                    insertCols.push('fecha_emision');
+                    insertVals.push(rc.fecha);
+                }
+                const placeholders = insertVals.map((_, idx) => `$${idx + 1}`).join(', ');
+                const reciboRes = await pool.query<IIdRow>(
+                    `INSERT INTO recibos (${insertCols.join(', ')}) VALUES (${placeholders}) RETURNING id`,
+                    insertVals
+                );
+                recibosApto101.push({ id: reciboRes.rows[0].id, montoUsd: rc.montoUsd, mesCobro });
+            }
+
+            const cuentaSeedId = cuentaPrincipalBs.rows[0].id;
+            const upsertPagoSeed = async (input: {
+                fechaPago: string;
+                montoUsd: number;
+                referencia: string;
+                nota: string;
+                esAjusteHistorico?: boolean;
+            }): Promise<void> => {
+                const montoOrigen = Number((input.montoUsd * tasaCambioSeed).toFixed(2));
+                const insertCols = [
+                    'propiedad_id',
+                    'recibo_id',
+                    'cuenta_bancaria_id',
+                    'monto_origen',
+                    'tasa_cambio',
+                    'monto_usd',
+                    'moneda',
+                    'referencia',
+                    'fecha_pago',
+                    'estado',
+                ];
+                const insertVals: Array<number | string | null | boolean> = [
+                    apto101PropId,
+                    null,
+                    cuentaSeedId,
+                    montoOrigen,
+                    tasaCambioSeed,
+                    input.montoUsd,
+                    'BS',
+                    input.referencia,
+                    input.fechaPago,
+                    'Pendiente',
+                ];
+                if (pagosCols.has('metodo')) {
+                    insertCols.push('metodo');
+                    insertVals.push('Transferencia');
+                }
+                if (pagosCols.has('nota')) {
+                    insertCols.push('nota');
+                    insertVals.push(input.nota);
+                }
+                if (pagosCols.has('es_ajuste_historico')) {
+                    insertCols.push('es_ajuste_historico');
+                    insertVals.push(Boolean(input.esAjusteHistorico));
+                }
+                const placeholders = insertVals.map((_, idx) => `$${idx + 1}`).join(', ');
+                await pool.query(
+                    `INSERT INTO pagos (${insertCols.join(', ')}) VALUES (${placeholders})`,
+                    insertVals
+                );
+            };
+
+            // -----------------------------------------------------------
+            // ESCENARIO A: Pago Histórico (anterior a fecha_saldo de fondos)
+            // -----------------------------------------------------------
+            await upsertPagoSeed({
+                fechaPago: '2023-12-15',
+                montoUsd: 75.00,
+                referencia: '[TEST][HIST] PAGO-APTO101-20231215',
+                nota: 'Escenario A: regularizacion historica previa a fecha_saldo.',
+                esAjusteHistorico: true,
+            });
+
+            // -----------------------------------------------------------
+            // ESCENARIO B: Pago Parcial (mitad exacta del primer recibo pendiente)
+            // -----------------------------------------------------------
+            const mitadPrimerReciboUsd = Number((recibosApto101[0].montoUsd / 2).toFixed(2));
+            await upsertPagoSeed({
+                fechaPago: `${mesActual}-10`,
+                montoUsd: mitadPrimerReciboUsd,
+                referencia: '[TEST][PARCIAL] PAGO-APTO101-MITAD-R1',
+                nota: 'Escenario B: pago parcial, mitad exacta del primer recibo.',
+            });
+
+            // -----------------------------------------------------------
+            // ESCENARIO C: Pago Múltiple/Cascada (cubre R1 + R2 y deja saldo a favor)
+            // -----------------------------------------------------------
+            const montoCascadaUsd = Number((recibosApto101[0].montoUsd + recibosApto101[1].montoUsd + 35).toFixed(2));
+            await upsertPagoSeed({
+                fechaPago: `${mesActual}-15`,
+                montoUsd: montoCascadaUsd,
+                referencia: '[TEST][CASCADA] PAGO-APTO101-R1-R2-FAVOR',
+                nota: 'Escenario C: pago en cascada, cubre recibo 1 y 2, dejando saldo a favor.',
+            });
+
             await pool.query('COMMIT');
             res.json({
                 status: 'success',
-                message: 'Simulacion lista: 20 inmuebles, 8 proveedores, 2 cuentas (3 fondos) y 15 gastos (incluye 2 Extra y cuotas diferidas).',
+                message: 'Simulacion lista: fondos con fecha_saldo, propiedad Apto 101 con recibos FIFO y pagos escenario historico/parcial/cascada.',
             });
         } catch (err: unknown) {
             const error = asError(err);

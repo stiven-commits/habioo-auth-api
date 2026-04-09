@@ -67,6 +67,17 @@ interface IMovimientoRow {
     created_at?: string | Date | null;
 }
 
+interface IExtraInfoRow {
+    pago_id: number;
+    fecha: string | Date;
+    referencia: string | null;
+    inmueble: string | null;
+    concepto: string;
+    monto_bs: number | null;
+    monto_usd: number;
+    fondo_destino: string | null;
+}
+
 interface IGastoPendienteRow {
     id: number;
     concepto: string;
@@ -1040,6 +1051,16 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                       AND p.estado = 'Validado'
                       AND COALESCE(p.es_ajuste_historico, false) = false
                       AND extra_meta.extra_usd > 0
+                      -- Evita doble visualizacion: si el pago ya genero ingresos en fondos, el extra
+                      -- ya esta reflejado en ingresos_fondos y no debe repetirse como transito/extra.
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM movimientos_fondos mf_ex
+                        JOIN fondos f_ex ON f_ex.id = mf_ex.fondo_id
+                        WHERE mf_ex.referencia_id = p.id
+                          AND f_ex.cuenta_bancaria_id = $1
+                          AND UPPER(COALESCE(mf_ex.tipo, '')) IN ('INGRESO', 'INGRESO_PAGO', 'ABONO', 'AJUSTE_INICIAL')
+                      )
                 ),
                 egresos_gpf AS (
                     SELECT
@@ -1253,6 +1274,111 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const typedError = asError(error);
             console.error('Error en estado de cuenta:', error);
             res.status(500).json({ error: typedError.message });
+        }
+    });
+
+    // Extras aplicados al fondo principal (solo informativo, no altera saldos en la consulta principal)
+    app.get('/bancos-admin/:id/extras-info', verifyToken, async (req: Request<BancosParams>, res: Response, _next: NextFunction) => {
+        try {
+            const user = asAuthUser(req.user);
+            const cuentaId = parseInt(asString(req.params.id), 10);
+            if (!Number.isFinite(cuentaId) || cuentaId <= 0) {
+                return res.status(400).json({ error: 'ID de cuenta inválido.' });
+            }
+
+            const condoRes = await pool.query<ICondominioIdRow>(
+                'SELECT id FROM condominios WHERE admin_user_id = $1 LIMIT 1',
+                [user.id]
+            );
+            if (condoRes.rows.length === 0) {
+                return res.status(404).json({ error: 'Condominio no encontrado.' });
+            }
+            const condoId = condoRes.rows[0].id;
+
+            const cuentaRes = await pool.query<ICuentaBancariaRow>(
+                'SELECT id FROM cuentas_bancarias WHERE id = $1 AND condominio_id = $2 LIMIT 1',
+                [cuentaId, condoId]
+            );
+            if (cuentaRes.rows.length === 0) {
+                return res.status(404).json({ error: 'Cuenta bancaria no encontrada.' });
+            }
+
+            const query = `
+                WITH fondo_principal AS (
+                    SELECT nombre
+                    FROM fondos
+                    WHERE cuenta_bancaria_id = $1
+                      AND COALESCE(activo, true) = true
+                      AND COALESCE(es_operativo, false) = true
+                    ORDER BY id ASC
+                    LIMIT 1
+                ),
+                fondo_fallback AS (
+                    SELECT nombre
+                    FROM fondos
+                    WHERE cuenta_bancaria_id = $1
+                      AND COALESCE(activo, true) = true
+                    ORDER BY id ASC
+                    LIMIT 1
+                )
+                SELECT
+                    p.id::int AS pago_id,
+                    p.fecha_pago::date AS fecha,
+                    p.referencia,
+                    pr.identificador::text AS inmueble,
+                    COALESCE(
+                        CASE
+                            WHEN NULLIF(BTRIM(extra_conceptos.conceptos), '') IS NOT NULL
+                                THEN ('Extra aplicado: ' || NULLIF(BTRIM(extra_conceptos.conceptos), ''))
+                            ELSE NULL
+                        END,
+                        'Extra aplicado al fondo principal'
+                    )::text AS concepto,
+                    CASE
+                        WHEN p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0
+                            THEN ROUND((extra_meta.extra_usd * p.tasa_cambio)::numeric, 2)
+                        ELSE NULL
+                    END AS monto_bs,
+                    ROUND(extra_meta.extra_usd::numeric, 6) AS monto_usd,
+                    COALESCE(fp.nombre, ff.nombre, 'Fondo principal')::text AS fondo_destino
+                FROM pagos p
+                LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
+                CROSS JOIN LATERAL (
+                    SELECT COALESCE(
+                        NULLIF(
+                            (regexp_match(COALESCE(p.nota, ''), '(?i)\\[extra_usd:([0-9]+(?:\\.[0-9]+)?)\\]'))[1],
+                            ''
+                        )::numeric,
+                        0
+                    ) AS extra_usd
+                ) extra_meta
+                LEFT JOIN LATERAL (
+                    SELECT string_agg(DISTINCT NULLIF(BTRIM(mf_ex.nota), ''), ' | ') AS conceptos
+                    FROM movimientos_fondos mf_ex
+                    JOIN fondos f_ex ON f_ex.id = mf_ex.fondo_id
+                    WHERE mf_ex.referencia_id = p.id
+                      AND f_ex.cuenta_bancaria_id = $1
+                      AND UPPER(COALESCE(mf_ex.tipo, '')) IN ('INGRESO', 'INGRESO_PAGO', 'ABONO', 'AJUSTE_INICIAL')
+                      AND NULLIF(BTRIM(mf_ex.nota), '') IS NOT NULL
+                      AND COALESCE(mf_ex.nota, '') NOT ILIKE 'Pago de condominio%'
+                      AND COALESCE(mf_ex.nota, '') NOT ILIKE 'Saldo de apertura%'
+                      AND COALESCE(mf_ex.nota, '') NOT ILIKE 'Ingreso distribuido en fondo:%'
+                ) extra_conceptos ON true
+                LEFT JOIN fondo_principal fp ON true
+                LEFT JOIN fondo_fallback ff ON true
+                WHERE p.cuenta_bancaria_id = $1
+                  AND p.estado = 'Validado'
+                  AND COALESCE(p.es_ajuste_historico, false) = false
+                  AND extra_meta.extra_usd > 0
+                ORDER BY p.fecha_pago DESC, p.id DESC
+            `;
+
+            const extras = await pool.query<IExtraInfoRow>(query, [cuentaId]);
+            return res.json({ status: 'success', extras: extras.rows });
+        } catch (error: unknown) {
+            const typedError = asError(error);
+            console.error('Error en extras-info:', error);
+            return res.status(500).json({ error: typedError.message });
         }
     });
 
