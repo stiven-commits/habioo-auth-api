@@ -146,6 +146,7 @@ interface ManualEgresoBody {
     fondo_id: unknown;
     monto_origen: unknown;
     tasa_cambio?: unknown;
+    tipo_movimiento?: unknown;
     referencia: string | null;
     concepto: string | null;
     fecha: string | Date;
@@ -813,6 +814,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         COALESCE(p.fecha_pago::date, mf.fecha::date) AS fecha,
                         CASE
                             WHEN p.id IS NOT NULL THEN NULLIF(BTRIM(COALESCE(p.referencia, '')), '')
+                            WHEN COALESCE(mf.nota, '') ILIKE 'Ingreso manual libro mayor%'
+                                THEN NULLIF(BTRIM(COALESCE((regexp_match(COALESCE(mf.nota, ''), '(?i)Ref:\\s*([^|]+)'))[1], '')), '')
                             WHEN mf.tipo = 'AJUSTE_INICIAL'
                                  AND COALESCE(mf.nota, '') ILIKE 'Saldo de apertura del fondo%'
                                 THEN 'APERTURA'
@@ -873,6 +876,11 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                         ''
                                     ),
                                     ('Ajuste en fondo: ' || COALESCE(f.nombre, 'N/A'))
+                                )
+                            WHEN COALESCE(mf.nota, '') ILIKE 'Ingreso manual libro mayor%'
+                                THEN COALESCE(
+                                    NULLIF(BTRIM(COALESCE((regexp_match(COALESCE(mf.nota, ''), '(?i)Concepto:\\s*([^|]+)'))[1], '')), ''),
+                                    'Ingreso manual libro mayor'
                                 )
                             WHEN COALESCE(mf.nota, '') ILIKE 'Ingreso alquiler%'
                                 THEN COALESCE(NULLIF(BTRIM(mf.nota), ''), ('Ingreso por alquiler - Fondo: ' || COALESCE(f.nombre, 'N/A')))
@@ -1662,11 +1670,12 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
     });
 
     app.post('/egresos-manuales', verifyToken, async (req: Request<{}, unknown, ManualEgresoBody>, res: Response) => {
-        const { cuenta_id, fondo_id, monto_origen, tasa_cambio, referencia, concepto, fecha } = req.body;
+        const { cuenta_id, fondo_id, monto_origen, tasa_cambio, referencia, concepto, fecha, tipo_movimiento } = req.body;
         let client: PoolClient | null = null;
         try {
             client = await pool.connect();
             const user = asAuthUser(req.user);
+            const tipoMovimiento = String(tipo_movimiento || 'EGRESO').trim().toUpperCase() === 'INGRESO' ? 'INGRESO' : 'EGRESO';
             const cuentaId = asPositiveInt(cuenta_id, 'cuenta_id');
             const fondoId = asPositiveInt(fondo_id, 'fondo_id');
             const montoOrigen = asDecimal(monto_origen, 'monto_origen');
@@ -1748,19 +1757,25 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
 
             const montoFondo = fondoMoneda === 'USD' ? montoUsd : montoBs;
             const saldoFondo = parseFloat(String(fondo.saldo_actual ?? 0)) || 0;
-            if (montoFondo <= 0 || saldoFondo + 0.0001 < montoFondo) {
+            if (montoFondo <= 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ status: 'error', message: 'El monto calculado para el fondo es inválido.' });
+            }
+            if (tipoMovimiento === 'EGRESO' && saldoFondo + 0.0001 < montoFondo) {
                 await client.query('ROLLBACK');
                 return res.status(400).json({ status: 'error', message: 'Saldo insuficiente en el fondo seleccionado.' });
             }
 
             await client.query(
-                `UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) - $1 WHERE id = $2`,
+                `UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) ${tipoMovimiento === 'INGRESO' ? '+' : '-'} $1 WHERE id = $2`,
                 [montoFondo, fondoId]
             );
 
-            const preferredTiposEgreso = ['EGRESO_GASTO', 'EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO', 'PAGO_PROVEEDOR', 'EGRESO_PAGO'];
-            const tipoEgreso = await resolveMovimientoFondoTipo(preferredTiposEgreso, 'EGRESO_GASTO');
-            const nota = `Egreso manual libro mayor | Concepto: ${conceptoSafe} | Ref: ${referenciaSafe} | Bs ${montoBs.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | USD ${montoUsd.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+            const preferredTipos = tipoMovimiento === 'INGRESO'
+                ? ['INGRESO', 'INGRESO_PAGO', 'ABONO']
+                : ['EGRESO_GASTO', 'EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO', 'PAGO_PROVEEDOR', 'EGRESO_PAGO'];
+            const tipoMovimientoFondo = await resolveMovimientoFondoTipo(preferredTipos, preferredTipos[0]);
+            const nota = `${tipoMovimiento === 'INGRESO' ? 'Ingreso' : 'Egreso'} manual libro mayor | Concepto: ${conceptoSafe} | Ref: ${referenciaSafe} | Bs ${montoBs.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | USD ${montoUsd.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
             const mfColsRes = await client.query<IColumnNameRow>(
                 `
@@ -1773,7 +1788,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             );
             const mfCols = new Set(mfColsRes.rows.map((r) => r.column_name));
             const insertCols = ['fondo_id', 'tipo', 'monto', 'nota'];
-            const insertVals: unknown[] = [fondoId, tipoEgreso, montoFondo, nota];
+            const insertVals: unknown[] = [fondoId, tipoMovimientoFondo, montoFondo, nota];
             if (mfCols.has('tasa_cambio')) {
                 insertCols.push('tasa_cambio');
                 insertVals.push(tasaCambio);
@@ -1790,8 +1805,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             const allowedTipos = await getMovimientoFondoTiposPermitidos();
             const tiposCandidatos = Array.from(
                 new Set([
-                    tipoEgreso,
-                    ...preferredTiposEgreso,
+                    tipoMovimientoFondo,
+                    ...preferredTipos,
                     ...allowedTipos,
                 ].map((t) => String(t || '').trim()).filter(Boolean))
             );
@@ -1824,8 +1839,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             await client.query('COMMIT');
             return res.json({
                 status: 'success',
-                message: 'Egreso registrado correctamente.',
+                message: `${tipoMovimiento === 'INGRESO' ? 'Ingreso' : 'Egreso'} registrado correctamente.`,
                 data: {
+                    tipo_movimiento: tipoMovimiento,
                     cuenta_id: cuentaId,
                     fondo_id: fondoId,
                     referencia: referenciaSafe,
