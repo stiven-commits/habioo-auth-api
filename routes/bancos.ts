@@ -1772,7 +1772,7 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             );
 
             const preferredTipos = tipoMovimiento === 'INGRESO'
-                ? ['INGRESO', 'INGRESO_PAGO', 'ABONO']
+                ? ['INGRESO_PAGO', 'ABONO', 'INGRESO']
                 : ['EGRESO_GASTO', 'EGRESO', 'SALIDA', 'DEBITO', 'DESCUENTO', 'PAGO_PROVEEDOR', 'EGRESO_PAGO'];
             const tipoMovimientoFondo = await resolveMovimientoFondoTipo(preferredTipos, preferredTipos[0]);
             const nota = `${tipoMovimiento === 'INGRESO' ? 'Ingreso' : 'Egreso'} manual libro mayor | Concepto: ${conceptoSafe} | Ref: ${referenciaSafe} | Bs ${montoBs.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | USD ${montoUsd.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -1814,15 +1814,18 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             let lastInsertErr: unknown = null;
             for (const tipo of tiposCandidatos) {
                 try {
+                    await client.query('SAVEPOINT sp_mf_insert_tipo');
                     const vals = [...insertVals];
                     vals[1] = tipo;
                     await client.query(
                         `INSERT INTO movimientos_fondos (${insertCols.join(', ')}) VALUES (${placeholders})`,
                         vals
                     );
+                    await client.query('RELEASE SAVEPOINT sp_mf_insert_tipo');
                     inserted = true;
                     break;
                 } catch (insertErr: unknown) {
+                    await client.query('ROLLBACK TO SAVEPOINT sp_mf_insert_tipo');
                     const errObj = insertErr as { code?: string; constraint?: string };
                     const isTipoCheck = errObj?.code === '23514' && (
                         String(errObj?.constraint || '').includes('movimientos_fondos_tipo_check') ||
@@ -1852,7 +1855,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             });
         } catch (err: unknown) {
             if (client) await client.query('ROLLBACK');
-            return res.status(500).json({ status: 'error', message: asError(err).message });
+            const message = asError(err).message;
+            const isBadRequest = err instanceof TypeError || /invalid\s+[a-z_]+\s+value/i.test(message) || /es requerida/i.test(message);
+            return res.status(isBadRequest ? 400 : 500).json({ status: 'error', message });
         } finally {
             client?.release();
         }
