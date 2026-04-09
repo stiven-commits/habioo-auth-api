@@ -80,6 +80,7 @@ interface IGastoListRow extends Record<string, unknown> {
     has_real_pago_proveedor?: boolean;
     cuotas_historicas?: number | string | null;
     monto_historico_proveedor_usd?: number | string | null;
+    monto_historico_recaudado_usd?: number | string | null;
     nota: string | null;
     clasificacion: string | null;
     proveedor: string;
@@ -204,6 +205,8 @@ interface CreateGastoBody {
     fecha_gasto?: string | null;
     cuotas_historicas?: string | number | null;
     monto_historico_proveedor_usd?: string | number | null;
+    monto_historico_recaudado_usd?: string | number | null;
+    tasa_historica?: string | number | null;
     remove_factura_img?: string | boolean | null;
     keep_imagenes?: string | string[] | null;
 }
@@ -485,6 +488,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             fecha_gasto,
             cuotas_historicas,
             monto_historico_proveedor_usd,
+            monto_historico_recaudado_usd,
+            tasa_historica,
             remove_factura_img,
         } = req.body;
 
@@ -563,6 +568,30 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     message: 'El pago histórico del proveedor debe estar entre 0 y el monto total del gasto.',
                 });
             }
+            const montoHistoricoRecaudadoUsdSafe = Number(parseLocaleNumber(monto_historico_recaudado_usd || 0).toFixed(2));
+            if (montoHistoricoRecaudadoUsdSafe < 0 || montoHistoricoRecaudadoUsdSafe > Number(montoUsdNum.toFixed(2))) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'La recaudación histórica debe estar entre 0 y el monto total del gasto.',
+                });
+            }
+            const tasaHistoricaSafe = Number(parseLocaleNumber(tasa_historica || 0).toFixed(4));
+            if (tasaHistoricaSafe > 0) {
+                const montoHistoricoProveedorBsSafe = Number((montoHistoricoProveedorUsdSafe * tasaHistoricaSafe).toFixed(2));
+                const montoHistoricoRecaudadoBsSafe = Number((montoHistoricoRecaudadoUsdSafe * tasaHistoricaSafe).toFixed(2));
+                if (montoHistoricoProveedorBsSafe > Number(m_bs) + 0.01) {
+                    return res.status(400).json({
+                        status: 'error',
+                        message: 'El pago histórico en Bs no puede superar el monto en Bs del gasto.',
+                    });
+                }
+                if (montoHistoricoRecaudadoBsSafe > Number(m_bs) + 0.01) {
+                    return res.status(400).json({
+                        status: 'error',
+                        message: 'La recaudación histórica en Bs no puede superar el monto en Bs del gasto.',
+                    });
+                }
+            }
 
             const mes_factura = fechaGastoSafe ? fechaGastoSafe.substring(0, 7) : mes_actual;
             const mes_inicio_base = mes_factura > mes_actual ? mes_factura : mes_actual;
@@ -591,6 +620,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const metaHistorico: string[] = [];
             if (cuotasHistoricasSafe > 0) metaHistorico.push(`[hist.cuotas:${cuotasHistoricasSafe}]`);
             if (montoHistoricoProveedorUsdSafe > 0) metaHistorico.push(`[hist.proveedor_usd:${montoHistoricoProveedorUsdSafe.toFixed(2)}]`);
+            if (montoHistoricoRecaudadoUsdSafe > 0) metaHistorico.push(`[hist.recaudado_usd:${montoHistoricoRecaudadoUsdSafe.toFixed(2)}]`);
+            if (tasaHistoricaSafe > 0) metaHistorico.push(`[hist.tasa:${tasaHistoricaSafe.toFixed(4)}]`);
             const notaFinal = [notaBase, ...metaHistorico].filter(Boolean).join(' | ') || null;
 
             const result = await pool.query<IInsertedIdRow>(
@@ -598,7 +629,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             INSERT INTO gastos (condominio_id, proveedor_id, concepto, monto_bs, tasa_cambio, monto_usd, monto_pagado_usd, total_cuotas, nota, clasificacion, tipo, zona_id, propiedad_id, fecha_gasto, factura_img, imagenes)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id
         `,
-                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, montoHistoricoProveedorUsdSafe, totalCuotasSafe, notaFinal, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados]
+                [condominio_id, proveedor_id, concepto, m_bs, t_c, monto_usd, montoHistoricoRecaudadoUsdSafe, totalCuotasSafe, notaFinal, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados]
             );
 
             for (let i = 1; i <= totalCuotasSafe; i += 1) {
@@ -635,6 +666,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             fecha_gasto,
             cuotas_historicas,
             monto_historico_proveedor_usd,
+            monto_historico_recaudado_usd,
+            tasa_historica,
             remove_factura_img,
         } = req.body;
 
@@ -737,6 +770,30 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     message: 'El pago histórico del proveedor debe estar entre 0 y el monto total del gasto.',
                 });
             }
+            const montoHistoricoRecaudadoUsdSafe = Number(parseLocaleNumber(monto_historico_recaudado_usd || 0).toFixed(2));
+            if (montoHistoricoRecaudadoUsdSafe < 0 || montoHistoricoRecaudadoUsdSafe > Number(montoUsdNum.toFixed(2))) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'La recaudación histórica debe estar entre 0 y el monto total del gasto.',
+                });
+            }
+            const tasaHistoricaSafe = Number(parseLocaleNumber(tasa_historica || 0).toFixed(4));
+            if (tasaHistoricaSafe > 0) {
+                const montoHistoricoProveedorBsSafe = Number((montoHistoricoProveedorUsdSafe * tasaHistoricaSafe).toFixed(2));
+                const montoHistoricoRecaudadoBsSafe = Number((montoHistoricoRecaudadoUsdSafe * tasaHistoricaSafe).toFixed(2));
+                if (montoHistoricoProveedorBsSafe > Number(m_bs) + 0.01) {
+                    return res.status(400).json({
+                        status: 'error',
+                        message: 'El pago histórico en Bs no puede superar el monto en Bs del gasto.',
+                    });
+                }
+                if (montoHistoricoRecaudadoBsSafe > Number(m_bs) + 0.01) {
+                    return res.status(400).json({
+                        status: 'error',
+                        message: 'La recaudación histórica en Bs no puede superar el monto en Bs del gasto.',
+                    });
+                }
+            }
             const monto_cuota_usd = (parseFloat(monto_usd) / totalCuotasSafe).toFixed(2);
 
             const mes_factura = fechaGastoSafe ? fechaGastoSafe.substring(0, 7) : mes_actual;
@@ -766,6 +823,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const metaHistorico: string[] = [];
             if (cuotasHistoricasSafe > 0) metaHistorico.push(`[hist.cuotas:${cuotasHistoricasSafe}]`);
             if (montoHistoricoProveedorUsdSafe > 0) metaHistorico.push(`[hist.proveedor_usd:${montoHistoricoProveedorUsdSafe.toFixed(2)}]`);
+            if (montoHistoricoRecaudadoUsdSafe > 0) metaHistorico.push(`[hist.recaudado_usd:${montoHistoricoRecaudadoUsdSafe.toFixed(2)}]`);
+            if (tasaHistoricaSafe > 0) metaHistorico.push(`[hist.tasa:${tasaHistoricaSafe.toFixed(4)}]`);
             const notaFinal = [notaBase, ...metaHistorico].filter(Boolean).join(' | ') || null;
 
             await pool.query('BEGIN');
@@ -787,10 +846,11 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     propiedad_id = $11,
                     fecha_gasto = $12,
                     factura_img = $13,
-                    imagenes = $14
-                    WHERE id = $15
+                    imagenes = $14,
+                    monto_pagado_usd = $15
+                    WHERE id = $16
                 `,
-                [proveedor_id, concepto, m_bs, t_c, monto_usd, totalCuotasSafe, notaFinal, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados, gastoId]
+                [proveedor_id, concepto, m_bs, t_c, monto_usd, totalCuotasSafe, notaFinal, dbClasificacion, dbTipo, zId, pId, fechaGastoSafe, facturaGuardada, soportesGuardados, montoHistoricoRecaudadoUsdSafe, gastoId]
             );
 
             await pool.query('DELETE FROM gastos_cuotas WHERE gasto_id = $1', [gastoId]);
@@ -851,9 +911,10 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                    ) AS monto_pagado_proveedor_usd,
                    LEAST(COALESCE(g.monto_usd, 0), COALESCE(g.monto_pagado_usd, 0)) AS monto_recaudado_usd,
                    ${realPagoProveedorExpr} AS has_real_pago_proveedor,
-                   COALESCE(((regexp_match(COALESCE(g.nota, ''), '\\[hist\\.cuotas:(\\d+)\\]'))[1])::int, 0) AS cuotas_historicas,
-                   COALESCE(((regexp_match(COALESCE(g.nota, ''), '\\[hist\\.proveedor_usd:([0-9]+(?:\\.[0-9]+)?)\\]'))[1])::numeric, 0) AS monto_historico_proveedor_usd,
-                   g.nota, g.clasificacion, p.nombre as proveedor,
+                    COALESCE(((regexp_match(COALESCE(g.nota, ''), '\\[hist\\.cuotas:(\\d+)\\]'))[1])::int, 0) AS cuotas_historicas,
+                    COALESCE(((regexp_match(COALESCE(g.nota, ''), '\\[hist\\.proveedor_usd:([0-9]+(?:\\.[0-9]+)?)\\]'))[1])::numeric, 0) AS monto_historico_proveedor_usd,
+                    COALESCE(((regexp_match(COALESCE(g.nota, ''), '\\[hist\\.recaudado_usd:([0-9]+(?:\\.[0-9]+)?)\\]'))[1])::numeric, 0) AS monto_historico_recaudado_usd,
+                    g.nota, g.clasificacion, p.nombre as proveedor,
                    gc.numero_cuota, g.total_cuotas, gc.monto_cuota_usd, gc.mes_asignado, gc.estado,
                    TO_CHAR(g.created_at, 'DD/MM/YYYY') as fecha_registro,
                    TO_CHAR(g.fecha_gasto, 'DD/MM/YYYY') as fecha_factura,
