@@ -76,6 +76,8 @@ interface IExtraInfoRow {
     monto_bs: number | null;
     monto_usd: number;
     fondo_destino: string | null;
+    nota?: string | null;
+    tasa_cambio?: number | null;
 }
 
 interface IGastoPendienteRow {
@@ -1029,11 +1031,17 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         ('Ingreso por gastos Extra - Inmueble: ' || COALESCE(pr.identificador, 'N/A')) AS concepto,
                         'INGRESO'::text AS tipo,
                         CASE
+                            WHEN extra_meta.extra_bs > 0 THEN ROUND(extra_meta.extra_bs::numeric, 2)
                             WHEN p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0 THEN (extra_meta.extra_usd * p.tasa_cambio)
                             ELSE NULL
                         END AS monto_bs,
                         p.tasa_cambio,
-                        extra_meta.extra_usd AS monto_usd,
+                        CASE
+                            WHEN extra_meta.extra_usd > 0 THEN extra_meta.extra_usd
+                            WHEN extra_meta.extra_bs > 0 AND p.tasa_cambio IS NOT NULL AND p.tasa_cambio > 0
+                                THEN ROUND((extra_meta.extra_bs / p.tasa_cambio)::numeric, 6)
+                            ELSE 0
+                        END AS monto_usd,
                         p.monto_origen AS monto_origen_pago,
                         ${pagoBancoOrigenExpr} AS banco_origen,
                         ${pagoCedulaOrigenExpr} AS cedula_origen,
@@ -1053,12 +1061,27 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                                 ''
                             )::numeric,
                             0
-                        ) AS extra_usd
+                        ) AS extra_usd,
+                        COALESCE(
+                            (
+                                SELECT SUM(NULLIF(BTRIM(split_part(item, '=', 2)), '')::numeric)
+                                FROM unnest(
+                                    string_to_array(
+                                        COALESCE((regexp_match(COALESCE(${pagoNotaExpr}, ''), '(?i)\\[extra_items_bs:([^\\]]+)\\]'))[1], ''),
+                                        ';'
+                                    )
+                                ) AS item
+                                WHERE NULLIF(BTRIM(item), '') IS NOT NULL
+                                  AND NULLIF(BTRIM(split_part(item, '=', 1)), '') ~ '^[0-9]+$'
+                                  AND NULLIF(BTRIM(split_part(item, '=', 2)), '') ~ '^[0-9]+(?:\\.[0-9]+)?$'
+                            ),
+                            0
+                        ) AS extra_bs
                     ) extra_meta
                     WHERE p.cuenta_bancaria_id = $1
                       AND p.estado = 'Validado'
                       AND COALESCE(p.es_ajuste_historico, false) = false
-                      AND extra_meta.extra_usd > 0
+                      AND (extra_meta.extra_usd > 0 OR extra_meta.extra_bs > 0)
                       -- Evita doble visualizacion: si el pago ya genero ingresos en fondos, el extra
                       -- ya esta reflejado en ingresos_fondos y no debe repetirse como transito/extra.
                       AND NOT EXISTS (
@@ -1348,7 +1371,9 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         ELSE NULL
                     END AS monto_bs,
                     ROUND(extra_meta.extra_usd::numeric, 6) AS monto_usd,
-                    COALESCE(fp.nombre, ff.nombre, 'Fondo principal')::text AS fondo_destino
+                    COALESCE(fp.nombre, ff.nombre, 'Fondo principal')::text AS fondo_destino,
+                    p.nota,
+                    p.tasa_cambio
                 FROM pagos p
                 LEFT JOIN propiedades pr ON pr.id = p.propiedad_id
                 CROSS JOIN LATERAL (
@@ -1382,7 +1407,56 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
             `;
 
             const extras = await pool.query<IExtraInfoRow>(query, [cuentaId]);
-            return res.json({ status: 'success', extras: extras.rows });
+            const round2 = (n: unknown): number => {
+                const parsed = parseFloat(String(n ?? 0));
+                if (!Number.isFinite(parsed)) return 0;
+                return parseFloat(parsed.toFixed(2));
+            };
+            const parseLocale = (value: unknown): number => {
+                const raw = String(value ?? '').trim();
+                if (!raw) return 0;
+                const normalized = raw.includes(',')
+                    ? (raw.includes('.') ? raw.replace(/\./g, '').replace(',', '.') : raw.replace(',', '.'))
+                    : raw;
+                const parsed = parseFloat(normalized);
+                return Number.isFinite(parsed) ? parsed : 0;
+            };
+
+            const normalizedExtras = extras.rows.map((row: IExtraInfoRow) => {
+                const notaRaw = String(row.nota || '');
+                const tasa = round2(parseLocale(row.tasa_cambio || 0));
+                const markerItemsBs = notaRaw.match(/\[extra_items_bs:([^\]]+)\]/i)?.[1] || '';
+                let montoBsExacto = 0;
+                if (markerItemsBs) {
+                    const parts = markerItemsBs.split(';').map((v) => v.trim()).filter(Boolean);
+                    for (const part of parts) {
+                        const [, bsPart] = part.split('=');
+                        const markerBs = round2(parseLocale(bsPart || 0));
+                        if (markerBs > 0) {
+                            montoBsExacto = round2(montoBsExacto + markerBs);
+                        }
+                    }
+                }
+
+                const montoBs = montoBsExacto > 0 ? montoBsExacto : (row.monto_bs !== null ? round2(parseLocale(row.monto_bs)) : null);
+                let montoUsd = round2(parseLocale(row.monto_usd));
+                if (montoUsd <= 0 && montoBs !== null && montoBs > 0 && tasa > 0) {
+                    montoUsd = round2(montoBs / tasa);
+                }
+
+                return {
+                    pago_id: row.pago_id,
+                    fecha: row.fecha,
+                    referencia: row.referencia,
+                    inmueble: row.inmueble,
+                    concepto: row.concepto,
+                    monto_bs: montoBs,
+                    monto_usd: montoUsd,
+                    fondo_destino: row.fondo_destino,
+                };
+            });
+
+            return res.json({ status: 'success', extras: normalizedExtras });
         } catch (error: unknown) {
             const typedError = asError(error);
             console.error('Error en extras-info:', error);
