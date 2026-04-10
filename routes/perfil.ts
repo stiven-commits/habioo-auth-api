@@ -336,7 +336,7 @@ router.put('/password', verifyToken, async (req: Request, res: Response<ApiRes>)
 
     const hashed = await bcrypt.hash(nueva_password, 10);
     const updateRes = await pool.query(
-      'UPDATE users SET password = $1 WHERE id = $2',
+      'UPDATE users SET password = $1, debe_cambiar_password = false WHERE id = $2',
       [hashed, authUser.id]
     );
     if (updateRes.rowCount === 0) {

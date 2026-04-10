@@ -1437,7 +1437,7 @@ router.put('/perfil/password', verifyToken, async (req: Request, res: Response<A
 
     const hashedPassword = await bcrypt.hash(nuevaPassword, 10);
     const updateRes = await pool.query(
-      'UPDATE users SET password = $1 WHERE id = $2',
+      'UPDATE users SET password = $1, debe_cambiar_password = false WHERE id = $2',
       [hashedPassword, authUser.id],
     );
 

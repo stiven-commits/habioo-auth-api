@@ -14,6 +14,7 @@ interface IUserRow {
     cedula: string;
     nombre: string;
     password: string;
+    debe_cambiar_password: boolean | null;
     is_superuser: boolean | null;
     created_at: Date;
 }
@@ -409,7 +410,10 @@ const registerAuthRoutes = (
                 return res.status(429).json({ status: 'error', message: 'Demasiados intentos. Intente nuevamente en unos minutos.' });
             }
 
-            const result = await pool.query<IUserRow>('SELECT * FROM users WHERE cedula = $1', [cedulaLimpia]);
+            const result = await pool.query<IUserRow>(
+                'SELECT id, cedula, nombre, password, debe_cambiar_password, is_superuser, created_at FROM users WHERE cedula = $1',
+                [cedulaLimpia]
+            );
             const user = result.rows[0];
             if (!user) {
                 registerFailedAttempt(attemptKey);
@@ -504,7 +508,13 @@ const registerAuthRoutes = (
                 expires_at: null,
             };
 
-            res.json({ status: 'success', token, user: mapUserForResponse(user), session });
+            res.json({
+                status: 'success',
+                token,
+                user: mapUserForResponse(user),
+                session,
+                requiresPasswordChange: user.debe_cambiar_password === true,
+            });
         } catch (err: unknown) {
             const error = err as Error;
             res.status(500).json({ error: error.message });

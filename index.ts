@@ -162,32 +162,17 @@ if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-app.get('/uploads/gastos/:filename', (req: Request, res: Response, next: NextFunction) => {
-    const rawFilename = String(req.params.filename || '').trim();
-    const safeFilename = path.basename(rawFilename);
-    if (!safeFilename) {
-        return res.status(404).end();
+app.get('/uploads/:folder/:filename', verifyToken, (req: Request, res: Response) => {
+    const folderParam = Array.isArray(req.params.folder) ? req.params.folder[0] : req.params.folder;
+    const filenameParam = Array.isArray(req.params.filename) ? req.params.filename[0] : req.params.filename;
+    const filePath = path.join(__dirname, 'uploads', folderParam || '', filenameParam || '');
+
+    if (fs.existsSync(filePath)) {
+        return res.sendFile(path.resolve(filePath));
     }
 
-    const requestedPath = path.join(__dirname, 'uploads', 'gastos', safeFilename);
-    if (fs.existsSync(requestedPath)) {
-        return res.sendFile(requestedPath);
-    }
-
-    const parsed = path.parse(safeFilename);
-    const base = parsed.name;
-    const candidates = ['.webp', '.pdf', '.png', '.jpg', '.jpeg'];
-    for (const ext of candidates) {
-        const candidatePath = path.join(__dirname, 'uploads', 'gastos', `${base}${ext}`);
-        if (fs.existsSync(candidatePath)) {
-            return res.sendFile(candidatePath);
-        }
-    }
-
-    return next();
+    return res.status(404).json({ message: 'Archivo no encontrado' });
 });
-
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const getPagosOptionalColumns: GetPagosOptionalColumns = createGetPagosOptionalColumns(pool);
 
