@@ -65,6 +65,7 @@ interface IGastoImagenesRow {
     condominio_id?: number;
     factura_img: string | null;
     imagenes: string[] | null;
+    nota?: string | null;
 }
 
 interface IGastoListRow extends Record<string, unknown> {
@@ -207,6 +208,7 @@ interface CreateGastoBody {
     monto_historico_proveedor_usd?: string | number | null;
     monto_historico_recaudado_usd?: string | number | null;
     tasa_historica?: string | number | null;
+    es_historico?: string | number | boolean | null;
     remove_factura_img?: string | boolean | null;
     keep_imagenes?: string | string[] | null;
 }
@@ -392,6 +394,13 @@ const toIsoDateOrNull = (value: unknown): string | null => {
     throw new Error('fecha_gasto invalida. Use dd/mm/yyyy o yyyy-mm-dd.');
 };
 
+const parseBooleanFlag = (value: unknown): boolean => {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value === 1;
+    const raw = String(value ?? '').trim().toLowerCase();
+    return ['1', 'true', 'si', 'sí', 'yes', 'on'].includes(raw);
+};
+
 const {
     ensureJuntaGeneralSchema,
     isJuntaGeneralTipo,
@@ -490,6 +499,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             monto_historico_proveedor_usd,
             monto_historico_recaudado_usd,
             tasa_historica,
+            es_historico,
             remove_factura_img,
         } = req.body;
 
@@ -622,6 +632,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             if (montoHistoricoProveedorUsdSafe > 0) metaHistorico.push(`[hist.proveedor_usd:${montoHistoricoProveedorUsdSafe.toFixed(2)}]`);
             if (montoHistoricoRecaudadoUsdSafe > 0) metaHistorico.push(`[hist.recaudado_usd:${montoHistoricoRecaudadoUsdSafe.toFixed(2)}]`);
             if (tasaHistoricaSafe > 0) metaHistorico.push(`[hist.tasa:${tasaHistoricaSafe.toFixed(4)}]`);
+            if (parseBooleanFlag(es_historico)) metaHistorico.push('[hist.no_aviso:1]');
             const notaFinal = [notaBase, ...metaHistorico].filter(Boolean).join(' | ') || null;
 
             const result = await pool.query<IInsertedIdRow>(
@@ -668,6 +679,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             monto_historico_proveedor_usd,
             monto_historico_recaudado_usd,
             tasa_historica,
+            es_historico,
             remove_factura_img,
         } = req.body;
 
@@ -682,7 +694,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const esJuntaGeneral = isJuntaGeneralTipo(condo.tipo);
 
             const ownGastoRes = await pool.query<IGastoImagenesRow>(
-                'SELECT id, condominio_id, factura_img, imagenes FROM gastos WHERE id = $1 LIMIT 1',
+                'SELECT id, condominio_id, factura_img, imagenes, nota FROM gastos WHERE id = $1 LIMIT 1',
                 [gastoId]
             );
             const ownGasto = ownGastoRes.rows[0];
@@ -825,6 +837,11 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             if (montoHistoricoProveedorUsdSafe > 0) metaHistorico.push(`[hist.proveedor_usd:${montoHistoricoProveedorUsdSafe.toFixed(2)}]`);
             if (montoHistoricoRecaudadoUsdSafe > 0) metaHistorico.push(`[hist.recaudado_usd:${montoHistoricoRecaudadoUsdSafe.toFixed(2)}]`);
             if (tasaHistoricaSafe > 0) metaHistorico.push(`[hist.tasa:${tasaHistoricaSafe.toFixed(4)}]`);
+            const rawEsHistorico = req.body.es_historico;
+            const esHistoricoProvided = rawEsHistorico !== undefined && rawEsHistorico !== null && String(rawEsHistorico).trim() !== '';
+            const esHistoricoActual = /\[hist\.no_aviso:1\]/i.test(String(ownGasto?.nota || ''));
+            const esHistoricoFinal = esHistoricoProvided ? parseBooleanFlag(rawEsHistorico) : esHistoricoActual;
+            if (esHistoricoFinal) metaHistorico.push('[hist.no_aviso:1]');
             const notaFinal = [notaBase, ...metaHistorico].filter(Boolean).join(' | ') || null;
 
             await pool.query('BEGIN');
@@ -1007,7 +1024,12 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             SELECT g.concepto, gc.monto_cuota_usd, gc.numero_cuota, g.total_cuotas, p.nombre as proveedor, g.nota, g.monto_usd as monto_total_usd, gc.mes_asignado,
                 (g.monto_usd - (gc.monto_cuota_usd * gc.numero_cuota)) as saldo_restante
             FROM gastos_cuotas gc JOIN gastos g ON gc.gasto_id = g.id JOIN proveedores p ON g.proveedor_id = p.id
-            WHERE g.condominio_id = $1 AND gc.mes_asignado >= $2 AND (gc.estado = 'Pendiente' OR gc.estado IS NULL) AND g.tipo IN ('Comun', 'Extra') ORDER BY gc.mes_asignado ASC
+            WHERE g.condominio_id = $1
+              AND gc.mes_asignado >= $2
+              AND (gc.estado = 'Pendiente' OR gc.estado IS NULL)
+              AND g.tipo IN ('Comun', 'Extra')
+              AND COALESCE(g.nota, '') NOT ILIKE '%[hist.no_aviso:1]%'
+            ORDER BY gc.mes_asignado ASC
         `,
                 [condominio_id, mes_actual]
             );
@@ -1140,7 +1162,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                      WHERE g.condominio_id = $1
                        AND gc.mes_asignado = $2
                        AND gc.estado = 'Pendiente'
-                       AND g.tipo IN ('Comun', 'Extra', 'Zona', 'No Comun')`,
+                       AND g.tipo IN ('Comun', 'Extra', 'Zona', 'No Comun')
+                       AND COALESCE(g.nota, '') NOT ILIKE '%[hist.no_aviso:1]%'`,
                      [condo_id, mes_actual]
                  );
                 const totalAvisoUsd = cuotasResGeneral.rows.reduce((acc, c) => acc + toNumber(c.monto_cuota_usd), 0);
@@ -1537,7 +1560,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                  LEFT JOIN propiedades gp ON gp.id = g.propiedad_id
                  WHERE g.condominio_id = $1
                    AND gc.mes_asignado = $2
-                   AND gc.estado = 'Pendiente'`,
+                   AND gc.estado = 'Pendiente'
+                   AND COALESCE(g.nota, '') NOT ILIKE '%[hist.no_aviso:1]%'`,
                 [condo_id, mes_actual]
             );
 
