@@ -752,10 +752,10 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 const isBs = ['BS', 'BS.'].includes(String(fondo.moneda || '').toUpperCase());
                 const amount = round2(isBs ? row.monto_bs : row.monto_usd);
                 if (amount <= 0) continue;
-                addDelta(row.fondo_id, -amount); // pago histórico: salida del fondo
+                // Pago histórico: solo referencia histórica (NO toca fondos/cuentas).
                 console.info('[GASTO_HIST_MOV]', {
                     tipo: 'pagado_historico',
-                    modo: 'solo_egreso',
+                    modo: 'solo_registro_sin_impacto',
                     condominio_id: input.condominioId,
                     cuenta_bancaria_id: Number(row.cuenta_bancaria_id),
                     fondo_origen_id: Number(row.fondo_id),
@@ -807,7 +807,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 : await resolveMovimientoFondoTipo(['EGRESO', 'SALIDA', 'RETIRO', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
             const nota = delta >= 0
                 ? `Reclasificación histórica a Tránsito/Extra (gasto ${input.gastoId})`
-                : `Reclasificación/Pago histórico desde fondo (gasto ${input.gastoId})`;
+                : `Reclasificación/Recaudado histórico desde fondo (gasto ${input.gastoId})`;
             await pool.query(
                 `
                 INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota)
@@ -994,7 +994,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     pagadoRows: pagadoRowsSafe,
                     recaudadoRows: recaudadoRowsSafe,
                 });
-                if (rowsDeltaMapCheck.size === 0 && (pagadoRowsSafe.length > 0 || recaudadoRowsSafe.length > 0)) {
+                if (rowsDeltaMapCheck.size === 0 && recaudadoRowsSafe.length > 0) {
                     return res.status(400).json({ status: 'error', message: 'No se pudo validar los orígenes históricos seleccionados.' });
                 }
             } else if (historicoEnCuentaSafe && historicoCuentaIdSafe && historicoFondoIdSafe) {
@@ -1335,7 +1335,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     pagadoRows: pagadoRowsSafe,
                     recaudadoRows: recaudadoRowsSafe,
                 });
-                if (rowsDeltaMapCheck.size === 0 && (pagadoRowsSafe.length > 0 || recaudadoRowsSafe.length > 0)) {
+                if (rowsDeltaMapCheck.size === 0 && recaudadoRowsSafe.length > 0) {
                     return res.status(400).json({ status: 'error', message: 'No se pudo validar los orígenes históricos seleccionados.' });
                 }
             }
