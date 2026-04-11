@@ -1217,6 +1217,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                             AND (
                                 COALESCE(mf.nota, '') ILIKE 'Reclasificación/Pago histórico%'
                                 OR COALESCE(mf.nota, '') ILIKE 'Reclasificacion/Pago historico%'
+                                OR COALESCE(mf.nota, '') ILIKE 'Reclasificación/Recaudado histórico%'
+                                OR COALESCE(mf.nota, '') ILIKE 'Reclasificacion/Recaudado historico%'
                             )
                         )
                       )

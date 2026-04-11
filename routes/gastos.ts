@@ -66,6 +66,7 @@ interface IGastoImagenesRow {
     factura_img: string | null;
     imagenes: string[] | null;
     nota?: string | null;
+    tasa_cambio?: string | number | null;
 }
 
 interface IGastoListRow extends Record<string, unknown> {
@@ -814,6 +815,34 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 VALUES ($1, $2, $3, $4, $5)
                 `,
                 [fondoId, tipo, round2(Math.abs(delta)), round2(input.tasaCambio), nota]
+            );
+        }
+    };
+
+    const rollbackFundDeltaMap = async (input: {
+        gastoId: number;
+        tasaCambio: number;
+        appliedDeltaMap: Map<number, number>;
+    }): Promise<void> => {
+        for (const [fondoId, appliedDelta] of input.appliedDeltaMap.entries()) {
+            const compensatingDelta = round2(-appliedDelta);
+            if (Math.abs(compensatingDelta) < 0.005) continue;
+            await pool.query(
+                'UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2',
+                [compensatingDelta, fondoId]
+            );
+            const tipo = compensatingDelta >= 0
+                ? await resolveMovimientoFondoTipo(['INGRESO_EXTRA', 'INGRESO', 'ABONO', 'ENTRADA', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL')
+                : await resolveMovimientoFondoTipo(['EGRESO', 'SALIDA', 'RETIRO', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
+            const nota = compensatingDelta >= 0
+                ? `Rollback eliminación gasto histórico (gasto ${input.gastoId})`
+                : `Rollback eliminación gasto histórico (egreso, gasto ${input.gastoId})`;
+            await pool.query(
+                `
+                INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota)
+                VALUES ($1, $2, $3, $4, $5)
+                `,
+                [fondoId, tipo, round2(Math.abs(compensatingDelta)), round2(input.tasaCambio), nota]
             );
         }
     };
@@ -1604,8 +1633,16 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
     });
 
     app.delete('/gastos/:id', verifyToken, async (req: Request<DeleteGastoParams>, res: Response, _next: NextFunction) => {
+        let inTransaction = false;
         try {
+            const user = asAuthUser(req.user);
             const gastoId = asString(req.params.id);
+            const condo = await resolveCondominioBySession(pool, user);
+            if (!condo) {
+                return res.status(404).json({ status: 'error', message: 'Condominio no encontrado para la sesión activa.' });
+            }
+            const condominioId = condo.id;
+
             const cuotasCheck = await pool.query<IGastoCuotaCheckRow>("SELECT id FROM gastos_cuotas WHERE gasto_id = $1 AND estado != 'Pendiente'", [gastoId]);
             if (cuotasCheck.rows.length > 0) return res.status(400).json({ status: 'error', message: 'No puedes eliminar un gasto con cuotas procesadas.' });
 
@@ -1626,11 +1663,66 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 return res.status(400).json({ status: 'error', message: 'No puedes eliminar un gasto con pagos reales al proveedor.' });
             }
 
-            const imgRes = await pool.query<IGastoImagenesRow>('SELECT factura_img, imagenes FROM gastos WHERE id = $1', [gastoId]);
-            const { factura_img, imagenes } = imgRes.rows[0] || {};
+            const imgRes = await pool.query<IGastoImagenesRow>(
+                'SELECT id, condominio_id, factura_img, imagenes, nota, tasa_cambio FROM gastos WHERE id = $1 AND condominio_id = $2',
+                [gastoId, condominioId]
+            );
+            if (imgRes.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: 'Gasto no encontrado para este condominio.' });
+            }
+            const { factura_img, imagenes, nota, tasa_cambio } = imgRes.rows[0] || {};
+            const tasaCambioSafe = round2(toNumber(tasa_cambio) || 0);
+            const pagadoRows = decodeRowsB64FromNota(nota, 'pagado');
+            const recaudadoRows = decodeRowsB64FromNota(nota, 'recaudado');
+            const hasRows = pagadoRows.length > 0 || recaudadoRows.length > 0;
+            const histMeta = parseHistMetaFromNota(nota);
+
+            await pool.query('BEGIN');
+            inTransaction = true;
+
+            if (hasRows) {
+                const appliedDeltaMap = await buildFundDeltaMapFromRows({
+                    condominioId,
+                    pagadoRows,
+                    recaudadoRows,
+                });
+                await rollbackFundDeltaMap({
+                    gastoId: Number(gastoId),
+                    tasaCambio: tasaCambioSafe,
+                    appliedDeltaMap,
+                });
+            } else if (
+                histMeta.bankEnabled
+                && histMeta.bankCuentaId
+                && histMeta.bankFondoId
+                && (histMeta.recaudadoUsd > 0 || histMeta.recaudadoBs > 0)
+            ) {
+                await applyHistoricalBankDelta({
+                    condominioId,
+                    gastoId: Number(gastoId),
+                    prev: {
+                        enabled: true,
+                        cuentaId: histMeta.bankCuentaId,
+                        fondoId: histMeta.bankFondoId,
+                        recaudadoUsd: round2(histMeta.recaudadoUsd),
+                        recaudadoBs: round2(histMeta.recaudadoBs),
+                    },
+                    next: {
+                        enabled: false,
+                        cuentaId: null,
+                        fondoId: null,
+                        recaudadoUsd: 0,
+                        recaudadoBs: 0,
+                    },
+                    tasaCambio: tasaCambioSafe,
+                });
+            }
 
             await pool.query('DELETE FROM gastos_cuotas WHERE gasto_id = $1', [gastoId]);
-            await pool.query('DELETE FROM gastos WHERE id = $1', [gastoId]);
+            await pool.query('DELETE FROM gastos WHERE id = $1 AND condominio_id = $2', [gastoId, condominioId]);
+
+            await pool.query('COMMIT');
+            inTransaction = false;
 
             if (factura_img) {
                 const fullPath = path.join(__dirname, '..', factura_img);
@@ -1646,6 +1738,9 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
             res.json({ status: 'success', message: 'Gasto eliminado.' });
         } catch (err: unknown) {
+            if (inTransaction) {
+                await pool.query('ROLLBACK');
+            }
             const error = asError(err);
             res.status(500).json({ error: error.message });
         }
