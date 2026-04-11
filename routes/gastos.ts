@@ -212,6 +212,8 @@ interface CreateGastoBody {
     historico_en_cuenta?: string | number | boolean | null;
     historico_cuenta_bancaria_id?: string | number | null;
     historico_fondo_id?: string | number | null;
+    historico_pagado_origenes?: unknown;
+    historico_recaudado_origenes?: unknown;
     tasa_historica?: string | number | null;
     es_historico?: string | number | boolean | null;
     remove_factura_img?: string | boolean | null;
@@ -426,6 +428,13 @@ interface HistBankTarget {
     recaudadoBs: number;
 }
 
+interface HistOriginRow {
+    cuenta_bancaria_id: number;
+    fondo_id: number;
+    monto_usd: number;
+    monto_bs: number;
+}
+
 const round2 = (value: number): number => Math.round((Number(value) || 0) * 100) / 100;
 
 const parseHistMetaFromNota = (nota: string | null | undefined): HistMeta => {
@@ -452,6 +461,43 @@ const parseHistMetaFromNota = (nota: string | null | undefined): HistMeta => {
         bankFondoId: extractInt(/\[hist\.bank_fondo_id:(\d+)\]/i),
         esHistorico: /\[hist\.no_aviso:1\]/i.test(raw),
     };
+};
+
+const parseHistOriginRows = (raw: unknown): HistOriginRow[] => {
+    if (raw === undefined || raw === null) return [];
+    let parsed: unknown = raw;
+    if (typeof raw === 'string') {
+        const trimmed = raw.trim();
+        if (!trimmed) return [];
+        try {
+            parsed = JSON.parse(trimmed);
+        } catch {
+            return [];
+        }
+    }
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+        .map((item) => {
+            if (!item || typeof item !== 'object') return null;
+            const row = item as {
+                cuenta_bancaria_id?: unknown;
+                fondo_id?: unknown;
+                monto_usd?: unknown;
+                monto_bs?: unknown;
+            };
+            const cuentaId = toPositiveInt(row.cuenta_bancaria_id);
+            const fondoId = toPositiveInt(row.fondo_id);
+            const montoUsd = round2(parseFloat(String(row.monto_usd ?? 0)) || 0);
+            const montoBs = round2(parseFloat(String(row.monto_bs ?? 0)) || 0);
+            if (!cuentaId || !fondoId || (montoUsd <= 0 && montoBs <= 0)) return null;
+            return {
+                cuenta_bancaria_id: cuentaId,
+                fondo_id: fondoId,
+                monto_usd: montoUsd,
+                monto_bs: montoBs,
+            };
+        })
+        .filter((row): row is HistOriginRow => Boolean(row));
 };
 
 const {
@@ -650,6 +696,89 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         }
     };
 
+    const decodeRowsB64FromNota = (nota: string | null | undefined, key: 'pagado' | 'recaudado'): HistOriginRow[] => {
+        const raw = String(nota || '');
+        const regex = key === 'pagado'
+            ? /\[hist\.pagado_rows_b64:([A-Za-z0-9+/=_-]+)\]/i
+            : /\[hist\.recaudado_rows_b64:([A-Za-z0-9+/=_-]+)\]/i;
+        const match = raw.match(regex);
+        if (!match?.[1]) return [];
+        try {
+            const decoded = Buffer.from(match[1], 'base64').toString('utf8');
+            return parseHistOriginRows(decoded);
+        } catch {
+            return [];
+        }
+    };
+
+    const buildFundDeltaMapFromRows = async (input: {
+        condominioId: number;
+        pagadoRows: HistOriginRow[];
+        recaudadoRows: HistOriginRow[];
+    }): Promise<Map<number, number>> => {
+        const allRows = [...input.pagadoRows, ...input.recaudadoRows];
+        if (allRows.length === 0) return new Map<number, number>();
+        const fondoIds = [...new Set(allRows.map((r) => r.fondo_id))];
+        const fondosRes = await pool.query<{ id: number; cuenta_bancaria_id: number; moneda: string }>(
+            `
+            SELECT id, cuenta_bancaria_id, COALESCE(moneda, 'USD') AS moneda
+            FROM fondos
+            WHERE condominio_id = $1
+              AND id = ANY($2::int[])
+              AND COALESCE(activo, true) = true
+            `,
+            [input.condominioId, fondoIds]
+        );
+        const fondosMap = new Map<number, { cuenta_bancaria_id: number; moneda: string }>();
+        for (const row of fondosRes.rows) fondosMap.set(row.id, { cuenta_bancaria_id: row.cuenta_bancaria_id, moneda: row.moneda });
+
+        const deltaMap = new Map<number, number>();
+        const addDelta = (fondoId: number, amount: number): void => {
+            const prev = deltaMap.get(fondoId) || 0;
+            deltaMap.set(fondoId, round2(prev + amount));
+        };
+        const applyRows = (rows: HistOriginRow[], sign: 1 | -1): void => {
+            for (const row of rows) {
+                const fondo = fondosMap.get(row.fondo_id);
+                if (!fondo) throw new Error(`Fondo ${row.fondo_id} no encontrado para histórico.`);
+                if (Number(fondo.cuenta_bancaria_id) !== Number(row.cuenta_bancaria_id)) {
+                    throw new Error(`La cuenta ${row.cuenta_bancaria_id} no corresponde al fondo ${row.fondo_id}.`);
+                }
+                const isBs = ['BS', 'BS.'].includes(String(fondo.moneda || '').toUpperCase());
+                const amount = round2(isBs ? row.monto_bs : row.monto_usd);
+                if (amount <= 0) continue;
+                addDelta(row.fondo_id, round2(sign * amount));
+            }
+        };
+        applyRows(input.recaudadoRows, 1);
+        applyRows(input.pagadoRows, -1);
+        return deltaMap;
+    };
+
+    const applyFundDeltaMap = async (input: {
+        gastoId: number;
+        tasaCambio: number;
+        deltaMap: Map<number, number>;
+    }): Promise<void> => {
+        for (const [fondoId, delta] of input.deltaMap.entries()) {
+            if (Math.abs(delta) < 0.005) continue;
+            await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [round2(delta), fondoId]);
+            const tipo = delta >= 0
+                ? await resolveMovimientoFondoTipo(['AJUSTE_INICIAL', 'INGRESO', 'ABONO', 'ENTRADA'], 'AJUSTE_INICIAL')
+                : await resolveMovimientoFondoTipo(['EGRESO', 'SALIDA', 'RETIRO', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
+            const nota = delta >= 0
+                ? `Ajuste histórico ingreso gasto ${input.gastoId}`
+                : `Ajuste histórico egreso gasto ${input.gastoId}`;
+            await pool.query(
+                `
+                INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota)
+                VALUES ($1, $2, $3, $4, $5)
+                `,
+                [fondoId, tipo, round2(Math.abs(delta)), round2(input.tasaCambio), nota]
+            );
+        }
+    };
+
     app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount: 1 }, { name: 'soportes', maxCount: 4 }]), async (req: Request<{}, unknown, CreateGastoBody>, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
 
@@ -674,6 +803,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             historico_en_cuenta,
             historico_cuenta_bancaria_id,
             historico_fondo_id,
+            historico_pagado_origenes,
+            historico_recaudado_origenes,
             tasa_historica,
             es_historico,
             remove_factura_img,
@@ -773,6 +904,16 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             if (montoHistoricoRecaudadoBsSafe <= 0 && montoHistoricoRecaudadoUsdSafe > 0 && tasaHistoricaSafe > 0) {
                 montoHistoricoRecaudadoBsSafe = round2(montoHistoricoRecaudadoUsdSafe * tasaHistoricaSafe);
             }
+            const pagadoRowsSafe = parseHistOriginRows(historico_pagado_origenes);
+            const recaudadoRowsSafe = parseHistOriginRows(historico_recaudado_origenes);
+            if (pagadoRowsSafe.length > 0) {
+                montoHistoricoProveedorUsdSafe = round2(pagadoRowsSafe.reduce((sum, row) => sum + row.monto_usd, 0));
+                montoHistoricoProveedorBsSafe = round2(pagadoRowsSafe.reduce((sum, row) => sum + row.monto_bs, 0));
+            }
+            if (recaudadoRowsSafe.length > 0) {
+                montoHistoricoRecaudadoUsdSafe = round2(recaudadoRowsSafe.reduce((sum, row) => sum + row.monto_usd, 0));
+                montoHistoricoRecaudadoBsSafe = round2(recaudadoRowsSafe.reduce((sum, row) => sum + row.monto_bs, 0));
+            }
 
             if (montoHistoricoProveedorUsdSafe < 0 || montoHistoricoProveedorUsdSafe > Number(montoUsdNum.toFixed(2))) {
                 return res.status(400).json({
@@ -799,16 +940,25 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 });
             }
 
-            const historicoEnCuentaSafe = parseBooleanFlag(historico_en_cuenta);
+            const historicoEnCuentaSafe = recaudadoRowsSafe.length > 0 || parseBooleanFlag(historico_en_cuenta);
             const historicoCuentaIdSafe = toPositiveInt(historico_cuenta_bancaria_id);
             const historicoFondoIdSafe = toPositiveInt(historico_fondo_id);
-            if (historicoEnCuentaSafe) {
-                if (!historicoCuentaIdSafe || !historicoFondoIdSafe) {
-                    return res.status(400).json({ status: 'error', message: 'Debes indicar cuenta y fondo para la recaudación histórica en cuenta.' });
+            if (historicoEnCuentaSafe && recaudadoRowsSafe.length === 0 && (!historicoCuentaIdSafe || !historicoFondoIdSafe)) {
+                return res.status(400).json({ status: 'error', message: 'Debes indicar cuenta y fondo para la recaudación histórica en cuenta.' });
+            }
+            if (historicoEnCuentaSafe && recaudadoRowsSafe.length === 0 && (montoHistoricoRecaudadoUsdSafe <= 0 && montoHistoricoRecaudadoBsSafe <= 0)) {
+                return res.status(400).json({ status: 'error', message: 'Debes indicar una recaudación histórica mayor a 0 para sincronizar con cuenta bancaria.' });
+            }
+            if (recaudadoRowsSafe.length > 0 || pagadoRowsSafe.length > 0) {
+                const rowsDeltaMapCheck = await buildFundDeltaMapFromRows({
+                    condominioId: condominio_id,
+                    pagadoRows: pagadoRowsSafe,
+                    recaudadoRows: recaudadoRowsSafe,
+                });
+                if (rowsDeltaMapCheck.size === 0 && (pagadoRowsSafe.length > 0 || recaudadoRowsSafe.length > 0)) {
+                    return res.status(400).json({ status: 'error', message: 'No se pudo validar los orígenes históricos seleccionados.' });
                 }
-                if (montoHistoricoRecaudadoUsdSafe <= 0 && montoHistoricoRecaudadoBsSafe <= 0) {
-                    return res.status(400).json({ status: 'error', message: 'Debes indicar una recaudación histórica mayor a 0 para sincronizar con cuenta bancaria.' });
-                }
+            } else if (historicoEnCuentaSafe && historicoCuentaIdSafe && historicoFondoIdSafe) {
                 const targetFondo = await getHistFondoTarget({
                     condominioId: condominio_id,
                     cuentaId: historicoCuentaIdSafe,
@@ -855,6 +1005,12 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 if (historicoCuentaIdSafe) metaHistorico.push(`[hist.bank_cuenta_id:${historicoCuentaIdSafe}]`);
                 if (historicoFondoIdSafe) metaHistorico.push(`[hist.bank_fondo_id:${historicoFondoIdSafe}]`);
             }
+            if (pagadoRowsSafe.length > 0) {
+                metaHistorico.push(`[hist.pagado_rows_b64:${Buffer.from(JSON.stringify(pagadoRowsSafe)).toString('base64')}]`);
+            }
+            if (recaudadoRowsSafe.length > 0) {
+                metaHistorico.push(`[hist.recaudado_rows_b64:${Buffer.from(JSON.stringify(recaudadoRowsSafe)).toString('base64')}]`);
+            }
             if (esHistoricoSafe) metaHistorico.push('[hist.no_aviso:1]');
             const notaFinal = [notaBase, ...metaHistorico].filter(Boolean).join(' | ') || null;
 
@@ -874,25 +1030,38 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 await pool.query('INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado) VALUES ($1, $2, $3, $4)', [result.rows[0].id, i, monto_cuota_usd, mes_cuota]);
             }
 
-            await applyHistoricalBankDelta({
-                condominioId: condominio_id,
-                gastoId: result.rows[0].id,
-                prev: {
-                    enabled: false,
-                    cuentaId: null,
-                    fondoId: null,
-                    recaudadoUsd: 0,
-                    recaudadoBs: 0,
-                },
-                next: {
-                    enabled: historicoEnCuentaSafe,
-                    cuentaId: historicoCuentaIdSafe,
-                    fondoId: historicoFondoIdSafe,
-                    recaudadoUsd: montoHistoricoRecaudadoUsdSafe,
-                    recaudadoBs: montoHistoricoRecaudadoBsSafe,
-                },
-                tasaCambio: t_c,
-            });
+            if (pagadoRowsSafe.length > 0 || recaudadoRowsSafe.length > 0) {
+                const deltaMap = await buildFundDeltaMapFromRows({
+                    condominioId: condominio_id,
+                    pagadoRows: pagadoRowsSafe,
+                    recaudadoRows: recaudadoRowsSafe,
+                });
+                await applyFundDeltaMap({
+                    gastoId: result.rows[0].id,
+                    tasaCambio: t_c,
+                    deltaMap,
+                });
+            } else {
+                await applyHistoricalBankDelta({
+                    condominioId: condominio_id,
+                    gastoId: result.rows[0].id,
+                    prev: {
+                        enabled: false,
+                        cuentaId: null,
+                        fondoId: null,
+                        recaudadoUsd: 0,
+                        recaudadoBs: 0,
+                    },
+                    next: {
+                        enabled: historicoEnCuentaSafe,
+                        cuentaId: historicoCuentaIdSafe,
+                        fondoId: historicoFondoIdSafe,
+                        recaudadoUsd: montoHistoricoRecaudadoUsdSafe,
+                        recaudadoBs: montoHistoricoRecaudadoBsSafe,
+                    },
+                    tasaCambio: t_c,
+                });
+            }
 
             await pool.query('COMMIT');
             inTransaction = false;
@@ -935,6 +1104,8 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             historico_en_cuenta,
             historico_cuenta_bancaria_id,
             historico_fondo_id,
+            historico_pagado_origenes,
+            historico_recaudado_origenes,
             tasa_historica,
             es_historico,
             remove_factura_img,
@@ -1058,6 +1229,16 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             if (montoHistoricoRecaudadoBsSafe <= 0 && montoHistoricoRecaudadoUsdSafe > 0 && tasaHistoricaSafe > 0) {
                 montoHistoricoRecaudadoBsSafe = round2(montoHistoricoRecaudadoUsdSafe * tasaHistoricaSafe);
             }
+            const pagadoRowsSafe = parseHistOriginRows(historico_pagado_origenes);
+            const recaudadoRowsSafe = parseHistOriginRows(historico_recaudado_origenes);
+            if (pagadoRowsSafe.length > 0) {
+                montoHistoricoProveedorUsdSafe = round2(pagadoRowsSafe.reduce((sum, row) => sum + row.monto_usd, 0));
+                montoHistoricoProveedorBsSafe = round2(pagadoRowsSafe.reduce((sum, row) => sum + row.monto_bs, 0));
+            }
+            if (recaudadoRowsSafe.length > 0) {
+                montoHistoricoRecaudadoUsdSafe = round2(recaudadoRowsSafe.reduce((sum, row) => sum + row.monto_usd, 0));
+                montoHistoricoRecaudadoBsSafe = round2(recaudadoRowsSafe.reduce((sum, row) => sum + row.monto_bs, 0));
+            }
             if (montoHistoricoProveedorUsdSafe < 0 || montoHistoricoProveedorUsdSafe > Number(montoUsdNum.toFixed(2))) {
                 return res.status(400).json({
                     status: 'error',
@@ -1082,10 +1263,10 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     message: 'La recaudación histórica en Bs no puede superar el monto en Bs del gasto.',
                 });
             }
-            const historicoEnCuentaSafe = parseBooleanFlag(historico_en_cuenta);
+            const historicoEnCuentaSafe = recaudadoRowsSafe.length > 0 || parseBooleanFlag(historico_en_cuenta);
             const historicoCuentaIdSafe = toPositiveInt(historico_cuenta_bancaria_id);
             const historicoFondoIdSafe = toPositiveInt(historico_fondo_id);
-            if (historicoEnCuentaSafe) {
+            if (historicoEnCuentaSafe && recaudadoRowsSafe.length === 0) {
                 if (!historicoCuentaIdSafe || !historicoFondoIdSafe) {
                     return res.status(400).json({ status: 'error', message: 'Debes indicar cuenta y fondo para la recaudación histórica en cuenta.' });
                 }
@@ -1099,6 +1280,16 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 });
                 if (!targetFondo) {
                     return res.status(400).json({ status: 'error', message: 'La cuenta/fondo histórico seleccionado no es válido para este condominio.' });
+                }
+            }
+            if (recaudadoRowsSafe.length > 0 || pagadoRowsSafe.length > 0) {
+                const rowsDeltaMapCheck = await buildFundDeltaMapFromRows({
+                    condominioId: condominio_id,
+                    pagadoRows: pagadoRowsSafe,
+                    recaudadoRows: recaudadoRowsSafe,
+                });
+                if (rowsDeltaMapCheck.size === 0 && (pagadoRowsSafe.length > 0 || recaudadoRowsSafe.length > 0)) {
+                    return res.status(400).json({ status: 'error', message: 'No se pudo validar los orígenes históricos seleccionados.' });
                 }
             }
             const monto_cuota_usd = (parseFloat(monto_usd) / totalCuotasSafe).toFixed(2);
@@ -1138,6 +1329,12 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 metaHistorico.push('[hist.bank_enabled:1]');
                 if (historicoCuentaIdSafe) metaHistorico.push(`[hist.bank_cuenta_id:${historicoCuentaIdSafe}]`);
                 if (historicoFondoIdSafe) metaHistorico.push(`[hist.bank_fondo_id:${historicoFondoIdSafe}]`);
+            }
+            if (pagadoRowsSafe.length > 0) {
+                metaHistorico.push(`[hist.pagado_rows_b64:${Buffer.from(JSON.stringify(pagadoRowsSafe)).toString('base64')}]`);
+            }
+            if (recaudadoRowsSafe.length > 0) {
+                metaHistorico.push(`[hist.recaudado_rows_b64:${Buffer.from(JSON.stringify(recaudadoRowsSafe)).toString('base64')}]`);
             }
             const rawEsHistorico = req.body.es_historico;
             const esHistoricoProvided = rawEsHistorico !== undefined && rawEsHistorico !== null && String(rawEsHistorico).trim() !== '';
@@ -1181,25 +1378,96 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 );
             }
 
-            await applyHistoricalBankDelta({
-                condominioId: condominio_id,
-                gastoId,
-                prev: {
-                    enabled: Boolean(prevHistMeta.bankEnabled),
-                    cuentaId: prevHistMeta.bankCuentaId,
-                    fondoId: prevHistMeta.bankFondoId,
-                    recaudadoUsd: round2(prevHistMeta.recaudadoUsd),
-                    recaudadoBs: round2(prevHistMeta.recaudadoBs),
-                },
-                next: {
-                    enabled: historicoEnCuentaSafe,
-                    cuentaId: historicoCuentaIdSafe,
-                    fondoId: historicoFondoIdSafe,
-                    recaudadoUsd: round2(montoHistoricoRecaudadoUsdSafe),
-                    recaudadoBs: round2(montoHistoricoRecaudadoBsSafe),
-                },
-                tasaCambio: t_c,
-            });
+            const prevPagadoRows = decodeRowsB64FromNota(ownGasto.nota, 'pagado');
+            const prevRecaudadoRows = decodeRowsB64FromNota(ownGasto.nota, 'recaudado');
+            const hasPrevRows = prevPagadoRows.length > 0 || prevRecaudadoRows.length > 0;
+            const hasNextRows = pagadoRowsSafe.length > 0 || recaudadoRowsSafe.length > 0;
+
+            if (hasPrevRows || hasNextRows) {
+                const prevDeltaMap = hasPrevRows
+                    ? await buildFundDeltaMapFromRows({
+                        condominioId: condominio_id,
+                        pagadoRows: prevPagadoRows,
+                        recaudadoRows: prevRecaudadoRows,
+                    })
+                    : new Map<number, number>();
+                if (!hasPrevRows && prevHistMeta.bankEnabled && prevHistMeta.bankCuentaId && prevHistMeta.bankFondoId) {
+                    const prevTarget = await getHistFondoTarget({
+                        condominioId: condominio_id,
+                        cuentaId: Number(prevHistMeta.bankCuentaId),
+                        fondoId: Number(prevHistMeta.bankFondoId),
+                    });
+                    if (prevTarget) {
+                        const prevImpact = resolveImpactByMoneda(prevTarget.moneda, {
+                            enabled: true,
+                            cuentaId: Number(prevHistMeta.bankCuentaId),
+                            fondoId: Number(prevHistMeta.bankFondoId),
+                            recaudadoUsd: round2(prevHistMeta.recaudadoUsd),
+                            recaudadoBs: round2(prevHistMeta.recaudadoBs),
+                        });
+                        if (prevImpact > 0) prevDeltaMap.set(prevTarget.id, round2((prevDeltaMap.get(prevTarget.id) || 0) + prevImpact));
+                    }
+                }
+
+                const nextDeltaMap = hasNextRows
+                    ? await buildFundDeltaMapFromRows({
+                        condominioId: condominio_id,
+                        pagadoRows: pagadoRowsSafe,
+                        recaudadoRows: recaudadoRowsSafe,
+                    })
+                    : new Map<number, number>();
+                if (!hasNextRows && historicoEnCuentaSafe && historicoCuentaIdSafe && historicoFondoIdSafe) {
+                    const nextTarget = await getHistFondoTarget({
+                        condominioId: condominio_id,
+                        cuentaId: historicoCuentaIdSafe,
+                        fondoId: historicoFondoIdSafe,
+                    });
+                    if (nextTarget) {
+                        const nextImpact = resolveImpactByMoneda(nextTarget.moneda, {
+                            enabled: true,
+                            cuentaId: historicoCuentaIdSafe,
+                            fondoId: historicoFondoIdSafe,
+                            recaudadoUsd: round2(montoHistoricoRecaudadoUsdSafe),
+                            recaudadoBs: round2(montoHistoricoRecaudadoBsSafe),
+                        });
+                        if (nextImpact > 0) nextDeltaMap.set(nextTarget.id, round2((nextDeltaMap.get(nextTarget.id) || 0) + nextImpact));
+                    }
+                }
+
+                const netDeltaMap = new Map<number, number>();
+                const allFundIds = new Set<number>([...prevDeltaMap.keys(), ...nextDeltaMap.keys()]);
+                for (const fundId of allFundIds) {
+                    const prevAmount = prevDeltaMap.get(fundId) || 0;
+                    const nextAmount = nextDeltaMap.get(fundId) || 0;
+                    const net = round2(nextAmount - prevAmount);
+                    if (Math.abs(net) >= 0.005) netDeltaMap.set(fundId, net);
+                }
+                await applyFundDeltaMap({
+                    gastoId,
+                    tasaCambio: t_c,
+                    deltaMap: netDeltaMap,
+                });
+            } else {
+                await applyHistoricalBankDelta({
+                    condominioId: condominio_id,
+                    gastoId,
+                    prev: {
+                        enabled: Boolean(prevHistMeta.bankEnabled),
+                        cuentaId: prevHistMeta.bankCuentaId,
+                        fondoId: prevHistMeta.bankFondoId,
+                        recaudadoUsd: round2(prevHistMeta.recaudadoUsd),
+                        recaudadoBs: round2(prevHistMeta.recaudadoBs),
+                    },
+                    next: {
+                        enabled: historicoEnCuentaSafe,
+                        cuentaId: historicoCuentaIdSafe,
+                        fondoId: historicoFondoIdSafe,
+                        recaudadoUsd: round2(montoHistoricoRecaudadoUsdSafe),
+                        recaudadoBs: round2(montoHistoricoRecaudadoBsSafe),
+                    },
+                    tasaCambio: t_c,
+                });
+            }
 
             await pool.query('COMMIT');
             inTransaction = false;
