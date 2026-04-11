@@ -822,7 +822,12 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                 ingresos_fondos AS (
                     SELECT
                         ('ING-MF-' || mf.id::text) AS id,
-                        COALESCE(p.fecha_pago::date, mf.fecha::date) AS fecha,
+                        CASE
+                            WHEN mf.tipo = 'AJUSTE_INICIAL'
+                                 AND COALESCE(mf.nota, '') ILIKE 'Saldo de apertura del fondo%'
+                                THEN COALESCE(f.fecha_saldo::date, mf.fecha::date)
+                            ELSE COALESCE(p.fecha_pago::date, mf.fecha::date)
+                        END AS fecha,
                         CASE
                             WHEN p.id IS NOT NULL THEN NULLIF(BTRIM(COALESCE(p.referencia, '')), '')
                             WHEN COALESCE(mf.nota, '') ILIKE 'Ingreso manual libro mayor%'
@@ -940,6 +945,8 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                         OR (
                             mf.tipo = 'AJUSTE_INICIAL'
                             AND (
+                                COALESCE(mf.nota, '') ILIKE 'Saldo de apertura del fondo%'
+                                OR
                                 COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
                                 OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
                                 OR hsi.id IS NOT NULL
@@ -1213,16 +1220,24 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                       AND (
                         UPPER(COALESCE(mf.tipo, '')) IN ('EGRESO', 'EGRESO_GASTO', 'SALIDA', 'DEBITO', 'DESCUENTO')
                         OR (
-                            UPPER(COALESCE(mf.tipo, '')) = 'AJUSTE_INICIAL'
-                            AND (
-                                COALESCE(mf.nota, '') ILIKE 'Reclasificación/Pago histórico%'
-                                OR COALESCE(mf.nota, '') ILIKE 'Reclasificacion/Pago historico%'
-                                OR COALESCE(mf.nota, '') ILIKE 'Reclasificación/Recaudado histórico%'
-                                OR COALESCE(mf.nota, '') ILIKE 'Reclasificacion/Recaudado historico%'
+                          UPPER(COALESCE(mf.tipo, '')) = 'AJUSTE_INICIAL'
+                          AND (
+                            COALESCE(mf.nota, '') ILIKE '%[SYS_HIST_RECLASIF_INTERNA]%'
+                            OR COALESCE(mf.nota, '') ILIKE 'Reclasificación/Recaudado histórico%'
+                            OR COALESCE(mf.nota, '') ILIKE 'Reclasificacion/Recaudado historico%'
+                            OR (
+                              mf.referencia_id IS NOT NULL
+                              AND EXISTS (
+                                SELECT 1
+                                FROM gastos g_hist
+                                WHERE g_hist.id = mf.referencia_id
+                                  AND g_hist.condominio_id = f.condominio_id
+                                  AND COALESCE(g_hist.nota, '') ~* '\\[hist\\.recaudado_rows_b64:[A-Za-z0-9+/=_-]+\\]'
+                              )
                             )
+                          )
                         )
                       )
-                      AND mf.referencia_id IS NULL
                 ),
                 transferencias_cuentas AS (
                     SELECT

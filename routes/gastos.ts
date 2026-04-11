@@ -807,14 +807,14 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 ? await resolveMovimientoFondoTipo(['INGRESO_EXTRA', 'INGRESO', 'ABONO', 'ENTRADA', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL')
                 : await resolveMovimientoFondoTipo(['EGRESO', 'SALIDA', 'RETIRO', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
             const nota = delta >= 0
-                ? `Reclasificación histórica a Tránsito/Extra (gasto ${input.gastoId})`
-                : `Reclasificación/Recaudado histórico desde fondo (gasto ${input.gastoId})`;
+                ? `Reclasificación histórica a Tránsito/Extra (gasto ${input.gastoId}) [SYS_HIST_RECLASIF_INTERNA]`
+                : `Reclasificación/Recaudado histórico desde fondo (gasto ${input.gastoId}) [SYS_HIST_RECLASIF_INTERNA]`;
             await pool.query(
                 `
-                INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO movimientos_fondos (fondo_id, tipo, monto, referencia_id, tasa_cambio, nota)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 `,
-                [fondoId, tipo, round2(Math.abs(delta)), round2(input.tasaCambio), nota]
+                [fondoId, tipo, round2(Math.abs(delta)), input.gastoId, round2(input.tasaCambio), nota]
             );
         }
     };
