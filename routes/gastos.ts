@@ -206,7 +206,12 @@ interface CreateGastoBody {
     fecha_gasto?: string | null;
     cuotas_historicas?: string | number | null;
     monto_historico_proveedor_usd?: string | number | null;
+    monto_historico_proveedor_bs?: string | number | null;
     monto_historico_recaudado_usd?: string | number | null;
+    monto_historico_recaudado_bs?: string | number | null;
+    historico_en_cuenta?: string | number | boolean | null;
+    historico_cuenta_bancaria_id?: string | number | null;
+    historico_fondo_id?: string | number | null;
     tasa_historica?: string | number | null;
     es_historico?: string | number | boolean | null;
     remove_factura_img?: string | boolean | null;
@@ -401,6 +406,54 @@ const parseBooleanFlag = (value: unknown): boolean => {
     return ['1', 'true', 'si', 'sí', 'yes', 'on'].includes(raw);
 };
 
+interface HistMeta {
+    cuotas: number;
+    proveedorUsd: number;
+    proveedorBs: number;
+    recaudadoUsd: number;
+    recaudadoBs: number;
+    bankEnabled: boolean;
+    bankCuentaId: number | null;
+    bankFondoId: number | null;
+    esHistorico: boolean;
+}
+
+interface HistBankTarget {
+    enabled: boolean;
+    cuentaId: number | null;
+    fondoId: number | null;
+    recaudadoUsd: number;
+    recaudadoBs: number;
+}
+
+const round2 = (value: number): number => Math.round((Number(value) || 0) * 100) / 100;
+
+const parseHistMetaFromNota = (nota: string | null | undefined): HistMeta => {
+    const raw = String(nota || '');
+    const extractNumber = (regex: RegExp): number => {
+        const m = raw.match(regex);
+        return m?.[1] ? round2(parseFloat(String(m[1]))) : 0;
+    };
+    const extractInt = (regex: RegExp): number | null => {
+        const m = raw.match(regex);
+        if (!m?.[1]) return null;
+        const parsed = parseInt(String(m[1]), 10);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    };
+    const cuotasMatch = raw.match(/\[hist\.cuotas:(\d+)\]/i);
+    return {
+        cuotas: cuotasMatch?.[1] ? Math.max(0, parseInt(cuotasMatch[1], 10) || 0) : 0,
+        proveedorUsd: extractNumber(/\[hist\.proveedor_usd:([0-9]+(?:\.[0-9]+)?)\]/i),
+        proveedorBs: extractNumber(/\[hist\.proveedor_bs:([0-9]+(?:\.[0-9]+)?)\]/i),
+        recaudadoUsd: extractNumber(/\[hist\.recaudado_usd:([0-9]+(?:\.[0-9]+)?)\]/i),
+        recaudadoBs: extractNumber(/\[hist\.recaudado_bs:([0-9]+(?:\.[0-9]+)?)\]/i),
+        bankEnabled: /\[hist\.bank_enabled:1\]/i.test(raw),
+        bankCuentaId: extractInt(/\[hist\.bank_cuenta_id:(\d+)\]/i),
+        bankFondoId: extractInt(/\[hist\.bank_fondo_id:(\d+)\]/i),
+        esHistorico: /\[hist\.no_aviso:1\]/i.test(raw),
+    };
+};
+
 const {
     ensureJuntaGeneralSchema,
     isJuntaGeneralTipo,
@@ -479,6 +532,124 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         return null;
     };
 
+    const resolveMovimientoFondoTipo = async (preferred: string[], fallback: string): Promise<string> => {
+        try {
+            const r = await pool.query<{ def: string }>(
+                `
+                SELECT pg_get_constraintdef(oid) AS def
+                FROM pg_constraint
+                WHERE conname = 'movimientos_fondos_tipo_check'
+                LIMIT 1
+                `
+            );
+            const def = String(r.rows?.[0]?.def || '');
+            const matches = [...def.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+            const allowed = new Set(matches);
+            const selected = preferred.find((item) => allowed.has(item));
+            if (selected) return selected;
+            if (matches.length > 0) return matches[0];
+        } catch (_err) {
+            // fallback below
+        }
+        return fallback;
+    };
+
+    const getHistFondoTarget = async (input: {
+        condominioId: number;
+        cuentaId: number;
+        fondoId: number;
+    }): Promise<{ id: number; cuenta_bancaria_id: number; moneda: string } | null> => {
+        const r = await pool.query<{ id: number; cuenta_bancaria_id: number; moneda: string }>(
+            `
+            SELECT f.id, f.cuenta_bancaria_id, COALESCE(f.moneda, 'USD') AS moneda
+            FROM fondos f
+            WHERE f.id = $1
+              AND f.condominio_id = $2
+              AND f.cuenta_bancaria_id = $3
+              AND COALESCE(f.activo, true) = true
+            LIMIT 1
+            `,
+            [input.fondoId, input.condominioId, input.cuentaId]
+        );
+        return r.rows[0] || null;
+    };
+
+    const resolveImpactByMoneda = (moneda: string, source: HistBankTarget): number => {
+        const isBs = ['BS', 'BS.'].includes(String(moneda || '').toUpperCase());
+        return round2(isBs ? source.recaudadoBs : source.recaudadoUsd);
+    };
+
+    const applyHistoricalBankDelta = async (input: {
+        condominioId: number;
+        gastoId: number;
+        prev: HistBankTarget;
+        next: HistBankTarget;
+        tasaCambio: number;
+    }): Promise<void> => {
+        const prevHas = input.prev.enabled && input.prev.cuentaId && input.prev.fondoId;
+        const nextHas = input.next.enabled && input.next.cuentaId && input.next.fondoId;
+
+        const prevTarget = prevHas
+            ? await getHistFondoTarget({
+                condominioId: input.condominioId,
+                cuentaId: Number(input.prev.cuentaId),
+                fondoId: Number(input.prev.fondoId),
+            })
+            : null;
+        const nextTarget = nextHas
+            ? await getHistFondoTarget({
+                condominioId: input.condominioId,
+                cuentaId: Number(input.next.cuentaId),
+                fondoId: Number(input.next.fondoId),
+            })
+            : null;
+
+        if (prevHas && !prevTarget) {
+            throw new Error('La cuenta/fondo histórico previo no es válido para este condominio.');
+        }
+        if (nextHas && !nextTarget) {
+            throw new Error('La cuenta/fondo histórico seleccionado no es válido para este condominio.');
+        }
+
+        const applyOnTarget = async (target: { id: number; moneda: string }, delta: number): Promise<void> => {
+            const amount = round2(delta);
+            if (Math.abs(amount) < 0.005) return;
+            await pool.query(
+                'UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2',
+                [amount, target.id]
+            );
+            const tipo = amount >= 0
+                ? await resolveMovimientoFondoTipo(['AJUSTE_INICIAL', 'INGRESO', 'ABONO', 'ENTRADA'], 'AJUSTE_INICIAL')
+                : await resolveMovimientoFondoTipo(['EGRESO', 'SALIDA', 'RETIRO', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
+            const nota = amount >= 0
+                ? `Ajuste histórico ingreso gasto ${input.gastoId}`
+                : `Ajuste histórico reverso gasto ${input.gastoId}`;
+            await pool.query(
+                `
+                INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota)
+                VALUES ($1, $2, $3, $4, $5)
+                `,
+                [target.id, tipo, round2(Math.abs(amount)), round2(input.tasaCambio), nota]
+            );
+        };
+
+        if (prevTarget && nextTarget && prevTarget.id === nextTarget.id) {
+            const prevImpact = resolveImpactByMoneda(prevTarget.moneda, input.prev);
+            const nextImpact = resolveImpactByMoneda(nextTarget.moneda, input.next);
+            await applyOnTarget(nextTarget, round2(nextImpact - prevImpact));
+            return;
+        }
+
+        if (prevTarget) {
+            const prevImpact = resolveImpactByMoneda(prevTarget.moneda, input.prev);
+            await applyOnTarget(prevTarget, -prevImpact);
+        }
+        if (nextTarget) {
+            const nextImpact = resolveImpactByMoneda(nextTarget.moneda, input.next);
+            await applyOnTarget(nextTarget, nextImpact);
+        }
+    };
+
     app.post('/gastos', verifyToken, upload.fields([{ name: 'factura_img', maxCount: 1 }, { name: 'soportes', maxCount: 4 }]), async (req: Request<{}, unknown, CreateGastoBody>, res: Response, _next: NextFunction) => {
         const user = asAuthUser(req.user);
 
@@ -497,7 +668,12 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             fecha_gasto,
             cuotas_historicas,
             monto_historico_proveedor_usd,
+            monto_historico_proveedor_bs,
             monto_historico_recaudado_usd,
+            monto_historico_recaudado_bs,
+            historico_en_cuenta,
+            historico_cuenta_bancaria_id,
+            historico_fondo_id,
             tasa_historica,
             es_historico,
             remove_factura_img,
@@ -560,7 +736,15 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
 
             const totalCuotasSafe = Math.max(1, parseInt(String(total_cuotas), 10) || 1);
             const cuotasHistoricasSafe = Math.max(0, Math.trunc(parseLocaleNumber(cuotas_historicas || 0)));
-            if (cuotasHistoricasSafe >= totalCuotasSafe) {
+            const esHistoricoSafe = parseBooleanFlag(es_historico);
+            if (esHistoricoSafe) {
+                if (cuotasHistoricasSafe > totalCuotasSafe) {
+                    return res.status(400).json({
+                        status: 'error',
+                        message: 'Las cuotas históricas no pueden superar el total de cuotas.',
+                    });
+                }
+            } else if (cuotasHistoricasSafe >= totalCuotasSafe) {
                 return res.status(400).json({
                     status: 'error',
                     message: 'Las cuotas históricas deben ser menores al total de cuotas.',
@@ -571,35 +755,67 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const montoUsdNum = parseFloat(monto_usd);
             const montoCuotaUsdNum = Number((montoUsdNum / totalCuotasSafe).toFixed(2));
             const monto_cuota_usd = montoCuotaUsdNum.toFixed(2);
-            const montoHistoricoProveedorUsdSafe = Number(parseLocaleNumber(monto_historico_proveedor_usd || 0).toFixed(2));
+            let montoHistoricoProveedorUsdSafe = Number(parseLocaleNumber(monto_historico_proveedor_usd || 0).toFixed(2));
+            let montoHistoricoProveedorBsSafe = Number(parseLocaleNumber(monto_historico_proveedor_bs || 0).toFixed(2));
+            let montoHistoricoRecaudadoUsdSafe = Number(parseLocaleNumber(monto_historico_recaudado_usd || 0).toFixed(2));
+            let montoHistoricoRecaudadoBsSafe = Number(parseLocaleNumber(monto_historico_recaudado_bs || 0).toFixed(2));
+            const tasaHistoricaSafe = Number(parseLocaleNumber(tasa_historica || 0).toFixed(4));
+            // Compatibilidad legado: si no llega USD/Bs en nuevos campos, intentar completar con tasa histórica.
+            if (montoHistoricoProveedorUsdSafe <= 0 && montoHistoricoProveedorBsSafe > 0 && tasaHistoricaSafe > 0) {
+                montoHistoricoProveedorUsdSafe = round2(montoHistoricoProveedorBsSafe / tasaHistoricaSafe);
+            }
+            if (montoHistoricoProveedorBsSafe <= 0 && montoHistoricoProveedorUsdSafe > 0 && tasaHistoricaSafe > 0) {
+                montoHistoricoProveedorBsSafe = round2(montoHistoricoProveedorUsdSafe * tasaHistoricaSafe);
+            }
+            if (montoHistoricoRecaudadoUsdSafe <= 0 && montoHistoricoRecaudadoBsSafe > 0 && tasaHistoricaSafe > 0) {
+                montoHistoricoRecaudadoUsdSafe = round2(montoHistoricoRecaudadoBsSafe / tasaHistoricaSafe);
+            }
+            if (montoHistoricoRecaudadoBsSafe <= 0 && montoHistoricoRecaudadoUsdSafe > 0 && tasaHistoricaSafe > 0) {
+                montoHistoricoRecaudadoBsSafe = round2(montoHistoricoRecaudadoUsdSafe * tasaHistoricaSafe);
+            }
+
             if (montoHistoricoProveedorUsdSafe < 0 || montoHistoricoProveedorUsdSafe > Number(montoUsdNum.toFixed(2))) {
                 return res.status(400).json({
                     status: 'error',
                     message: 'El pago histórico del proveedor debe estar entre 0 y el monto total del gasto.',
                 });
             }
-            const montoHistoricoRecaudadoUsdSafe = Number(parseLocaleNumber(monto_historico_recaudado_usd || 0).toFixed(2));
             if (montoHistoricoRecaudadoUsdSafe < 0 || montoHistoricoRecaudadoUsdSafe > Number(montoUsdNum.toFixed(2))) {
                 return res.status(400).json({
                     status: 'error',
                     message: 'La recaudación histórica debe estar entre 0 y el monto total del gasto.',
                 });
             }
-            const tasaHistoricaSafe = Number(parseLocaleNumber(tasa_historica || 0).toFixed(4));
-            if (tasaHistoricaSafe > 0) {
-                const montoHistoricoProveedorBsSafe = Number((montoHistoricoProveedorUsdSafe * tasaHistoricaSafe).toFixed(2));
-                const montoHistoricoRecaudadoBsSafe = Number((montoHistoricoRecaudadoUsdSafe * tasaHistoricaSafe).toFixed(2));
-                if (montoHistoricoProveedorBsSafe > Number(m_bs) + 0.01) {
-                    return res.status(400).json({
-                        status: 'error',
-                        message: 'El pago histórico en Bs no puede superar el monto en Bs del gasto.',
-                    });
+            if (montoHistoricoProveedorBsSafe < 0 || montoHistoricoProveedorBsSafe > Number(m_bs) + 0.01) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'El pago histórico en Bs no puede superar el monto en Bs del gasto.',
+                });
+            }
+            if (montoHistoricoRecaudadoBsSafe < 0 || montoHistoricoRecaudadoBsSafe > Number(m_bs) + 0.01) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'La recaudación histórica en Bs no puede superar el monto en Bs del gasto.',
+                });
+            }
+
+            const historicoEnCuentaSafe = parseBooleanFlag(historico_en_cuenta);
+            const historicoCuentaIdSafe = toPositiveInt(historico_cuenta_bancaria_id);
+            const historicoFondoIdSafe = toPositiveInt(historico_fondo_id);
+            if (historicoEnCuentaSafe) {
+                if (!historicoCuentaIdSafe || !historicoFondoIdSafe) {
+                    return res.status(400).json({ status: 'error', message: 'Debes indicar cuenta y fondo para la recaudación histórica en cuenta.' });
                 }
-                if (montoHistoricoRecaudadoBsSafe > Number(m_bs) + 0.01) {
-                    return res.status(400).json({
-                        status: 'error',
-                        message: 'La recaudación histórica en Bs no puede superar el monto en Bs del gasto.',
-                    });
+                if (montoHistoricoRecaudadoUsdSafe <= 0 && montoHistoricoRecaudadoBsSafe <= 0) {
+                    return res.status(400).json({ status: 'error', message: 'Debes indicar una recaudación histórica mayor a 0 para sincronizar con cuenta bancaria.' });
+                }
+                const targetFondo = await getHistFondoTarget({
+                    condominioId: condominio_id,
+                    cuentaId: historicoCuentaIdSafe,
+                    fondoId: historicoFondoIdSafe,
+                });
+                if (!targetFondo) {
+                    return res.status(400).json({ status: 'error', message: 'La cuenta/fondo histórico seleccionado no es válido para este condominio.' });
                 }
             }
 
@@ -630,10 +846,20 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const metaHistorico: string[] = [];
             if (cuotasHistoricasSafe > 0) metaHistorico.push(`[hist.cuotas:${cuotasHistoricasSafe}]`);
             if (montoHistoricoProveedorUsdSafe > 0) metaHistorico.push(`[hist.proveedor_usd:${montoHistoricoProveedorUsdSafe.toFixed(2)}]`);
+            if (montoHistoricoProveedorBsSafe > 0) metaHistorico.push(`[hist.proveedor_bs:${montoHistoricoProveedorBsSafe.toFixed(2)}]`);
             if (montoHistoricoRecaudadoUsdSafe > 0) metaHistorico.push(`[hist.recaudado_usd:${montoHistoricoRecaudadoUsdSafe.toFixed(2)}]`);
+            if (montoHistoricoRecaudadoBsSafe > 0) metaHistorico.push(`[hist.recaudado_bs:${montoHistoricoRecaudadoBsSafe.toFixed(2)}]`);
             if (tasaHistoricaSafe > 0) metaHistorico.push(`[hist.tasa:${tasaHistoricaSafe.toFixed(4)}]`);
-            if (parseBooleanFlag(es_historico)) metaHistorico.push('[hist.no_aviso:1]');
+            if (historicoEnCuentaSafe) {
+                metaHistorico.push('[hist.bank_enabled:1]');
+                if (historicoCuentaIdSafe) metaHistorico.push(`[hist.bank_cuenta_id:${historicoCuentaIdSafe}]`);
+                if (historicoFondoIdSafe) metaHistorico.push(`[hist.bank_fondo_id:${historicoFondoIdSafe}]`);
+            }
+            if (esHistoricoSafe) metaHistorico.push('[hist.no_aviso:1]');
             const notaFinal = [notaBase, ...metaHistorico].filter(Boolean).join(' | ') || null;
+
+            await pool.query('BEGIN');
+            inTransaction = true;
 
             const result = await pool.query<IInsertedIdRow>(
                 `
@@ -647,8 +873,34 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 const mes_cuota = addMonths(mes_inicio_cobro, i - 1);
                 await pool.query('INSERT INTO gastos_cuotas (gasto_id, numero_cuota, monto_cuota_usd, mes_asignado) VALUES ($1, $2, $3, $4)', [result.rows[0].id, i, monto_cuota_usd, mes_cuota]);
             }
+
+            await applyHistoricalBankDelta({
+                condominioId: condominio_id,
+                gastoId: result.rows[0].id,
+                prev: {
+                    enabled: false,
+                    cuentaId: null,
+                    fondoId: null,
+                    recaudadoUsd: 0,
+                    recaudadoBs: 0,
+                },
+                next: {
+                    enabled: historicoEnCuentaSafe,
+                    cuentaId: historicoCuentaIdSafe,
+                    fondoId: historicoFondoIdSafe,
+                    recaudadoUsd: montoHistoricoRecaudadoUsdSafe,
+                    recaudadoBs: montoHistoricoRecaudadoBsSafe,
+                },
+                tasaCambio: t_c,
+            });
+
+            await pool.query('COMMIT');
+            inTransaction = false;
             res.json({ status: 'success', message: 'Gasto registrado con exito.' });
         } catch (err: unknown) {
+            if (inTransaction) {
+                await pool.query('ROLLBACK');
+            }
             const error = asError(err);
             res.status(500).json({ error: error.message });
         }
@@ -677,7 +929,12 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             fecha_gasto,
             cuotas_historicas,
             monto_historico_proveedor_usd,
+            monto_historico_proveedor_bs,
             monto_historico_recaudado_usd,
+            monto_historico_recaudado_bs,
+            historico_en_cuenta,
+            historico_cuenta_bancaria_id,
+            historico_fondo_id,
             tasa_historica,
             es_historico,
             remove_factura_img,
@@ -701,6 +958,7 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             if (!ownGasto || Number(ownGasto.condominio_id) !== Number(condominio_id)) {
                 return res.status(404).json({ status: 'error', message: 'Gasto no encontrado.' });
             }
+            const prevHistMeta = parseHistMetaFromNota(ownGasto.nota);
 
             const cuotasProcesadasRes = await pool.query<IGastoCuotaCheckRow>(
                 "SELECT id FROM gastos_cuotas WHERE gasto_id = $1 AND COALESCE(estado, 'Pendiente') <> 'Pendiente' LIMIT 1",
@@ -769,41 +1027,78 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const montoUsdNum = parseFloat(monto_usd);
             const totalCuotasSafe = Math.max(1, parseInt(String(total_cuotas), 10) || 1);
             const cuotasHistoricasSafe = Math.max(0, Math.trunc(parseLocaleNumber(cuotas_historicas || 0)));
-            if (cuotasHistoricasSafe >= totalCuotasSafe) {
+            const esHistoricoPayload = parseBooleanFlag(es_historico);
+            if (esHistoricoPayload) {
+                if (cuotasHistoricasSafe > totalCuotasSafe) {
+                    return res.status(400).json({
+                        status: 'error',
+                        message: 'Las cuotas históricas no pueden superar el total de cuotas.',
+                    });
+                }
+            } else if (cuotasHistoricasSafe >= totalCuotasSafe) {
                 return res.status(400).json({
                     status: 'error',
                     message: 'Las cuotas históricas deben ser menores al total de cuotas.',
                 });
             }
-            const montoHistoricoProveedorUsdSafe = Number(parseLocaleNumber(monto_historico_proveedor_usd || 0).toFixed(2));
+            let montoHistoricoProveedorUsdSafe = Number(parseLocaleNumber(monto_historico_proveedor_usd || 0).toFixed(2));
+            let montoHistoricoProveedorBsSafe = Number(parseLocaleNumber(monto_historico_proveedor_bs || 0).toFixed(2));
+            let montoHistoricoRecaudadoUsdSafe = Number(parseLocaleNumber(monto_historico_recaudado_usd || 0).toFixed(2));
+            let montoHistoricoRecaudadoBsSafe = Number(parseLocaleNumber(monto_historico_recaudado_bs || 0).toFixed(2));
+            const tasaHistoricaSafe = Number(parseLocaleNumber(tasa_historica || 0).toFixed(4));
+            if (montoHistoricoProveedorUsdSafe <= 0 && montoHistoricoProveedorBsSafe > 0 && tasaHistoricaSafe > 0) {
+                montoHistoricoProveedorUsdSafe = round2(montoHistoricoProveedorBsSafe / tasaHistoricaSafe);
+            }
+            if (montoHistoricoProveedorBsSafe <= 0 && montoHistoricoProveedorUsdSafe > 0 && tasaHistoricaSafe > 0) {
+                montoHistoricoProveedorBsSafe = round2(montoHistoricoProveedorUsdSafe * tasaHistoricaSafe);
+            }
+            if (montoHistoricoRecaudadoUsdSafe <= 0 && montoHistoricoRecaudadoBsSafe > 0 && tasaHistoricaSafe > 0) {
+                montoHistoricoRecaudadoUsdSafe = round2(montoHistoricoRecaudadoBsSafe / tasaHistoricaSafe);
+            }
+            if (montoHistoricoRecaudadoBsSafe <= 0 && montoHistoricoRecaudadoUsdSafe > 0 && tasaHistoricaSafe > 0) {
+                montoHistoricoRecaudadoBsSafe = round2(montoHistoricoRecaudadoUsdSafe * tasaHistoricaSafe);
+            }
             if (montoHistoricoProveedorUsdSafe < 0 || montoHistoricoProveedorUsdSafe > Number(montoUsdNum.toFixed(2))) {
                 return res.status(400).json({
                     status: 'error',
                     message: 'El pago histórico del proveedor debe estar entre 0 y el monto total del gasto.',
                 });
             }
-            const montoHistoricoRecaudadoUsdSafe = Number(parseLocaleNumber(monto_historico_recaudado_usd || 0).toFixed(2));
             if (montoHistoricoRecaudadoUsdSafe < 0 || montoHistoricoRecaudadoUsdSafe > Number(montoUsdNum.toFixed(2))) {
                 return res.status(400).json({
                     status: 'error',
                     message: 'La recaudación histórica debe estar entre 0 y el monto total del gasto.',
                 });
             }
-            const tasaHistoricaSafe = Number(parseLocaleNumber(tasa_historica || 0).toFixed(4));
-            if (tasaHistoricaSafe > 0) {
-                const montoHistoricoProveedorBsSafe = Number((montoHistoricoProveedorUsdSafe * tasaHistoricaSafe).toFixed(2));
-                const montoHistoricoRecaudadoBsSafe = Number((montoHistoricoRecaudadoUsdSafe * tasaHistoricaSafe).toFixed(2));
-                if (montoHistoricoProveedorBsSafe > Number(m_bs) + 0.01) {
-                    return res.status(400).json({
-                        status: 'error',
-                        message: 'El pago histórico en Bs no puede superar el monto en Bs del gasto.',
-                    });
+            if (montoHistoricoProveedorBsSafe < 0 || montoHistoricoProveedorBsSafe > Number(m_bs) + 0.01) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'El pago histórico en Bs no puede superar el monto en Bs del gasto.',
+                });
+            }
+            if (montoHistoricoRecaudadoBsSafe < 0 || montoHistoricoRecaudadoBsSafe > Number(m_bs) + 0.01) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'La recaudación histórica en Bs no puede superar el monto en Bs del gasto.',
+                });
+            }
+            const historicoEnCuentaSafe = parseBooleanFlag(historico_en_cuenta);
+            const historicoCuentaIdSafe = toPositiveInt(historico_cuenta_bancaria_id);
+            const historicoFondoIdSafe = toPositiveInt(historico_fondo_id);
+            if (historicoEnCuentaSafe) {
+                if (!historicoCuentaIdSafe || !historicoFondoIdSafe) {
+                    return res.status(400).json({ status: 'error', message: 'Debes indicar cuenta y fondo para la recaudación histórica en cuenta.' });
                 }
-                if (montoHistoricoRecaudadoBsSafe > Number(m_bs) + 0.01) {
-                    return res.status(400).json({
-                        status: 'error',
-                        message: 'La recaudación histórica en Bs no puede superar el monto en Bs del gasto.',
-                    });
+                if (montoHistoricoRecaudadoUsdSafe <= 0 && montoHistoricoRecaudadoBsSafe <= 0) {
+                    return res.status(400).json({ status: 'error', message: 'Debes indicar una recaudación histórica mayor a 0 para sincronizar con cuenta bancaria.' });
+                }
+                const targetFondo = await getHistFondoTarget({
+                    condominioId: condominio_id,
+                    cuentaId: historicoCuentaIdSafe,
+                    fondoId: historicoFondoIdSafe,
+                });
+                if (!targetFondo) {
+                    return res.status(400).json({ status: 'error', message: 'La cuenta/fondo histórico seleccionado no es válido para este condominio.' });
                 }
             }
             const monto_cuota_usd = (parseFloat(monto_usd) / totalCuotasSafe).toFixed(2);
@@ -835,11 +1130,18 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             const metaHistorico: string[] = [];
             if (cuotasHistoricasSafe > 0) metaHistorico.push(`[hist.cuotas:${cuotasHistoricasSafe}]`);
             if (montoHistoricoProveedorUsdSafe > 0) metaHistorico.push(`[hist.proveedor_usd:${montoHistoricoProveedorUsdSafe.toFixed(2)}]`);
+            if (montoHistoricoProveedorBsSafe > 0) metaHistorico.push(`[hist.proveedor_bs:${montoHistoricoProveedorBsSafe.toFixed(2)}]`);
             if (montoHistoricoRecaudadoUsdSafe > 0) metaHistorico.push(`[hist.recaudado_usd:${montoHistoricoRecaudadoUsdSafe.toFixed(2)}]`);
+            if (montoHistoricoRecaudadoBsSafe > 0) metaHistorico.push(`[hist.recaudado_bs:${montoHistoricoRecaudadoBsSafe.toFixed(2)}]`);
             if (tasaHistoricaSafe > 0) metaHistorico.push(`[hist.tasa:${tasaHistoricaSafe.toFixed(4)}]`);
+            if (historicoEnCuentaSafe) {
+                metaHistorico.push('[hist.bank_enabled:1]');
+                if (historicoCuentaIdSafe) metaHistorico.push(`[hist.bank_cuenta_id:${historicoCuentaIdSafe}]`);
+                if (historicoFondoIdSafe) metaHistorico.push(`[hist.bank_fondo_id:${historicoFondoIdSafe}]`);
+            }
             const rawEsHistorico = req.body.es_historico;
             const esHistoricoProvided = rawEsHistorico !== undefined && rawEsHistorico !== null && String(rawEsHistorico).trim() !== '';
-            const esHistoricoActual = /\[hist\.no_aviso:1\]/i.test(String(ownGasto?.nota || ''));
+            const esHistoricoActual = Boolean(prevHistMeta.esHistorico);
             const esHistoricoFinal = esHistoricoProvided ? parseBooleanFlag(rawEsHistorico) : esHistoricoActual;
             if (esHistoricoFinal) metaHistorico.push('[hist.no_aviso:1]');
             const notaFinal = [notaBase, ...metaHistorico].filter(Boolean).join(' | ') || null;
@@ -878,6 +1180,26 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     [gastoId, i, monto_cuota_usd, mes_cuota]
                 );
             }
+
+            await applyHistoricalBankDelta({
+                condominioId: condominio_id,
+                gastoId,
+                prev: {
+                    enabled: Boolean(prevHistMeta.bankEnabled),
+                    cuentaId: prevHistMeta.bankCuentaId,
+                    fondoId: prevHistMeta.bankFondoId,
+                    recaudadoUsd: round2(prevHistMeta.recaudadoUsd),
+                    recaudadoBs: round2(prevHistMeta.recaudadoBs),
+                },
+                next: {
+                    enabled: historicoEnCuentaSafe,
+                    cuentaId: historicoCuentaIdSafe,
+                    fondoId: historicoFondoIdSafe,
+                    recaudadoUsd: round2(montoHistoricoRecaudadoUsdSafe),
+                    recaudadoBs: round2(montoHistoricoRecaudadoBsSafe),
+                },
+                tasaCambio: t_c,
+            });
 
             await pool.query('COMMIT');
             inTransaction = false;
