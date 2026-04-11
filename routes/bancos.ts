@@ -80,6 +80,15 @@ interface IExtraInfoRow {
     tasa_cambio?: number | null;
 }
 
+interface IGastoHistoricoExtraRow {
+    id: number;
+    concepto: string;
+    nota: string | null;
+    referencia: string | null;
+    tasa_cambio: number | null;
+    fecha_gasto: string | Date | null;
+}
+
 interface IGastoPendienteRow {
     id: number;
     concepto: string;
@@ -928,7 +937,14 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     WHERE f.cuenta_bancaria_id = $1
                       AND (
                         mf.tipo IN ('INGRESO', 'INGRESO_PAGO', 'ABONO')
-                        OR mf.tipo = 'AJUSTE_INICIAL'
+                        OR (
+                            mf.tipo = 'AJUSTE_INICIAL'
+                            AND (
+                                COALESCE(mf.nota, '') ILIKE '%Ajuste desde Cuentas por Cobrar%'
+                                OR COALESCE(mf.nota, '') ILIKE 'Ajuste manual a favor%'
+                                OR hsi.id IS NOT NULL
+                            )
+                        )
                       )
                 ),
                 ingresos_distribuidos_por_pago AS (
@@ -1194,7 +1210,16 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     FROM movimientos_fondos mf
                     JOIN fondos f ON f.id = mf.fondo_id
                     WHERE f.cuenta_bancaria_id = $1
-                      AND UPPER(COALESCE(mf.tipo, '')) IN ('EGRESO', 'EGRESO_GASTO', 'SALIDA', 'DEBITO', 'DESCUENTO')
+                      AND (
+                        UPPER(COALESCE(mf.tipo, '')) IN ('EGRESO', 'EGRESO_GASTO', 'SALIDA', 'DEBITO', 'DESCUENTO')
+                        OR (
+                            UPPER(COALESCE(mf.tipo, '')) = 'AJUSTE_INICIAL'
+                            AND (
+                                COALESCE(mf.nota, '') ILIKE 'Reclasificación/Pago histórico%'
+                                OR COALESCE(mf.nota, '') ILIKE 'Reclasificacion/Pago historico%'
+                            )
+                        )
+                      )
                       AND mf.referencia_id IS NULL
                 ),
                 transferencias_cuentas AS (
@@ -1455,8 +1480,68 @@ const registerBancosRoutes = (app: Application, { pool, verifyToken }: AuthDepen
                     fondo_destino: row.fondo_destino,
                 };
             });
+            const gastosHistoricosRes = await pool.query<IGastoHistoricoExtraRow>(
+                `
+                SELECT
+                    g.id,
+                    g.concepto,
+                    g.nota,
+                    NULL::text AS referencia,
+                    g.tasa_cambio,
+                    g.fecha_gasto
+                FROM gastos g
+                WHERE g.condominio_id = $1
+                  AND COALESCE(g.nota, '') ~* '\\[hist\\.recaudado_rows_b64:[A-Za-z0-9+/=_-]+\\]'
+                `,
+                [condoId]
+            );
+            const historicosExtras: IExtraInfoRow[] = [];
+            for (const gasto of gastosHistoricosRes.rows) {
+                const notaRaw = String(gasto.nota || '');
+                const marker = notaRaw.match(/\[hist\.recaudado_rows_b64:([A-Za-z0-9+/=_-]+)\]/i)?.[1] || '';
+                if (!marker) continue;
+                let decodedRows: Array<Record<string, unknown>> = [];
+                try {
+                    decodedRows = JSON.parse(Buffer.from(marker, 'base64').toString('utf8'));
+                } catch {
+                    decodedRows = [];
+                }
+                if (!Array.isArray(decodedRows) || decodedRows.length === 0) continue;
 
-            return res.json({ status: 'success', extras: normalizedExtras });
+                for (let idx = 0; idx < decodedRows.length; idx += 1) {
+                    const row = decodedRows[idx] || {};
+                    const rowCuentaId = parseInt(String(row.cuenta_bancaria_id ?? ''), 10);
+                    if (!Number.isFinite(rowCuentaId) || rowCuentaId !== cuentaId) continue;
+
+                    const montoBs = round2(parseLocale(row.monto_bs ?? 0));
+                    const montoUsdRaw = round2(parseLocale(row.monto_usd ?? 0));
+                    const tasaRow = round2(parseLocale(gasto.tasa_cambio ?? 0));
+                    const montoUsd = montoUsdRaw > 0
+                        ? montoUsdRaw
+                        : (montoBs > 0 && tasaRow > 0 ? round2(montoBs / tasaRow) : 0);
+                    if (montoBs <= 0 && montoUsd <= 0) continue;
+
+                    const fechaOperacion = String(row.fecha_operacion || '').trim();
+                    const fecha = fechaOperacion || (gasto.fecha_gasto ? String(gasto.fecha_gasto).slice(0, 10) : '');
+                    historicosExtras.push({
+                        pago_id: Number(`${gasto.id}${idx + 1}`),
+                        fecha: fecha || new Date().toISOString().slice(0, 10),
+                        referencia: gasto.referencia || `GH-${gasto.id}`,
+                        inmueble: null,
+                        concepto: `Recaudado histórico gasto: ${String(gasto.concepto || `#${gasto.id}`)}`,
+                        monto_bs: montoBs > 0 ? montoBs : null,
+                        monto_usd: montoUsd,
+                        fondo_destino: 'Tránsito / Extra',
+                    });
+                }
+            }
+
+            const mergedExtras = [...normalizedExtras, ...historicosExtras].sort((a, b) => {
+                const aTime = new Date(String(a.fecha || '')).getTime();
+                const bTime = new Date(String(b.fecha || '')).getTime();
+                return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+            });
+            return res.json({ status: 'success', extras: mergedExtras });
         } catch (error: unknown) {
             const typedError = asError(error);
             console.error('Error en extras-info:', error);

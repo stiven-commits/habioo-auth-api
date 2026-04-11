@@ -512,7 +512,11 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
             const now = new Date();
             const mesAnteriorDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
             const mesActual = `${mesAnteriorDate.getUTCFullYear()}-${String(mesAnteriorDate.getUTCMonth() + 1).padStart(2, '0')}`;
-            const fechaSaldoFondosSeed = '2024-01-01';
+            // Fecha base: hace 30 días desde hoy
+            const fechaBase = new Date();
+            fechaBase.setDate(fechaBase.getDate() - 30);
+            const fechaBaseStr = fechaBase.toISOString().split('T')[0]; // YYYY-MM-DD
+            const fechaSaldoFondosSeed = fechaBaseStr;
             const tasaCambioSeed = 40;
             await pool.query('UPDATE condominios SET mes_actual = $1 WHERE id = $2', [mesActual, condoId]);
 
@@ -683,14 +687,27 @@ const registerDashboardRoutes = (app: Application, { pool, verifyToken }: AuthDe
                 ],
             );
 
+            // Crear fondos: mínimo 2 por cuenta bancaria, saldos coherentes
+            // Cuenta Principal Bs: Fondo Operativo (8000) + Fondo Reserva (2000) = 10,000 Bs total
+            // Cuenta Pago Móvil Bs: Fondo Caja Chica (1500) + Fondo Emergencias (500) = 2,000 Bs total
+            // Cuenta Secundaria Bs: Fondo Reserva General (2500) + Fondo Mantenimiento (700) = 3,200 Bs total
+            // Cuenta USD: Fondo Operativo USD (1000) + Fondo Reserva USD (500) = 1,500 USD total
             await pool.query(
                 `INSERT INTO fondos
                     (condominio_id, cuenta_bancaria_id, nombre, moneda, porcentaje_asignacion, saldo_actual, es_operativo, fecha_saldo)
                  VALUES
-                    ($1, $2, '[TEST] Fondo Operativo Principal Bs', 'BS', 0, 8000, true, $6::date),
-                    ($1, $3, '[TEST] Fondo Caja Chica Bs', 'BS', 0, 2500, false, $6::date),
-                    ($1, $4, '[TEST] Fondo Reserva General Bs', 'BS', 0, 3200, false, $6::date),
-                    ($1, $5, '[TEST] Fondo USD', 'USD', 0, 1500, false, $6::date)`,
+                    -- Cuenta Principal Bs (2 fondos, total: 10,000 Bs)
+                    ($1, $2, '[TEST] Fondo Operativo Principal Bs', 'BS', 80, 8000, true, $6::date),
+                    ($1, $2, '[TEST] Fondo Reserva Principal Bs', 'BS', 20, 2000, false, $6::date),
+                    -- Cuenta Pago Móvil Bs (2 fondos, total: 2,000 Bs)
+                    ($1, $3, '[TEST] Fondo Caja Chica Bs', 'BS', 75, 1500, true, $6::date),
+                    ($1, $3, '[TEST] Fondo Emergencias Pago Móvil', 'BS', 25, 500, false, $6::date),
+                    -- Cuenta Secundaria Bs (2 fondos, total: 3,200 Bs)
+                    ($1, $4, '[TEST] Fondo Reserva General Bs', 'BS', 78, 2500, true, $6::date),
+                    ($1, $4, '[TEST] Fondo Mantenimiento Bs', 'BS', 22, 700, false, $6::date),
+                    -- Cuenta USD (2 fondos, total: 1,500 USD)
+                    ($1, $5, '[TEST] Fondo Operativo USD', 'USD', 67, 1000, true, $6::date),
+                    ($1, $5, '[TEST] Fondo Reserva USD', 'USD', 33, 500, false, $6::date)`,
                 [
                     condoId,
                     cuentaPrincipalBs.rows[0].id,

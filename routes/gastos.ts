@@ -433,6 +433,7 @@ interface HistOriginRow {
     fondo_id: number;
     monto_usd: number;
     monto_bs: number;
+    fecha_operacion: string | null;
 }
 
 const round2 = (value: number): number => Math.round((Number(value) || 0) * 100) / 100;
@@ -484,17 +485,20 @@ const parseHistOriginRows = (raw: unknown): HistOriginRow[] => {
                 fondo_id?: unknown;
                 monto_usd?: unknown;
                 monto_bs?: unknown;
+                fecha_operacion?: unknown;
             };
             const cuentaId = toPositiveInt(row.cuenta_bancaria_id);
             const fondoId = toPositiveInt(row.fondo_id);
             const montoUsd = round2(parseFloat(String(row.monto_usd ?? 0)) || 0);
             const montoBs = round2(parseFloat(String(row.monto_bs ?? 0)) || 0);
+            const fechaOperacion = toIsoDateOrNull(row.fecha_operacion);
             if (!cuentaId || !fondoId || (montoUsd <= 0 && montoBs <= 0)) return null;
             return {
                 cuenta_bancaria_id: cuentaId,
                 fondo_id: fondoId,
                 monto_usd: montoUsd,
                 monto_bs: montoBs,
+                fecha_operacion: fechaOperacion,
             };
         })
         .filter((row): row is HistOriginRow => Boolean(row));
@@ -682,17 +686,18 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
         if (prevTarget && nextTarget && prevTarget.id === nextTarget.id) {
             const prevImpact = resolveImpactByMoneda(prevTarget.moneda, input.prev);
             const nextImpact = resolveImpactByMoneda(nextTarget.moneda, input.next);
-            await applyOnTarget(nextTarget, round2(nextImpact - prevImpact));
+            // Ambos restan del fondo: delta = (-nextImpact) - (-prevImpact) = prevImpact - nextImpact
+            await applyOnTarget(nextTarget, round2(prevImpact - nextImpact));
             return;
         }
 
         if (prevTarget) {
             const prevImpact = resolveImpactByMoneda(prevTarget.moneda, input.prev);
-            await applyOnTarget(prevTarget, -prevImpact);
+            await applyOnTarget(prevTarget, -prevImpact); // Revertir resta previa (sumar)
         }
         if (nextTarget) {
             const nextImpact = resolveImpactByMoneda(nextTarget.moneda, input.next);
-            await applyOnTarget(nextTarget, nextImpact);
+            await applyOnTarget(nextTarget, -nextImpact); // RESTAR del fondo (recaudado histórico = transferencia out)
         }
     };
 
@@ -718,26 +723,26 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
     }): Promise<Map<number, number>> => {
         const allRows = [...input.pagadoRows, ...input.recaudadoRows];
         if (allRows.length === 0) return new Map<number, number>();
-        const fondoIds = [...new Set(allRows.map((r) => r.fondo_id))];
-        const fondosRes = await pool.query<{ id: number; cuenta_bancaria_id: number; moneda: string }>(
+        const fondosRes = await pool.query<{ id: number; cuenta_bancaria_id: number; moneda: string; nombre: string }>(
             `
-            SELECT id, cuenta_bancaria_id, COALESCE(moneda, 'USD') AS moneda
+            SELECT id, cuenta_bancaria_id, COALESCE(moneda, 'USD') AS moneda, COALESCE(nombre, '') AS nombre
             FROM fondos
             WHERE condominio_id = $1
-              AND id = ANY($2::int[])
               AND COALESCE(activo, true) = true
             `,
-            [input.condominioId, fondoIds]
+            [input.condominioId]
         );
-        const fondosMap = new Map<number, { cuenta_bancaria_id: number; moneda: string }>();
-        for (const row of fondosRes.rows) fondosMap.set(row.id, { cuenta_bancaria_id: row.cuenta_bancaria_id, moneda: row.moneda });
+        const fondosMap = new Map<number, { cuenta_bancaria_id: number; moneda: string; nombre: string }>();
+        for (const row of fondosRes.rows) {
+            fondosMap.set(row.id, { cuenta_bancaria_id: row.cuenta_bancaria_id, moneda: row.moneda, nombre: row.nombre });
+        }
 
         const deltaMap = new Map<number, number>();
         const addDelta = (fondoId: number, amount: number): void => {
             const prev = deltaMap.get(fondoId) || 0;
             deltaMap.set(fondoId, round2(prev + amount));
         };
-        const applyRows = (rows: HistOriginRow[], sign: 1 | -1): void => {
+        const applyPagadoRows = (rows: HistOriginRow[]): void => {
             for (const row of rows) {
                 const fondo = fondosMap.get(row.fondo_id);
                 if (!fondo) throw new Error(`Fondo ${row.fondo_id} no encontrado para histórico.`);
@@ -747,11 +752,45 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                 const isBs = ['BS', 'BS.'].includes(String(fondo.moneda || '').toUpperCase());
                 const amount = round2(isBs ? row.monto_bs : row.monto_usd);
                 if (amount <= 0) continue;
-                addDelta(row.fondo_id, round2(sign * amount));
+                addDelta(row.fondo_id, -amount); // pago histórico: salida del fondo
+                console.info('[GASTO_HIST_MOV]', {
+                    tipo: 'pagado_historico',
+                    modo: 'solo_egreso',
+                    condominio_id: input.condominioId,
+                    cuenta_bancaria_id: Number(row.cuenta_bancaria_id),
+                    fondo_origen_id: Number(row.fondo_id),
+                    fondo_origen_moneda: String(fondo.moneda || '').toUpperCase(),
+                    monto_aplicado: amount,
+                });
             }
         };
-        applyRows(input.recaudadoRows, 1);
-        applyRows(input.pagadoRows, -1);
+        const applyRecaudadoRows = (rows: HistOriginRow[]): void => {
+            for (const row of rows) {
+                const fondoOrigen = fondosMap.get(row.fondo_id);
+                if (!fondoOrigen) throw new Error(`Fondo ${row.fondo_id} no encontrado para histórico.`);
+                if (Number(fondoOrigen.cuenta_bancaria_id) !== Number(row.cuenta_bancaria_id)) {
+                    throw new Error(`La cuenta ${row.cuenta_bancaria_id} no corresponde al fondo ${row.fondo_id}.`);
+                }
+                const isBs = ['BS', 'BS.'].includes(String(fondoOrigen.moneda || '').toUpperCase());
+                const amount = round2(isBs ? row.monto_bs : row.monto_usd);
+                if (amount <= 0) continue;
+                // Recaudado histórico: salida del fondo origen.
+                // El ingreso "Tránsito/Extra" se refleja en la pestaña informativa de extras.
+                addDelta(Number(row.fondo_id), -amount);
+                console.info('[GASTO_HIST_MOV]', {
+                    tipo: 'recaudado_historico',
+                    modo: 'solo_egreso',
+                    condominio_id: input.condominioId,
+                    cuenta_bancaria_id: Number(row.cuenta_bancaria_id),
+                    fondo_origen_id: Number(row.fondo_id),
+                    fondo_origen_moneda: String(fondoOrigen.moneda || '').toUpperCase(),
+                    monto_aplicado: amount,
+                    destino_virtual: 'transito_extra_info',
+                });
+            }
+        };
+        applyRecaudadoRows(input.recaudadoRows);
+        applyPagadoRows(input.pagadoRows);
         return deltaMap;
     };
 
@@ -764,11 +803,11 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
             if (Math.abs(delta) < 0.005) continue;
             await pool.query('UPDATE fondos SET saldo_actual = COALESCE(saldo_actual, 0) + $1 WHERE id = $2', [round2(delta), fondoId]);
             const tipo = delta >= 0
-                ? await resolveMovimientoFondoTipo(['AJUSTE_INICIAL', 'INGRESO', 'ABONO', 'ENTRADA'], 'AJUSTE_INICIAL')
+                ? await resolveMovimientoFondoTipo(['INGRESO_EXTRA', 'INGRESO', 'ABONO', 'ENTRADA', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL')
                 : await resolveMovimientoFondoTipo(['EGRESO', 'SALIDA', 'RETIRO', 'AJUSTE_INICIAL'], 'AJUSTE_INICIAL');
             const nota = delta >= 0
-                ? `Ajuste histórico ingreso gasto ${input.gastoId}`
-                : `Ajuste histórico egreso gasto ${input.gastoId}`;
+                ? `Reclasificación histórica a Tránsito/Extra (gasto ${input.gastoId})`
+                : `Reclasificación/Pago histórico desde fondo (gasto ${input.gastoId})`;
             await pool.query(
                 `
                 INSERT INTO movimientos_fondos (fondo_id, tipo, monto, tasa_cambio, nota)
@@ -1036,12 +1075,20 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     pagadoRows: pagadoRowsSafe,
                     recaudadoRows: recaudadoRowsSafe,
                 });
+                for (const delta of deltaMap.values()) {
+                    if (delta > 0.004) {
+                        throw new Error('Regla contable: el histórico por orígenes no puede incrementar saldos de fondos en creación.');
+                    }
+                }
                 await applyFundDeltaMap({
                     gastoId: result.rows[0].id,
                     tasaCambio: t_c,
                     deltaMap,
                 });
-            } else {
+            } else if (
+                !(Object.prototype.hasOwnProperty.call(req.body, 'historico_pagado_origenes')
+                    || Object.prototype.hasOwnProperty.call(req.body, 'historico_recaudado_origenes'))
+            ) {
                 await applyHistoricalBankDelta({
                     condominioId: condominio_id,
                     gastoId: result.rows[0].id,
@@ -1442,12 +1489,22 @@ const registerGastosRoutes = (app: Application, { pool, verifyToken, parseLocale
                     const net = round2(nextAmount - prevAmount);
                     if (Math.abs(net) >= 0.005) netDeltaMap.set(fundId, net);
                 }
+                if (!hasPrevRows && hasNextRows) {
+                    for (const delta of netDeltaMap.values()) {
+                        if (delta > 0.004) {
+                            throw new Error('Regla contable: al registrar histórico por orígenes no se permite incrementar saldos de fondos.');
+                        }
+                    }
+                }
                 await applyFundDeltaMap({
                     gastoId,
                     tasaCambio: t_c,
                     deltaMap: netDeltaMap,
                 });
-            } else {
+            } else if (
+                !(Object.prototype.hasOwnProperty.call(req.body, 'historico_pagado_origenes')
+                    || Object.prototype.hasOwnProperty.call(req.body, 'historico_recaudado_origenes'))
+            ) {
                 await applyHistoricalBankDelta({
                     condominioId: condominio_id,
                     gastoId,
